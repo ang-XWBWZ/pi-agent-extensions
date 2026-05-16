@@ -666,6 +666,9 @@ export default function (pi: ExtensionAPI) {
 
     if (mode === "yolo") return;
 
+    // 子进程不进入 plan 流程，直接执行
+    if (isSubAgent) return;
+
     if (needsPlan && mode !== "plan") setMode("plan", ctx);
 
     if (mode === "plan") {
@@ -707,7 +710,7 @@ export default function (pi: ExtensionAPI) {
   // ============================================================
 
   pi.on("turn_end", (_event, ctx) => {
-    // 只在 planning 状态且有计划文本时运行审查
+    if (isSubAgent) return;
     if (appState !== "planning" || mode !== "plan" || !planProduced || !planFullText) return;
     if (reviewCount >= MAX_REVIEW_ATTEMPTS) return;
 
