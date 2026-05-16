@@ -113,20 +113,20 @@ async function showBashConfirm(
 ): Promise<"yes" | "always" | "no" | "edit"> {
   const short = cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
   const label = `Bash 确认 [${modeLabel}]  —  ${short}`;
-  const options = ["允许本次", "始终允许此模式", "编辑后执行", "阻止"];
+  const options = ["允许本次", "始终允许此模式", "输入建议", "阻止"];
 
   if (isSubAgent) {
     const choice = await requestConfirm("bash", label, cmd, options);
     if (choice === "允许本次") return "yes";
     if (choice === "阻止" || choice === undefined) return "no";
-    if (choice === "编辑后执行") return "edit";
+    if (choice === "输入建议") return "edit";
     return "always";
   }
 
   const choice = await ctx.ui.select(label, options);
   if (choice === "允许本次") return "yes";
   if (choice === "阻止" || choice === undefined) return "no";
-  if (choice === "编辑后执行") return "edit";
+  if (choice === "输入建议") return "edit";
   return "always";
 }
 
@@ -161,7 +161,7 @@ async function confirmAndRemember(
   target: string,
   isSubAgent: boolean,
   onEdit?: (edited: string) => boolean,
-): Promise<"dialog" | "silent" | false> {
+): Promise<"dialog" | "silent" | false | { action: "suggest"; text: string }> {
   for (const pattern of allowlist) {
     if (wildcardMatch(pattern, target)) return "silent";
   }
@@ -172,17 +172,15 @@ async function confirmAndRemember(
     action = await showBashConfirm(ctx, label, target, isSubAgent);
     if (action === "edit" && onEdit) {
       if (isSubAgent) {
-        const edited = await requestInput("编辑后执行 (Enter确认/Esc取消)", target);
-        if (edited && edited.trim()) {
-          onEdit(edited.trim());
-          return "dialog";
+        const suggestion = await requestInput("输入建议 (Enter确认/Esc取消)", "");
+        if (suggestion && suggestion.trim()) {
+          return { action: "suggest", text: suggestion.trim() };
         }
         return false;
       }
-      const edited = await ctx.ui.editor("编辑后执行 (Esc 取消)", target);
-      if (edited && edited.trim()) {
-        onEdit(edited.trim());
-        return "dialog";
+      const suggestion = await ctx.ui.editor("输入建议 (Esc 取消)", "");
+      if (suggestion && suggestion.trim()) {
+        return { action: "suggest", text: suggestion.trim() };
       }
       return false;
     }
@@ -292,10 +290,25 @@ interface SecurityFinding {
   suggestion: string;
 }
 
+  /** 检查文本是否包含实际的写/删/执行操作（而非统计报告） */
+function hasWritableOperations(text: string): boolean {
+  const t = text.toLowerCase();
+  // 工具调用 + 路径模式 (write/edit/bash/cmd 后跟路径)
+  if (/(?:write|edit|bash|cmd)\b[^\n]{0,80}[\/][\w.-]+/mi.test(t)) return true;
+  // 删除命令 + 破坏性标志
+  if (/\b(?:rm|del|rd|rmdir)\s+-[rf\/]/i.test(t)) return true;
+  // 中文写操作 + 文件/目录/代码
+  if (/(?:新增|创建|编写|修改|删除|覆盖|替换|重命名|移除).{0,10}(?:文件|目录|脚本|代码)/i.test(t)) return true;
+  return false;
+}
+
 /** 对计划文本执行安全审查 */
 function securityReview(text: string, steps: string[]): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
   const fullText = text.toLowerCase();
+
+  // ---- 提前退出：纯只读计划无安全风险 ----
+  if (!hasWritableOperations(fullText)) return [];
 
   // ---- 受保护路径操作检查 ----
   if (PROTECTED_PATH_PATTERNS.some((re) => re.test(fullText))) {
@@ -501,7 +514,10 @@ export default function (pi: ExtensionAPI) {
   // Security review self-loop (在 turn_end 自动运行，不展示给用户)
   let reviewCount = 0;
   let pendingSecurityFeedback: SecurityFinding[] | null = null;
-  const MAX_REVIEW_ATTEMPTS = 3;
+  const MAX_REVIEW_ATTEMPTS: number =
+    (typeof (globalThis as Record<string, unknown>).__pi_max_review_attempts === "number"
+      ? (globalThis as Record<string, unknown>).__pi_max_review_attempts as number
+      : 3);
 
   // Error recovery
   let pendingErrorInfo: { stepIndex: number; message: string; isSevere: boolean } | null = null;
@@ -681,27 +697,65 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ============================================================
-  // message_end: detect plan produced + parse steps
+  // message_end: plan detection (PLAN mode) + step advance (WORK mode)
   // ============================================================
 
-  pi.on("message_end", (event, _ctx) => {
-    if (appState !== "planning" || mode !== "plan") return;
+  pi.on("message_end", (event, ctx) => {
+    // ---- PLAN mode: detect plan produced + parse steps ----
+    if (appState === "planning" && mode === "plan") {
+      const textParts = (event.message.content ?? []).filter(
+        (c: { type: string }) => c.type === "text",
+      );
+      if (textParts.length === 0) return;
 
-    const textParts = (event.message.content ?? []).filter(
-      (c: { type: string }) => c.type === "text",
-    );
-    if (textParts.length === 0) return;
-    if (!textParts.some((c: { text?: string }) => (c.text ?? "").trim().length > 50)) return;
+      const fullText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
+      if (!textParts.some((c: { text?: string }) => (c.text ?? "").trim().length > 50)) return;
 
-    planProduced = true;
+      const hasPlanPattern =
+        /(?:^|\n)\s*(?:#{1,3}|(?:\d+[.\)]|[-*])\s+\S{6,})/m.test(fullText) ||
+        hasWritableOperations(fullText) ||
+        /(?:执行计划|行动计划|实现方案|修改方案|以下(?:是|为).*(?:计划|方案|步骤))/i.test(fullText);
 
-    // 提取完整文本供安全审查
-    planFullText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
+      if (!hasPlanPattern) return;
 
-    const parsed = parsePlanSteps(planFullText);
-    if (parsed.length > 0) {
-      planSteps = parsed;
-      currentStepIndex = -1;
+      planProduced = true;
+      planFullText = fullText;
+
+      const parsed = parsePlanSteps(planFullText);
+      if (parsed.length > 0) {
+        planSteps = parsed;
+        currentStepIndex = -1;
+      }
+      return;
+    }
+
+    // ---- WORK mode: 语义驱动步骤推进 ----
+    if (mode === "work" && planSteps.length > 0 && currentStepIndex >= 0) {
+      const textParts = (event.message.content ?? []).filter(
+        (c: { type: string }) => c.type === "text",
+      );
+      const workText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
+
+      // 计划完成检测
+      if (/\[PLAN_DONE\]|计划全部完成|所有步骤完成|全部任务完成/i.test(workText)) {
+        currentStepIndex = planSteps.length;
+        closePlanPanel(ctx);
+        ctx.ui.notify("✅ 计划全部完成", "success");
+        return;
+      }
+
+      // 步骤完成检测
+      if (/\[STEP_DONE\]|\[步骤完成\]|当前步骤已完成|这一步完成/i.test(workText)) {
+        currentStepIndex++;
+        toolCallsInCurrentStep = 0;
+        if (currentStepIndex >= planSteps.length) {
+          closePlanPanel(ctx);
+          ctx.ui.notify("✅ 计划所有步骤执行完成", "success");
+        } else {
+          updatePlanPanel(ctx);
+          ctx.ui.notify(`▶️ 推进到步骤 ${currentStepIndex + 1}/${planSteps.length}`, "info");
+        }
+      }
     }
   });
 
@@ -712,7 +766,19 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", (_event, ctx) => {
     if (isSubAgent) return;
     if (appState !== "planning" || mode !== "plan" || !planProduced || !planFullText) return;
-    if (reviewCount >= MAX_REVIEW_ATTEMPTS) return;
+    if (reviewCount >= MAX_REVIEW_ATTEMPTS) {
+      if (reviewCount === MAX_REVIEW_ATTEMPTS) {
+        ctx.ui.notify(`⏭ 安全审查已达上限 (${MAX_REVIEW_ATTEMPTS} 轮)，自动通过`, "info");
+        reviewCount = 0;
+      }
+      return;
+    }
+
+    // ---- 二次确认：跳过纯只读计划 ----
+    if (!hasWritableOperations(planFullText)) {
+      ctx.ui.notify("🔍 计划仅含只读操作，跳过安全审查", "info");
+      return;
+    }
 
     const findings = securityReview(planFullText, planSteps);
     const severeCount = findings.filter((f) => f.severity === "high").length;
@@ -801,7 +867,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ============================================================
-  // tool_execution_end: advance plan panel + detect errors
+  // tool_execution_end: safety net — warn if too many calls without [STEP_DONE]
   // ============================================================
 
   pi.on("tool_execution_end", (_event, ctx) => {
@@ -809,17 +875,12 @@ export default function (pi: ExtensionAPI) {
     if (currentStepIndex < 0 || currentStepIndex >= planSteps.length) return;
 
     toolCallsInCurrentStep++;
-    const threshold = planSteps.length <= 3 ? 1 : 2;
-    if (toolCallsInCurrentStep >= threshold) {
-      currentStepIndex++;
-      toolCallsInCurrentStep = 0;
-      if (currentStepIndex >= planSteps.length) {
-        currentStepIndex = planSteps.length;
-        closePlanPanel(ctx);
-        ctx.ui.notify("✅ 计划所有步骤执行完成", "success");
-        return;
-      }
-      updatePlanPanel(ctx);
+    // 安全网：8 次工具调用未推进 → 提示
+    if (toolCallsInCurrentStep === 8) {
+      ctx.ui.notify(
+        `⚠️ 步骤 ${currentStepIndex + 1} 已执行 8 次工具调用未推进，输出 [STEP_DONE] 标记完成`,
+        "warning",
+      );
     }
   });
 
@@ -979,6 +1040,10 @@ export default function (pi: ExtensionAPI) {
           (e) => { event.input.command = e; return true; },
         );
         if (!ok) return { block: true, reason: `${toolName} blocked in PLAN mode` };
+        if (typeof ok === "object" && ok.action === "suggest") {
+          pi.sendUserMessage(`用户对命令的建议:\n${ok.text}`, { deliverAs: "steer" });
+          return { block: true, reason: "已接收建议，请重新推理" };
+        }
         if (ok === "dialog") confirmedCalls.set(event.toolCallId, `PLAN ${toolName} ✅`);
       }
       return;
@@ -1031,6 +1096,10 @@ export default function (pi: ExtensionAPI) {
           const ok = await confirmAndRemember(ctx, cmdAllowlist, "bash", "WORK (destructive)", cmdStr, isSubAgent,
             (e) => { event.input.command = e; return true; });
           if (!ok) return { block: true, reason: `${toolName} blocked: destructive command` };
+          if (typeof ok === "object" && ok.action === "suggest") {
+            pi.sendUserMessage(`用户对命令的建议:\n${ok.text}`, { deliverAs: "steer" });
+            return { block: true, reason: "已接收建议，请重新推理" };
+          }
           if (ok === "dialog") confirmedCalls.set(event.toolCallId, `WORK ${toolName} ✅`);
           return;
         }
@@ -1038,6 +1107,10 @@ export default function (pi: ExtensionAPI) {
         const ok = await confirmAndRemember(ctx, cmdAllowlist, "bash", "WORK", cmdStr, isSubAgent,
           (e) => { event.input.command = e; return true; });
         if (!ok) return { block: true, reason: `${toolName} blocked` };
+        if (typeof ok === "object" && ok.action === "suggest") {
+          pi.sendUserMessage(`用户对命令的建议:\n${ok.text}`, { deliverAs: "steer" });
+          return { block: true, reason: "已接收建议，请重新推理" };
+        }
         if (ok === "dialog") confirmedCalls.set(event.toolCallId, `WORK ${toolName} ✅`);
       }
       return;
