@@ -83,10 +83,7 @@ pi 本身是一个极简的终端 AI 编码助手，只提供 `read` / `write` /
 ## 安装
 
 ```bash
-# 克隆到 pi 的全局扩展目录
-git clone https://gitea.llang.top/li/pi-agent-extensions.git ~/.pi/agent/extensions-gitea
-
-# 或者直接复制文件到 ~/.pi/agent/extensions/
+# 直接复制文件到 ~/.pi/agent/extensions/
 cp extensions/*.ts ~/.pi/agent/extensions/
 cp extensions/lib/*.ts ~/.pi/agent/extensions/lib/
 ```
