@@ -15,12 +15,12 @@ pi 本身是一个极简的终端 AI 编码助手，只提供 `read` / `write` /
 
 | 扩展 | 文件 | 功能 |
 |------|------|------|
-| 🔀 子 Agent 系统 | `parallel-agent.ts` | 并行派发子 Agent，生命周期管理，结果自动注入 |
+| 🔀 子 Agent 系统 | `parallel-agent.ts` | v8 · 并行派发子 Agent，AbortSignal 支持，生命周期管理，结果自动注入 |
 | 🚌 Agent 通信总线 | `lib/agent-bus.ts` | 全局 EventEmitter，跨 session 消息传递 |
 | ✅ 确认弹窗总线 | `lib/confirm-bus.ts` | 子 Agent 的安全确认弹窗路由至主 session |
 | 🪟 Windows 命令工具 | `cmd-tool.ts` | 用 `cmd.exe` 替代 `bash`，适配 Windows 环境 |
 | 🔄 模型热切换 | `model-switch.ts` | LLM 可通过 `switch_model` 工具自行切换模型 |
-| 🎯 工作模式 | `work-mode.ts` | Plan / Work / YOLO 三模式，控制 Agent 执行节奏 |
+| 🎯 工作模式 | `work-mode.ts` | v3 · Plan/Work/YOLO，滑动窗口计划面板，Unicode 状态图标 |
 | 📊 上下文统计 | `context-usage.ts` | `/context` 命令，浮层展示 token 占用明细 |
 | 💍 上下文环 | `token-stats.ts` | 状态栏实时显示上下文使用百分比 |
 
@@ -58,9 +58,25 @@ pi 本身是一个极简的终端 AI 编码助手，只提供 `read` / `write` /
 | `send_agent_message` | Agent 间消息传递（广播 / 点对点） |
 | `control_agent` | 完整生命周期：`kill` / `abort` / `pause` / `resume` / `send` / `list` / `status` |
 
+### v8 改进
+
+- **AbortSignal 支持** — 4 个工具的 `execute()` 全部接入 AbortSignal，`check_agent_results(wait=true)` 可被用户取消
+- **Promise 反模式修复** — `runSingleAgent` 从 `new Promise(async)` 改为同步 executor + async IIFE
+- **异常日志** — 8 处静默吞异常改为 `console.warn`，问题排查不再黑盒
+
 ### v7 新特性：结果自动注入
 
 子任务全部完成后，结果通过 `steer` 机制自动推送到主对话——**主 Agent 不再需要阻塞式等待**。你在派发任务后可以继续交互，结果到了自会出现在对话中。
+
+---
+
+## 计划面板 v3
+
+| 特性 | 说明 |
+|------|------|
+| Unicode 图标 | `✅` 完成 `▶` 进行中 `○` 待定 `❌` 出错 |
+| 命令 ≠ 任务失败 | 命令返回非零退出码不再自动中断执行，由 AI 自主判断 |
+| 滑动窗口 | 面板以当前步骤为中心显示 5 步，前后省略提示，始终跟踪最新进度 |
 
 ---
 
