@@ -206,10 +206,10 @@ export async function killAgent(jobId: string, taskId: string): Promise<boolean>
 
   try {
     await inst.session.abort();
-  } catch { /* ignore */ }
+  } catch (e) { console.warn("[agent-bus] killAgent abort 失败:", e); }
   try {
     inst.session.dispose();
-  } catch { /* ignore */ }
+  } catch (e) { console.warn("[agent-bus] killAgent dispose 失败:", e); }
 
   unregisterInstance(jobId, taskId);
   publishTaskResult(jobId, {
@@ -247,7 +247,8 @@ export async function abortAgent(jobId: string, taskId: string): Promise<boolean
     inst._abortExternally?.();
     await inst.session.abort();
     return true;
-  } catch {
+  } catch (e) {
+    console.warn("[agent-bus] abortAgent 失败:", e);
     return false;
   }
 }
@@ -260,7 +261,7 @@ export async function pauseAgent(jobId: string, taskId: string): Promise<boolean
   try {
     inst._abortExternally?.();
     await inst.session.abort();
-  } catch { /* continue */ }
+  } catch (e) { console.warn("[agent-bus] pauseAgent abort 失败:", e); }
 
   inst.status = "paused";
   globalBus.emit(Events.AGENT_PAUSED, { jobId, taskId, name: inst.name });
@@ -379,14 +380,30 @@ export function onJobComplete(
 
 // ---- 等待（阻塞式，仅用于 check_agent_results 兼容） ----
 
-export function waitForJob(jobId: string, timeoutMs: number = 300_000): Promise<AgentJob> {
+export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: AbortSignal): Promise<AgentJob> {
   const job = jobs.get(jobId);
   if (job && (job.status === "complete" || job.status === "error" || job.status === "killed")) {
     return Promise.resolve(job);
   }
 
   return new Promise((resolve) => {
+    // AbortSignal 支持
+    if (signal?.aborted) {
+      const j = jobs.get(jobId);
+      resolve(j ?? { jobId, tasks: [], total: 0, completed: 0, results: [], status: "error", createdAt: 0, finishedAt: Date.now() });
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      globalBus.off(Events.JOB_COMPLETE, onComplete);
+      globalBus.off(Events.JOB_ERROR, onError);
+      const j = jobs.get(jobId);
+      resolve(j ?? { jobId, tasks: [], total: 0, completed: 0, results: [], status: "error", createdAt: 0, finishedAt: Date.now() });
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
       const j = jobs.get(jobId);
@@ -407,6 +424,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000): Promise<
     const onComplete = (data: { jobId: string }) => {
       if (data.jobId !== jobId) return;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
       resolve(jobs.get(jobId)!);
@@ -415,6 +433,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000): Promise<
     const onError = (data: { jobId: string }) => {
       if (data.jobId !== jobId) return;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
       resolve(jobs.get(jobId)!);
@@ -441,7 +460,7 @@ export function cleanupJobs(maxAge: number = 600_000): void {
   // 清理僵尸实例（关联 job 已不存在的）
   for (const [key, inst] of instances) {
     if (!jobs.has(inst.jobId)) {
-      try { inst.session.dispose(); } catch { /* */ }
+      try { inst.session.dispose(); } catch (e) { console.warn("[agent-bus] cleanupJobs dispose 失败:", e); }
       instances.delete(key);
     }
   }

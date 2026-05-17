@@ -2,7 +2,6 @@
  * token-stats.ts — 上下文环指示器
  *
  * 不篡改原生 footer。仅追加环 + 百分比到状态栏。
- * 缓存量由原生 footer 的 R 字段显示。
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -18,9 +17,10 @@ export default function (pi: ExtensionAPI) {
   function refresh(ctx: ExtensionContext) {
     const cu = ctx.getContextUsage();
     const pct = cu?.percent ?? null;
-    ctx.ui.setStatus("token-stats", ring(pct));
+    const label = pct !== null ? `${ring(pct)} ${pct.toFixed(0)}%` : ring(null);
+    ctx.ui.setStatus("token-stats", label);
   }
 
+  // context usage only changes after message_end (model reports usage in response)
   pi.on("message_end", (_event, ctx) => refresh(ctx));
-  pi.on("message_start", (_event, ctx) => refresh(ctx));
 }

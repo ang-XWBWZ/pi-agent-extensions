@@ -3,7 +3,7 @@
  *
  * 强制 Plan-First：AI 在回复前必须先进入 PLAN 模式、输出安全计划，
  * 产出计划后等待用户 /accept-plan 确认，确认后切换到 WORK 模式执行。
- * 编辑器上方显示 📋 执行计划 面板，实时展示步骤完成进度。
+ * 编辑器上方显示 执行计划 面板，实时展示步骤完成进度。
  * 执行中出错时暂停等待用户决策（继续/重新规划/中止）。
  *
  * 状态机: idle → planning → awaiting_confirm → working ─→ error （出错时）
@@ -15,6 +15,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { resolve, isAbsolute } from "node:path";
 import {
   requestConfirm,
@@ -112,21 +113,21 @@ async function showBashConfirm(
   isSubAgent: boolean,
 ): Promise<"yes" | "always" | "no" | "edit"> {
   const short = cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
-  const label = `Bash 确认 [${modeLabel}]  —  ${short}`;
-  const options = ["允许本次", "始终允许此模式", "输入建议", "阻止"];
+  const label = "Bash 确认 [" + modeLabel + "]  —  " + short;
+  const options = ["允许本次", "始终允许此模式", "编辑后执行", "阻止"];
 
   if (isSubAgent) {
     const choice = await requestConfirm("bash", label, cmd, options);
     if (choice === "允许本次") return "yes";
     if (choice === "阻止" || choice === undefined) return "no";
-    if (choice === "输入建议") return "edit";
+    if (choice === "编辑后执行") return "edit";
     return "always";
   }
 
   const choice = await ctx.ui.select(label, options);
   if (choice === "允许本次") return "yes";
   if (choice === "阻止" || choice === undefined) return "no";
-  if (choice === "输入建议") return "edit";
+  if (choice === "编辑后执行") return "edit";
   return "always";
 }
 
@@ -137,7 +138,7 @@ async function showPathConfirm(
   isSubAgent: boolean,
 ): Promise<"yes" | "always" | "no"> {
   const short = path.length > 80 ? "..." + path.slice(-77) : path;
-  const title = `${label} 确认  —  ${short}`;
+  const title = label + " 确认  —  " + short;
   const options = ["允许本次", "始终允许此路径", "阻止"];
 
   if (isSubAgent) {
@@ -161,7 +162,7 @@ async function confirmAndRemember(
   target: string,
   isSubAgent: boolean,
   onEdit?: (edited: string) => boolean,
-): Promise<"dialog" | "silent" | false | { action: "suggest"; text: string }> {
+): Promise<"dialog" | "silent" | false> {
   for (const pattern of allowlist) {
     if (wildcardMatch(pattern, target)) return "silent";
   }
@@ -172,15 +173,17 @@ async function confirmAndRemember(
     action = await showBashConfirm(ctx, label, target, isSubAgent);
     if (action === "edit" && onEdit) {
       if (isSubAgent) {
-        const suggestion = await requestInput("输入建议 (Enter确认/Esc取消)", "");
-        if (suggestion && suggestion.trim()) {
-          return { action: "suggest", text: suggestion.trim() };
+        const edited = await requestInput("编辑后执行 (Enter确认/Esc取消)", target);
+        if (edited && edited.trim()) {
+          onEdit(edited.trim());
+          return "dialog";
         }
         return false;
       }
-      const suggestion = await ctx.ui.editor("输入建议 (Esc 取消)", "");
-      if (suggestion && suggestion.trim()) {
-        return { action: "suggest", text: suggestion.trim() };
+      const edited = await ctx.ui.editor("编辑后执行 (Esc 取消)", target);
+      if (edited && edited.trim()) {
+        onEdit(edited.trim());
+        return "dialog";
       }
       return false;
     }
@@ -194,7 +197,7 @@ async function confirmAndRemember(
   if (action === "always") {
     const pattern = type === "path" ? guessPathPattern(target) : guessCmdPattern(target);
     allowlist.add(pattern);
-    ctx.ui.notify(`✅ 已记住: ${pattern}`, "info");
+    ctx.ui.notify("已记住: " + pattern, "info");
     return "dialog";
   }
 
@@ -202,57 +205,87 @@ async function confirmAndRemember(
 }
 
 // ============================================================
-// Plan panel — 计划步骤解析 & Widget
+// Plan panel - 计划步骤解析 and Widget
 // ============================================================
 
-/** 从 AI 输出的计划文本中提取步骤列表 */
+const MAX_PLAN_STEPS = 10;
+const DEFAULT_VISIBLE_STEPS = 5;
+
+/** 从 AI 输出的计划文本中提取步骤列表 —— 仅解析 ## Execution Plan 段落 */
 function parsePlanSteps(text: string): string[] {
-  const lines = text.split("\n");
+  // 只提取 ## Execution Plan 之后到下一个 ## 标题或文件末尾的内容
+  const planMatch = text.match(/(?:^|\n)##\s+Execution\s+Plan\s*\n([\s\S]*?)(?:\n##\s|\n*$)/i);
+  const section = planMatch ? planMatch[1] : "";
+  if (!section.trim()) return [];
+
+  const lines = section.split("\n");
   const steps: string[] = [];
   let inCodeBlock = false;
 
   for (const raw of lines) {
     const line = raw.trim();
+    if (!line) continue;
     if (line.startsWith("```")) { inCodeBlock = !inCodeBlock; continue; }
     if (inCodeBlock) continue;
 
     const numbered = line.match(/^\s*(?:\d+[\.\)]|[a-z][\.\)])\s+(.+)/i);
     if (numbered) {
       const desc = numbered[1].trim();
-      if (desc.length > 8) { steps.push(desc); continue; }
+      if (desc.length > 3) { steps.push(desc); continue; }
     }
 
     const bullet = line.match(/^\s*[-*]\s+(.+)/);
     if (bullet) {
       const desc = bullet[1].trim();
-      if (desc.length > 8) { steps.push(desc); continue; }
-    }
-
-    const heading = line.match(/^#{1,3}\s+(.+)/);
-    if (heading) {
-      const desc = heading[1].trim();
-      if (desc.length > 5 && desc.length < 80 && !desc.match(/^plan|步骤|step|方案|概览|目录|计划/i)) {
-        steps.push(desc);
-      }
+      if (desc.length > 3) { steps.push(desc); continue; }
     }
   }
 
-  return steps;
+  return steps.slice(0, MAX_PLAN_STEPS);
 }
 
-/** 渲染计划面板行（含错误状态） */
+/** 渲染计划面板行（含错误状态、折叠支持） */
 function renderPlanPanel(
   steps: string[],
   currentIdx: number,
   errors: boolean[],
   theme: any,
+  expanded: boolean,
 ): string[] {
   if (steps.length === 0) return [];
 
-  const header = theme?.fg("accent", theme?.bold("📋 执行计划")) ?? "📋 执行计划";
+  const header = theme?.fg("accent", theme?.bold("执行计划")) ?? "执行计划";
   const lines: string[] = [header, ""];
 
-  for (let i = 0; i < steps.length; i++) {
+  // 滑动窗口：展开模式显示全部，否则以 currentIdx 为中心显示 5 步
+  let windowStart: number;
+  let windowEnd: number;
+  const collapsed = !expanded && steps.length > DEFAULT_VISIBLE_STEPS;
+
+  if (expanded) {
+    windowStart = 0;
+    windowEnd = steps.length;
+  } else if (currentIdx < 0) {
+    // 计划阶段尚未开始执行，显示前 5 步
+    windowStart = 0;
+    windowEnd = Math.min(steps.length, DEFAULT_VISIBLE_STEPS);
+  } else {
+    // 以当前步骤为中心，前 2 后 2（共 5 步可见）
+    const half = Math.floor(DEFAULT_VISIBLE_STEPS / 2);
+    windowStart = Math.max(0, currentIdx - half);
+    windowEnd = Math.min(steps.length, windowStart + DEFAULT_VISIBLE_STEPS);
+    // 靠近末尾时，窗口起点往前移以保持 5 步可见
+    if (windowEnd - windowStart < DEFAULT_VISIBLE_STEPS) {
+      windowStart = Math.max(0, windowEnd - DEFAULT_VISIBLE_STEPS);
+    }
+  }
+
+  // 窗口前省略提示
+  if (windowStart > 0) {
+    lines.push(theme?.fg("muted", `  ... 前 ${windowStart} 步已完成`) ?? `  ... 前 ${windowStart} 步已完成`);
+  }
+
+  for (let i = windowStart; i < windowEnd; i++) {
     let icon: string;
     let style: (s: string) => string;
 
@@ -263,24 +296,35 @@ function renderPlanPanel(
       icon = "✅";
       style = (s) => theme?.fg("success", s) ?? s;
     } else if (i === currentIdx) {
-      icon = "🔄";
+      icon = "▶";
       style = (s) => theme?.fg("accent", s) ?? s;
     } else {
-      icon = "⏳";
+      icon = "○";
       style = (s) => theme?.fg("muted", s) ?? s;
     }
 
     const label = steps[i].length > 70
       ? steps[i].slice(0, 67) + "..."
       : steps[i];
-    lines.push(` ${icon} ${style(label)}`);
+    lines.push(" " + icon + " " + style(label));
+  }
+
+  // 窗口后省略提示
+  if (windowEnd < steps.length) {
+    const remaining = steps.length - windowEnd;
+    lines.push(theme?.fg("muted", `  ... 后 ${remaining} 步待执行`) ?? `  ... 后 ${remaining} 步待执行`);
+  }
+
+  if (expanded && steps.length > DEFAULT_VISIBLE_STEPS) {
+    lines.push("");
+    lines.push(theme?.fg("muted", `(共 ${steps.length} 步, /plan-collapse 折叠)`) ?? `(共 ${steps.length} 步)`);
   }
 
   return lines;
 }
 
 // ============================================================
-// 安全审查 — 计划文本的规则式安全检查
+// 安全审查 - 计划文本的规则式安全检查
 // ============================================================
 
 interface SecurityFinding {
@@ -290,25 +334,10 @@ interface SecurityFinding {
   suggestion: string;
 }
 
-  /** 检查文本是否包含实际的写/删/执行操作（而非统计报告） */
-function hasWritableOperations(text: string): boolean {
-  const t = text.toLowerCase();
-  // 工具调用 + 路径模式 (write/edit/bash/cmd 后跟路径)
-  if (/(?:write|edit|bash|cmd)\b[^\n]{0,80}[\/][\w.-]+/mi.test(t)) return true;
-  // 删除命令 + 破坏性标志
-  if (/\b(?:rm|del|rd|rmdir)\s+-[rf\/]/i.test(t)) return true;
-  // 中文写操作 + 文件/目录/代码
-  if (/(?:新增|创建|编写|修改|删除|覆盖|替换|重命名|移除).{0,10}(?:文件|目录|脚本|代码)/i.test(t)) return true;
-  return false;
-}
-
 /** 对计划文本执行安全审查 */
 function securityReview(text: string, steps: string[]): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
   const fullText = text.toLowerCase();
-
-  // ---- 提前退出：纯只读计划无安全风险 ----
-  if (!hasWritableOperations(fullText)) return [];
 
   // ---- 受保护路径操作检查 ----
   if (PROTECTED_PATH_PATTERNS.some((re) => re.test(fullText))) {
@@ -343,13 +372,13 @@ function securityReview(text: string, steps: string[]): SecurityFinding[] {
       findings.push({
         severity: "high",
         category: "破坏性操作",
-        description: `计划包含「${label}」命令，可能造成不可逆的数据丢失`,
+        description: "计划包含" + label + "命令，可能造成不可逆的数据丢失",
         suggestion: "确保有完整的备份/回滚策略，考虑先用 --dry-run 或 /p 参数预览",
       });
     }
   }
 
-  // ---- 备份/回滚检查 — 有写操作但没提及备份 ----
+  // ---- 备份/回滚检查 ----
   const hasWriteOps = /write|edit|修改|删除|覆盖|replace|update|delete|rename|move|copy/i.test(fullText);
   const hasBackup = /备份|backup|rollback|回滚|还原|restore|revert|暂存|stash|snapshot/i.test(fullText);
   if (hasWriteOps && !hasBackup && steps.length > 0) {
@@ -414,18 +443,18 @@ function securityReview(text: string, steps: string[]): SecurityFinding[] {
 function formatSecurityReview(findings: SecurityFinding[]): string {
   if (findings.length === 0) return "";
 
-  const lines: string[] = ["🔍 安全审查结果:", ""];
+  const lines: string[] = ["安全审查结果:", ""];
 
   const severe = findings.filter((f) => f.severity === "high");
   const medium = findings.filter((f) => f.severity === "medium");
   const low = findings.filter((f) => f.severity === "low");
 
-  for (const [level, items] of [["🔴 高危", severe], ["🟡 中危", medium], ["🟢 低危", low]] as const) {
+  for (const [level, items] of [["高危", severe], ["中危", medium], ["低危", low]] as const) {
     if (items.length === 0) continue;
-    lines.push(`${level} — ${items.length} 项`);
+    lines.push(level + " - " + items.length + " 项");
     for (const f of items) {
-      lines.push(`  • [${f.category}] ${f.description}`);
-      lines.push(`    建议: ${f.suggestion}`);
+      lines.push("  [" + f.category + "] " + f.description);
+      lines.push("    建议: " + f.suggestion);
     }
     lines.push("");
   }
@@ -434,54 +463,56 @@ function formatSecurityReview(findings: SecurityFinding[]): string {
 }
 
 // ============================================================
-// Plan → Work auto-switch system prompt snippet
+// Plan -> Work auto-switch system prompt snippet
 // ============================================================
 
-const PLAN_SYSTEM_PROMPT = `
+const SMART_PLAN_PROMPT = `
 
-## 🔒 PLAN-FIRST RULE（强制）
+## Smart Mode: decide for yourself
 
-当前处于 **PLAN 模式**。你必须先制定完整的安全计划，然后**等待用户接受**后系统才会切换到 WORK 模式执行。
+You are in **WORK mode by default**. All tools including write/edit are available.
+Protected paths (.git, .pi, .agents, .claude, node_modules) are still guarded.
 
-### 你必须做到的
+### Before you act, assess the user request:
 
-**第一步：充分调研**
-- 使用 read / ls / grep / find 工具了解项目结构、现有代码
-- 使用 bash / cmd（需确认）查看目录、依赖、配置文件
-- 考虑可用的工具链（如 build 脚本、测试框架、lint 规则）
-- 不依赖假设，用工具验证
+**No plan needed - just do it:**
+- Pure Q&A, explaining concepts, reading/analyzing code
+- Simple one-shot operations (check encoding, list files, search patterns)
 
-**第二步：制定详细计划（必须包含安全考量）**
-覆盖以下内容：
-- 涉及的文件路径和修改类型（新增/修改/删除）
-- 需要执行的命令和顺序
-- **每个步骤的风险评估（低/中/高）**
-- **备份/回滚策略（涉及文件修改时必须包含）**
-- **边界条件检查和异常处理**
-- **凭证管理：绝对不要硬编码 API Key、Token、密码**
-- **依赖管理：安装依赖需指定版本号**
-- **子进程拆分：可并行化的任务应使用 spawn_agent 派发子进程**
-  - 任务目标必须原子级明确（单文件读写、单次扫描、单个修复）
-  - 子进程使用 mode: "plan" 确保安全边界
-  - 善用 context 参数注入相关文件内容，减少子进程调研开销
+**Plan needed - output a structured plan first:**
+- Tasks involving file creation, modification, or deletion
+- Multi-step operations with step dependencies
+- Risky operations (destructive commands, mass modifications)
+- Unfamiliar codebase - research needed before acting
 
-**模型分配策略：**
-- 调研/扫描/信息收集 → 🔹 高性价比模型（deepseek-v4-flash）
-- 分析/设计/代码生成 → 🔸 高能力模型（deepseek-v4-pro）
-- 子进程任务必须标注使用的模型
+### If you decide to plan:
+You MUST start the plan section with this exact heading:
 
-**第三步：逐条讲解并请用户确认**
-- 向用户逐条解释你的计划
-- 说明每步风险
-- 系统会弹窗让用户选择：是 / 否 / 建议
-- 如果用户选择「建议」，请根据建议修订计划
+## Execution Plan
 
-### 在 PLAN 模式下你不能做的
-- write/edit/delete：**被强制阻止**
-- 修改 .git、node_modules、.pi、.agents、.claude 等受保护路径：**被强制阻止**
-- 执行未确认的 bash/cmd 命令
+This marker is required for the system to detect your plan. Without it, your entire response will be treated as a normal reply and executed directly — no confirmation dialog will appear.
 
-记住：用工具调研 → 制定计划 → 逐条讲解 → 等待用户确认`;
+When you use the marker, the system will:
+1. Detect your plan
+2. Pop up a confirmation dialog for the user
+3. After user confirms, switch to planned execution mode with progress panel
+
+You should also self-assess security risks in your plan:
+- Mark protected path operations
+- Flag destructive commands
+- Note credential handling
+- Include backup/rollback strategies
+
+### Safety nets (always active regardless of mode):
+- Protected paths are blocked for write/edit
+- Destructive bash commands require confirmation
+- Working directory boundaries are enforced
+
+### Key rules:
+- For simple tasks: answer directly, no plan needed
+- For complex tasks: output a plan WITH the ## Execution Plan marker
+- Never hardcode API keys, tokens, or passwords
+- Include backup/rollback strategy when modifying files`;
 
 // ============================================================
 // Extension entry
@@ -501,23 +532,16 @@ export default function (pi: ExtensionAPI) {
   // Internal state machine
   let appState: AppState = "idle";
   let planProduced = false;
-  let needsPlan = true;
+  let needsPlan = false;
   let planAccepted = false;
 
   // Plan panel state
   let planSteps: string[] = [];
-  let planFullText = "";         // 完整的计划文本（含表格/风险评估），供安全审查用
+  let planFullText = "";
   let currentStepIndex = -1;
   let toolCallsInCurrentStep = 0;
   let stepErrors: boolean[] = [];
-
-  // Security review self-loop (在 turn_end 自动运行，不展示给用户)
-  let reviewCount = 0;
-  let pendingSecurityFeedback: SecurityFinding[] | null = null;
-  const MAX_REVIEW_ATTEMPTS: number =
-    (typeof (globalThis as Record<string, unknown>).__pi_max_review_attempts === "number"
-      ? (globalThis as Record<string, unknown>).__pi_max_review_attempts as number
-      : 3);
+  let planPanelExpanded = false;
 
   // Error recovery
   let pendingErrorInfo: { stepIndex: number; message: string; isSevere: boolean } | null = null;
@@ -549,10 +573,10 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  // ---- persistence & panel ----
+  // ---- persistence and panel ----
   function persist(ctx: ExtensionContext) {
     pi.appendEntry("work-mode-state", { mode });
-    ctx.ui.setStatus("work-mode", `MODE: ${mode.toUpperCase()}`);
+    ctx.ui.setStatus("work-mode", "MODE: " + mode.toUpperCase());
   }
 
   function setMode(m: WorkMode, ctx: ExtensionContext) {
@@ -562,14 +586,14 @@ export default function (pi: ExtensionAPI) {
 
   function showModeNotification(ctx: ExtensionContext) {
     const labels: Record<string, string> = {
-      plan: "PLAN — safe planning (write/edit blocked)",
-      work: "WORK — cwd + protected path guard",
-      yolo: "YOLO — ⚠️ unrestricted, only user can switch",
+      plan: "PLAN mode - write/edit blocked",
+      work: "WORK mode - cwd + protected path guard",
+      yolo: "YOLO mode - unrestricted, user only",
     };
     ctx.ui.notify(labels[mode], "info");
   }
 
-  /** 更新编辑器上方的计划面板（子进程不创建面板） */
+  /** 更新编辑器上方的计划面板 */
   function updatePlanPanel(ctx: ExtensionContext) {
     if (isSubAgent) return;
     if (planSteps.length === 0) {
@@ -577,14 +601,19 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     ctx.ui.setWidget("plan-panel", (tui, theme) => ({
-      render: () => renderPlanPanel(planSteps, currentStepIndex, stepErrors, theme),
-      invalidate: () => {},
+      render: () => renderPlanPanel(planSteps, currentStepIndex, stepErrors, theme, planPanelExpanded),
+      invalidate: () => tui.requestRender?.(),
     }));
   }
 
-  /** 关闭计划面板（完成时调用） */
+  /** 关闭计划面板（完成时调用，清理状态防止重渲染） */
   function closePlanPanel(ctx: ExtensionContext) {
     if (isSubAgent) return;
+    planSteps = [];
+    planFullText = "";
+    currentStepIndex = -1;
+    toolCallsInCurrentStep = 0;
+    stepErrors = [];
     ctx.ui.setWidget("plan-panel", undefined);
   }
 
@@ -595,11 +624,9 @@ export default function (pi: ExtensionAPI) {
     currentStepIndex = -1;
     toolCallsInCurrentStep = 0;
     stepErrors = [];
+    planPanelExpanded = false;
     pendingErrorInfo = null;
-    reviewCount = 0;
-    pendingSecurityFeedback = null;
     ctx.ui.setWidget("plan-panel", undefined);
-    ctx.ui.setWidget("security-review", undefined);
   }
 
   // ---- restore state from session ----
@@ -612,8 +639,8 @@ export default function (pi: ExtensionAPI) {
         mode = (entry as ModeEntry).data.mode;
       }
     }
-    ctx.ui.setStatus("work-mode", `MODE: ${mode.toUpperCase()}`);
-    needsPlan = true;
+    ctx.ui.setStatus("work-mode", "MODE: " + mode.toUpperCase());
+    needsPlan = false;
     appState = "idle";
     clearPlanPanel(ctx);
   });
@@ -623,7 +650,7 @@ export default function (pi: ExtensionAPI) {
   // ============================================================
 
   pi.registerCommand("plan", {
-    description: "PLAN — safe planning (read-only, write/edit blocked)",
+    description: "PLAN mode - read-only, write/edit blocked",
     handler: (_a, ctx) => {
       setMode("plan", ctx);
       needsPlan = true;
@@ -636,7 +663,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("work", {
-    description: "WORK — cwd guard + protected path guard",
+    description: "WORK mode - cwd guard + protected path guard",
     handler: (_a, ctx) => {
       setMode("work", ctx);
       needsPlan = false;
@@ -647,7 +674,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("yolo", {
-    description: "YOLO — ⚠️ unrestricted (only user can enable)",
+    description: "YOLO mode - unrestricted, user only",
     handler: (_a, ctx) => {
       setMode("yolo", ctx);
       appState = "working";
@@ -656,8 +683,54 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("security-review", {
+    description: "Run security review on the current plan text (manual trigger)",
+    handler: (_a, ctx) => {
+      if (!planFullText || planSteps.length === 0) {
+        ctx.ui.notify("没有当前计划可审查。先使用 /plan 或让 AI 输出带 ## Execution Plan 标记的计划", "warning");
+        return;
+      }
+      const findings = securityReview(planFullText, planSteps);
+      if (findings.length === 0) {
+        ctx.ui.notify("安全审查通过，未发现问题", "info");
+      } else {
+        ctx.ui.notify(formatSecurityReview(findings), "warning");
+      }
+    },
+  });
+
+  pi.registerCommand("plan-expand", {
+    description: "展开计划面板显示全部步骤",
+    handler: (_a, ctx) => {
+      planPanelExpanded = true;
+      updatePlanPanel(ctx);
+      ctx.ui.notify("计划面板已展开", "info");
+    },
+  });
+
+  pi.registerCommand("plan-collapse", {
+    description: "折叠计划面板，以当前步骤为中心滚动显示 " + DEFAULT_VISIBLE_STEPS + " 步",
+    handler: (_a, ctx) => {
+      planPanelExpanded = false;
+      updatePlanPanel(ctx);
+      ctx.ui.notify("计划面板已折叠为滚动视图", "info");
+    },
+  });
+
+  pi.registerCommand("plan-cancel", {
+    description: "终止当前计划，清除面板，回到空闲状态",
+    handler: (_a, ctx) => {
+      clearPlanPanel(ctx);
+      appState = "idle";
+      planAccepted = false;
+      planProduced = false;
+      needsPlan = false;
+      ctx.ui.notify("计划已终止，面板已清除", "info");
+    },
+  });
+
   /**
-   * 用户接受计划 — 切换到 WORK 模式执行（从弹窗或 /work 命令调用）
+   * 用户接受计划 - 切换到 WORK 模式执行
    */
   function acceptPlan(ctx: ExtensionContext) {
     planAccepted = true;
@@ -669,11 +742,11 @@ export default function (pi: ExtensionAPI) {
     setMode("work", ctx);
     appState = "working";
     if (!isSubAgent && planSteps.length > 0) updatePlanPanel(ctx);
-    ctx.ui.notify("✅ 计划已接受，切换到 WORK 模式执行", "info");
+    ctx.ui.notify("计划已接受，切换到 WORK 模式执行", "info");
   }
 
   // ============================================================
-  // before_agent_start: force plan mode + inject instructions
+  // before_agent_start: inject instructions
   // ============================================================
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -682,45 +755,33 @@ export default function (pi: ExtensionAPI) {
 
     if (mode === "yolo") return;
 
-    // 子进程不进入 plan 流程，直接执行
     if (isSubAgent) return;
 
-    if (needsPlan && mode !== "plan") setMode("plan", ctx);
-
+    // Respect manual /plan command; smart mode defaults to working
     if (mode === "plan") {
-      if (appState === "awaiting_confirm") return;
       appState = "planning";
-      return { systemPrompt: event.systemPrompt + PLAN_SYSTEM_PROMPT };
+    } else {
+      appState = "working";
     }
-
-    appState = "working";
+    return { systemPrompt: event.systemPrompt + SMART_PLAN_PROMPT };
   });
 
   // ============================================================
-  // message_end: plan detection (PLAN mode) + step advance (WORK mode)
+  // message_end: detect plan produced + parse steps
   // ============================================================
 
-  pi.on("message_end", (event, ctx) => {
-    // ---- PLAN mode: detect plan produced + parse steps ----
-    if (appState === "planning" && mode === "plan") {
-      const textParts = (event.message.content ?? []).filter(
-        (c: { type: string }) => c.type === "text",
-      );
-      if (textParts.length === 0) return;
+  pi.on("message_end", (event, _ctx) => {
+    const textParts = (event.message.content ?? []).filter(
+      (c: { type: string }) => c.type === "text",
+    );
+    if (textParts.length === 0) return;
+    if (!textParts.some((c: { text?: string }) => (c.text ?? "").trim().length > 50)) return;
+    const fullText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
 
-      const fullText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
-      if (!textParts.some((c: { text?: string }) => (c.text ?? "").trim().length > 50)) return;
-
-      const hasPlanPattern =
-        /(?:^|\n)\s*(?:#{1,3}|(?:\d+[.\)]|[-*])\s+\S{6,})/m.test(fullText) ||
-        hasWritableOperations(fullText) ||
-        /(?:执行计划|行动计划|实现方案|修改方案|以下(?:是|为).*(?:计划|方案|步骤))/i.test(fullText);
-
-      if (!hasPlanPattern) return;
-
+    // PLAN mode: detect plan produced (only first time, don't re-parse if already have steps)
+    if (appState === "planning" && mode === "plan" && planSteps.length === 0) {
       planProduced = true;
       planFullText = fullText;
-
       const parsed = parsePlanSteps(planFullText);
       if (parsed.length > 0) {
         planSteps = parsed;
@@ -729,177 +790,94 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // ---- WORK mode: 语义驱动步骤推进 ----
-    if (mode === "work" && planSteps.length > 0 && currentStepIndex >= 0) {
-      const textParts = (event.message.content ?? []).filter(
-        (c: { type: string }) => c.type === "text",
-      );
-      const workText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
+    // WORK mode: only detect when AI uses the explicit "## Execution Plan" marker
+    // 已有活跃计划时不再重复解析（防止执行过程中被覆盖）
+    if (appState === "working" && mode === "work" && !planProduced && planSteps.length === 0) {
+      const hasExplicitPlan = /(?:^|\n)##\s+Execution\s+Plan\s*\n/i.test(fullText);
 
-      // 计划完成检测
-      if (/\[PLAN_DONE\]|计划全部完成|所有步骤完成|全部任务完成/i.test(workText)) {
-        currentStepIndex = planSteps.length;
-        closePlanPanel(ctx);
-        ctx.ui.notify("✅ 计划全部完成", "success");
-        return;
-      }
-
-      // 步骤完成检测
-      if (/\[STEP_DONE\]|\[步骤完成\]|当前步骤已完成|这一步完成/i.test(workText)) {
-        currentStepIndex++;
-        toolCallsInCurrentStep = 0;
-        if (currentStepIndex >= planSteps.length) {
-          closePlanPanel(ctx);
-          ctx.ui.notify("✅ 计划所有步骤执行完成", "success");
-        } else {
-          updatePlanPanel(ctx);
-          ctx.ui.notify(`▶️ 推进到步骤 ${currentStepIndex + 1}/${planSteps.length}`, "info");
+      if (hasExplicitPlan) {
+        planProduced = true;
+        planFullText = fullText;
+        const parsed = parsePlanSteps(planFullText);
+        if (parsed.length > 0) {
+          planSteps = parsed;
+          currentStepIndex = -1;
         }
+        appState = "planning";
+        mode = "plan";
       }
     }
   });
 
   // ============================================================
-  // turn_end: 安全审查自循环（在 agent loop 内运行，真正自动）
-  // ============================================================
-
-  pi.on("turn_end", (_event, ctx) => {
-    if (isSubAgent) return;
-    if (appState !== "planning" || mode !== "plan" || !planProduced || !planFullText) return;
-    if (reviewCount >= MAX_REVIEW_ATTEMPTS) {
-      if (reviewCount === MAX_REVIEW_ATTEMPTS) {
-        ctx.ui.notify(`⏭ 安全审查已达上限 (${MAX_REVIEW_ATTEMPTS} 轮)，自动通过`, "info");
-        reviewCount = 0;
-      }
-      return;
-    }
-
-    // ---- 二次确认：跳过纯只读计划 ----
-    if (!hasWritableOperations(planFullText)) {
-      ctx.ui.notify("🔍 计划仅含只读操作，跳过安全审查", "info");
-      return;
-    }
-
-    const findings = securityReview(planFullText, planSteps);
-    const severeCount = findings.filter((f) => f.severity === "high").length;
-
-    if (findings.length > 0) {
-      reviewCount++;
-      const type = severeCount > 0 ? "error" : "warning";
-      ctx.ui.notify(
-        `🔄 安全审查 ${reviewCount}/${MAX_REVIEW_ATTEMPTS}: ${severeCount}🔴 ${findings.filter((f) => f.severity === "medium").length}🟡`,
-        type,
-      );
-
-      // 注入 steer → agent loop 内循环自动拾取 → AI 修订 → 下一轮 turn_end 再审查
-      pi.sendUserMessage(
-        `⚠️ 安全审查反馈（第 ${reviewCount} 轮）：\n` +
-          findings
-            .map((f) => `[${f.severity === "high" ? "高危" : f.severity === "medium" ? "中危" : "低危"}] ${f.category}: ${f.description}\n建议: ${f.suggestion}`)
-            .join("\n\n") +
-          "\n\n请针对以上问题修订你的计划后再提交。",
-        { deliverAs: "steer" },
-      );
-
-      // 重置 planProduced → AI 将重新输出计划 → MessageEnd 重新检测
-      planProduced = false;
-      planFullText = "";
-    }
-    // 审查通过 → 不做任何事，等 agent_end 弹窗
-  });
-
-  // ============================================================
-  // agent_end: 弹窗让用户决策（是/否/建议）
+  // agent_end: confirmation dialog
   // ============================================================
 
   pi.on("agent_end", async (_event, ctx) => {
-    // 清理审查状态
-    reviewCount = 0;
-    pendingSecurityFeedback = null;
-    ctx.ui.setWidget("security-review", undefined);
 
-    // 仅在 plan 产出后进入弹窗
+    // 仅在 plan 产出后进入弹窗 — 不自动运行安全审查（由 AI 自评或用户 /security-review 手动触发）
     if (appState === "planning" && mode === "plan" && planProduced) {
-      const findings = securityReview(planFullText, planSteps);
-      const severeCount = findings.filter((f) => f.severity === "high").length;
-      const summary =
-        findings.length > 0
-          ? `安全审查: ${severeCount}🔴 ${findings.filter((f) => f.severity === "medium").length}🟡 ${findings.filter((f) => f.severity === "low").length}🟢`
-          : "安全审查通过";
-
       if (isSubAgent) {
         const choice = await requestConfirm(
-          "plan_confirm", summary, planFullText.slice(0, 200),
+          "plan_confirm", "计划确认", planFullText.slice(0, 200),
           ["是", "否", "建议"],
         );
         if (choice === "是") {
           acceptPlan(ctx);
-          // agent_end 时 activeRun 还在，推迟到 finishRun 后启动执行
-          setTimeout(() => pi.sendUserMessage("请按计划步骤逐步执行"), 0);
+          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(advance) 推进面板");
         }
         else if (choice === "建议") {
           const s = await requestInput("请输入修改建议", "");
           if (s?.trim()) {
-            pi.sendUserMessage(`用户对计划的建议:\n${s}`, { deliverAs: "steer" });
-            appState = "planning"; planProduced = false;
+            pi.sendUserMessage("用户对计划的建议:" + s, { deliverAs: "steer" });
+            appState = "planning"; planProduced = false; planSteps = []; planFullText = "";
           } else { appState = "idle"; }
-        } else { ctx.ui.notify("⏸ 计划未被接受", "info"); appState = "idle"; }
+        } else { ctx.ui.notify("计划未被接受", "info"); appState = "idle"; }
       } else {
         const choice = await ctx.ui.select(
-          `${summary}\n\n是否接受此计划并开始执行？`,
-          ["✅ 是，开始执行", "❌ 否，停止等待", "💬 建议，修改计划"],
+          "是否接受此计划并开始执行？",
+          ["是，开始执行", "否，停止等待", "建议，修改计划"],
         );
-        if (choice === "✅ 是，开始执行") {
+        if (choice === "是，开始执行") {
           acceptPlan(ctx);
-          setTimeout(() => pi.sendUserMessage("请按计划步骤逐步执行，每个步骤完成后自动推进面板"), 0);
-        } else if (choice === "💬 建议，修改计划") {
+          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(advance) 推进面板");
+        } else if (choice === "建议，修改计划") {
           const s = await ctx.ui.editor("请输入修改建议（Esc 取消）", "");
           if (s?.trim()) {
-            pi.sendUserMessage(`用户对计划的建议:\n${s}`, { deliverAs: "steer" });
-            appState = "planning"; planProduced = false;
-          } else { ctx.ui.notify("⏸ 未输入建议", "info"); appState = "idle"; }
-        } else { ctx.ui.notify("⏸ 计划未被接受", "info"); appState = "idle"; }
+            pi.sendUserMessage("用户对计划的建议:" + s, { deliverAs: "steer" });
+            appState = "planning"; planProduced = false; planSteps = []; planFullText = "";
+          } else { ctx.ui.notify("未输入建议", "info"); appState = "idle"; }
+        } else { ctx.ui.notify("计划未被接受", "info"); appState = "idle"; }
       }
       return;
     }
-
     if (appState === "error" && pendingErrorInfo) return;
   });
 
   // ============================================================
-  // tool_execution_end: safety net — warn if too many calls without [STEP_DONE]
+  // tool_execution_end: refresh panel (auto-advance removed — use manage_plan)
   // ============================================================
 
   pi.on("tool_execution_end", (_event, ctx) => {
     if (mode !== "work" || planSteps.length === 0) return;
-    if (currentStepIndex < 0 || currentStepIndex >= planSteps.length) return;
-
-    toolCallsInCurrentStep++;
-    // 安全网：8 次工具调用未推进 → 提示
-    if (toolCallsInCurrentStep === 8) {
-      ctx.ui.notify(
-        `⚠️ 步骤 ${currentStepIndex + 1} 已执行 8 次工具调用未推进，输出 [STEP_DONE] 标记完成`,
-        "warning",
-      );
-    }
+    // Panel progression is now controlled by LLM via manage_plan(advance).
+    // This handler only refreshes the display; no auto-advance.
+    updatePlanPanel(ctx);
   });
 
   // ============================================================
-  // tool_result: detect errors → show recovery dialog
+  // tool_result: detect errors
   // ============================================================
 
   pi.on("tool_result", async (event, ctx) => {
-    // Only in WORK mode with an active plan
     if (mode !== "work" || planSteps.length === 0) return;
-    if (appState === "error") return; // already in recovery
+    if (appState === "error") return;
     if (currentStepIndex < 0 || currentStepIndex >= planSteps.length) return;
 
-    // Check if this tool result is an error
-    const isError = event.isError;
-    if (!isError && event.details?.exitCode === 0) return;
-    if (!isError && event.details?.exitCode === undefined) return; // non-bash non-error
+    // 仅框架级错误（isError=true）触发 error 状态；
+    // 命令返回非零退出码（exitCode != 0）是正常结果，由 AI 自行判断处理
+    if (!event.isError) return;
 
-    // It's an error — determine severity
     const textContent = event.content
       .filter((c: { type: string }) => c.type === "text")
       .map((c: { text?: string }) => c.text ?? "")
@@ -914,31 +892,27 @@ export default function (pi: ExtensionAPI) {
       textContent.includes("Access denied") ||
       textContent.includes("权限");
 
-    // Mark step as errored in the panel
     if (currentStepIndex < stepErrors.length) {
       stepErrors[currentStepIndex] = true;
     }
     appState = "error";
     updatePlanPanel(ctx);
 
-    // Save the error info
     const stepLabel = currentStepIndex < planSteps.length
       ? planSteps[currentStepIndex]
       : "当前步骤";
     pendingErrorInfo = {
       stepIndex: currentStepIndex,
-      message: `步骤「${stepLabel}」执行出错:\n${textContent.slice(0, 300)}`,
+      message: "步骤" + stepLabel + "执行出错:\n" + textContent.slice(0, 300),
       isSevere,
     };
 
     if (isSevere) {
-      // 严重错误 — 自动中止，不需要用户选择
-      ctx.ui.notify(`🚨 严重错误已中止: ${textContent.slice(0, 100)}`, "error");
-      ctx.ui.setStatus("work-mode", `MODE: ${mode.toUpperCase()} ⛔ 已中止`);
+      ctx.ui.notify("严重错误已中止: " + textContent.slice(0, 100), "error");
+      ctx.ui.setStatus("work-mode", "MODE: " + mode.toUpperCase() + " 已中止");
       return;
     }
 
-    // 一般错误 — 弹窗问用户
     if (isSubAgent) {
       const choice = await requestConfirm(
         "error_recovery",
@@ -949,7 +923,7 @@ export default function (pi: ExtensionAPI) {
       await handleErrorChoice(choice, ctx);
     } else {
       const choice = await ctx.ui.select(
-        `⚠️ 步骤出错\n\n${pendingErrorInfo.message}\n\n如何继续？`,
+        "步骤出错\n\n" + pendingErrorInfo.message + "\n\n如何继续？",
         ["继续执行 (跳过该步)", "重新规划", "中止执行"],
       );
       await handleErrorChoice(choice, ctx);
@@ -962,7 +936,6 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ) {
     if (choice === "继续执行" || choice === "继续执行 (跳过该步)") {
-      // 标记当前步已完成（带错误标记），继续下一步
       currentStepIndex++;
       toolCallsInCurrentStep = 0;
       if (currentStepIndex >= planSteps.length) {
@@ -971,37 +944,146 @@ export default function (pi: ExtensionAPI) {
       appState = "working";
       pendingErrorInfo = null;
       updatePlanPanel(ctx);
-      ctx.ui.notify("▶️ 已跳过错误，继续执行", "info");
+      ctx.ui.notify("已跳过错误，继续执行", "info");
     } else if (choice === "重新规划") {
-      // 切换回 PLAN 模式，保留已有步骤作为参考
       clearPlanPanel(ctx);
       setMode("plan", ctx);
       needsPlan = true;
       planAccepted = false;
       planProduced = false;
       appState = "planning";
-      ctx.ui.notify("🔄 已切换到 PLAN 模式，请重新制定计划", "info");
+      ctx.ui.notify("已切换到 PLAN 模式，请重新制定计划", "info");
     } else {
-      // 中止 — 保持 error 状态，阻止进一步操作
       appState = "error";
-      ctx.ui.notify("⏹ 执行已中止", "warning");
+      ctx.ui.notify("执行已中止", "warning");
     }
   }
 
   // ============================================================
-  // tool_call: block tools in error state + enforce mode rules
+  // manage_plan: AI 可操控计划面板
+  // ============================================================
+
+  pi.registerTool({
+    name: "manage_plan",
+    label: "Manage Plan",
+    description:
+      "操控计划面板：设置步骤、推进进度、标记错误、清除面板。" +
+      "让 AI 在执行过程中主动更新面板状态。",
+    promptSnippet: "Update the plan panel (set steps, advance, mark errors, clear)",
+    promptGuidelines: [
+      "Use manage_plan to update the execution plan panel during task execution.",
+      "Actions: 'set_steps' (replace all steps), 'advance' (move to next step), 'complete' (mark all done + close), 'mark_error' (flag a step as errored), 'clear' (remove panel).",
+      "Call advance after completing each major step so the panel stays in sync.",
+      "Use set_steps to replace the current plan with a refined one (max 10 steps).",
+      "Use clear when the task is done or the plan is no longer relevant.",
+    ],
+    parameters: Type.Object({
+      action: Type.String({ description: "操作: set_steps | advance | complete | mark_error | clear" }),
+      steps: Type.Optional(Type.Array(Type.String(), { description: "步骤列表 (set_steps 时使用，上限10)" })),
+      stepIndex: Type.Optional(Type.Number({ description: "步骤索引 (mark_error 时使用，0-based)" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      switch (params.action) {
+        case "set_steps": {
+          if (!params.steps || params.steps.length === 0) {
+            return {
+              content: [{ type: "text", text: "错误: set_steps 需要 steps 参数" }],
+              details: { error: "missing_steps" },
+            };
+          }
+          planSteps = params.steps.slice(0, MAX_PLAN_STEPS);
+          currentStepIndex = planSteps.length > 0 ? 0 : -1;
+          toolCallsInCurrentStep = 0;
+          stepErrors = new Array(planSteps.length).fill(false);
+          planPanelExpanded = planSteps.length <= DEFAULT_VISIBLE_STEPS;
+          pendingErrorInfo = null;
+          updatePlanPanel(ctx);
+          return {
+            content: [{ type: "text", text: `✅ 计划面板已更新: ${planSteps.length} 步` }],
+            details: { action: "set_steps", count: planSteps.length },
+          };
+        }
+        case "advance": {
+          if (planSteps.length === 0 || currentStepIndex < 0) {
+            return {
+              content: [{ type: "text", text: "没有活跃的计划步骤" }],
+              details: { error: "no_active_plan" },
+            };
+          }
+          currentStepIndex++;
+          toolCallsInCurrentStep = 0;
+          if (currentStepIndex >= planSteps.length) {
+            currentStepIndex = planSteps.length;
+            closePlanPanel(ctx);
+            return {
+              content: [{ type: "text", text: "✅ 所有步骤已完成，面板已关闭" }],
+              details: { action: "advance", completed: true },
+            };
+          }
+          updatePlanPanel(ctx);
+          return {
+            content: [{
+              type: "text",
+              text: `➡️ 推进到步骤 ${currentStepIndex + 1}/${planSteps.length}: ${planSteps[currentStepIndex].slice(0, 60)}`,
+            }],
+            details: { action: "advance", stepIndex: currentStepIndex, total: planSteps.length },
+          };
+        }
+        case "complete": {
+          currentStepIndex = planSteps.length;
+          closePlanPanel(ctx);
+          appState = "working";
+          return {
+            content: [{ type: "text", text: "✅ 计划已全部完成，面板已关闭" }],
+            details: { action: "complete" },
+          };
+        }
+        case "mark_error": {
+          const idx = params.stepIndex ?? currentStepIndex;
+          if (idx < 0 || idx >= planSteps.length) {
+            return {
+              content: [{ type: "text", text: `错误: stepIndex ${idx} 超出范围 (0-${planSteps.length - 1})` }],
+              details: { error: "invalid_index" },
+            };
+          }
+          stepErrors[idx] = true;
+          updatePlanPanel(ctx);
+          return {
+            content: [{ type: "text", text: `❌ 步骤 ${idx + 1} 已标记为错误: ${planSteps[idx].slice(0, 60)}` }],
+            details: { action: "mark_error", stepIndex: idx },
+          };
+        }
+        case "clear": {
+          clearPlanPanel(ctx);
+          return {
+            content: [{ type: "text", text: "🧹 计划面板已清除" }],
+            details: { action: "clear" },
+          };
+        }
+        default:
+          return {
+            content: [{ type: "text", text: `未知操作: ${params.action}\n支持: set_steps | advance | complete | mark_error | clear` }],
+            details: { error: "unknown_action" },
+          };
+      }
+    },
+  });
+
+  // ============================================================
+  // tool_call: enforce mode rules
   // ============================================================
 
   pi.on("tool_call", async (event, ctx) => {
-    // ---- Error state: all tools blocked ----
     if (appState === "error") {
+      // 错误状态下仅放行只读和管理工具，允许 LLM 查看现状或调整计划
+      const safeTools = ["read", "manage_plan", "check_agent_results", "context"];
+      if (safeTools.includes(event.toolName)) return;
       return {
         block: true,
-        reason: "⛔ 执行因错误已暂停。请选择：继续执行、重新规划 或 中止",
+        reason: "执行因错误已暂停。请选择：继续执行、重新规划 或 中止",
       };
     }
 
-    // ---- YOLO: no restrictions ----
     if (mode === "yolo") {
       if (isSubAgent) {
         return { block: true, reason: "YOLO mode not available for sub-agents" };
@@ -1009,7 +1091,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // ---- PLAN mode: strict ----
     if (mode === "plan") {
       if (
         isToolCallEventType("write", event) ||
@@ -1017,19 +1098,8 @@ export default function (pi: ExtensionAPI) {
       ) {
         return {
           block: true,
-          reason:
-            "❌ write/edit 在 PLAN 模式下被阻止。请先输出计划，系统将自动切换到 WORK 模式。",
+          reason: "write/edit 在 PLAN 模式下被阻止。请先输出计划，系统将自动切换到 WORK 模式。",
         };
-      }
-
-      if (
-        isToolCallEventType("write", event) ||
-        isToolCallEventType("edit", event)
-      ) {
-        const targetPath = resolvePath(ctx.cwd, (event as any).input.path ?? "");
-        if (isProtectedPath(targetPath)) {
-          return { block: true, reason: `❌ 不允许操作受保护路径: ${targetPath}` };
-        }
       }
 
       if (isToolCallEventType("bash", event) || isToolCallEventType("cmd", event)) {
@@ -1039,17 +1109,12 @@ export default function (pi: ExtensionAPI) {
           ctx, cmdAllowlist, "bash", "PLAN", cmdStr, isSubAgent,
           (e) => { event.input.command = e; return true; },
         );
-        if (!ok) return { block: true, reason: `${toolName} blocked in PLAN mode` };
-        if (typeof ok === "object" && ok.action === "suggest") {
-          pi.sendUserMessage(`用户对命令的建议:\n${ok.text}`, { deliverAs: "steer" });
-          return { block: true, reason: "已接收建议，请重新推理" };
-        }
-        if (ok === "dialog") confirmedCalls.set(event.toolCallId, `PLAN ${toolName} ✅`);
+        if (!ok) return { block: true, reason: toolName + " blocked in PLAN mode" };
+        if (ok === "dialog") confirmedCalls.set(event.toolCallId, "PLAN " + toolName + " ok");
       }
       return;
     }
 
-    // ---- WORK mode: safety checks ----
     if (mode === "work") {
       if (
         isToolCallEventType("write", event) ||
@@ -1057,7 +1122,7 @@ export default function (pi: ExtensionAPI) {
       ) {
         const targetPath = resolvePath(ctx.cwd, (event as any).input.path ?? "");
         if (isProtectedPath(targetPath)) {
-          return { block: true, reason: `❌ 不允许操作受保护路径: ${targetPath}` };
+          return { block: true, reason: "不允许操作受保护路径: " + targetPath };
         }
       }
 
@@ -1067,24 +1132,24 @@ export default function (pi: ExtensionAPI) {
         path = resolvePath(ctx.cwd, event.input.path);
         if (!isUnder(ctx.cwd, path)) {
           const ok = await confirmAndRemember(ctx, pathAllowlist, "path", "Read", path, isSubAgent);
-          if (!ok) return { block: true, reason: `read outside cwd: ${path}` };
-          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK read ✅");
+          if (!ok) return { block: true, reason: "read outside cwd: " + path };
+          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK read ok");
         }
       }
       if (isToolCallEventType("write", event)) {
         path = resolvePath(ctx.cwd, event.input.path);
         if (!isUnder(ctx.cwd, path)) {
           const ok = await confirmAndRemember(ctx, pathAllowlist, "path", "Write", path, isSubAgent);
-          if (!ok) return { block: true, reason: `write outside cwd: ${path}` };
-          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK write ✅");
+          if (!ok) return { block: true, reason: "write outside cwd: " + path };
+          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK write ok");
         }
       }
       if (isToolCallEventType("edit", event)) {
         path = resolvePath(ctx.cwd, event.input.path);
         if (!isUnder(ctx.cwd, path)) {
           const ok = await confirmAndRemember(ctx, pathAllowlist, "path", "Edit", path, isSubAgent);
-          if (!ok) return { block: true, reason: `edit outside cwd: ${path}` };
-          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK edit ✅");
+          if (!ok) return { block: true, reason: "edit outside cwd: " + path };
+          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK edit ok");
         }
       }
       if (isToolCallEventType("bash", event) || isToolCallEventType("cmd", event)) {
@@ -1095,31 +1160,22 @@ export default function (pi: ExtensionAPI) {
         if (destructiveCommands.test(cmdStr) && cmdStr.includes("..")) {
           const ok = await confirmAndRemember(ctx, cmdAllowlist, "bash", "WORK (destructive)", cmdStr, isSubAgent,
             (e) => { event.input.command = e; return true; });
-          if (!ok) return { block: true, reason: `${toolName} blocked: destructive command` };
-          if (typeof ok === "object" && ok.action === "suggest") {
-            pi.sendUserMessage(`用户对命令的建议:\n${ok.text}`, { deliverAs: "steer" });
-            return { block: true, reason: "已接收建议，请重新推理" };
-          }
-          if (ok === "dialog") confirmedCalls.set(event.toolCallId, `WORK ${toolName} ✅`);
+          if (!ok) return { block: true, reason: toolName + " blocked: destructive command" };
+          if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK " + toolName + " ok");
           return;
         }
 
         const ok = await confirmAndRemember(ctx, cmdAllowlist, "bash", "WORK", cmdStr, isSubAgent,
           (e) => { event.input.command = e; return true; });
-        if (!ok) return { block: true, reason: `${toolName} blocked` };
-        if (typeof ok === "object" && ok.action === "suggest") {
-          pi.sendUserMessage(`用户对命令的建议:\n${ok.text}`, { deliverAs: "steer" });
-          return { block: true, reason: "已接收建议，请重新推理" };
-        }
-        if (ok === "dialog") confirmedCalls.set(event.toolCallId, `WORK ${toolName} ✅`);
+        if (!ok) return { block: true, reason: toolName + " blocked" };
+        if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK " + toolName + " ok");
       }
       return;
     }
   });
 
   // ============================================================
-  // tool_result: tag confirmed calls (controlled tagging)
-  // 注：该 handler 与上面的错误检测 handler 并存，两者顺序无关
+  // tool_result: tag confirmed calls
   // ============================================================
 
   pi.on("tool_result", (event) => {
@@ -1133,7 +1189,7 @@ export default function (pi: ExtensionAPI) {
     if (idx >= 0) {
       event.content[idx] = {
         ...event.content[idx],
-        text: `[${label}]\n${event.content[idx].text}`,
+        text: "[" + label + "]\n" + event.content[idx].text,
       };
     }
   });

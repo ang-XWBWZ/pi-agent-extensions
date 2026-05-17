@@ -88,7 +88,7 @@ export function registerBusUI(ui: BusUI): () => void {
 export function requestInput(
   prompt: string,
   placeholder: string,
-  timeoutMs: number = 30_000,
+  timeoutMs: number = 60_000,
 ): Promise<string | undefined> {
   const reqId = randomUUID();
   return new Promise((resolve) => {

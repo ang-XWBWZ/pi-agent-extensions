@@ -9,14 +9,25 @@ import { Type } from "typebox";
 import { spawn, execSync } from "node:child_process";
 import { Text } from "@earendil-works/pi-tui";
 import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Buffer limit in bytes (~1MB)
-const MAX_OUTPUT_BYTES = 1_000_000;
-// Collapse threshold in characters
+/** 跨平台进程树清理（与 pi 内核 shell.ts 的 killProcessTree 等价）*/
+function killProcessTree(pid: number): void {
+  if (process.platform === "win32") {
+    try { spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", detached: true }); } catch { /* */ }
+  } else {
+    try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* */ } }
+  }
+}
+
+// Buffer limits — aligned with pi core truncate.ts (50KB / 2000 lines, whichever first)
+const MAX_OUTPUT_BYTES = 50 * 1024;
+const MAX_OUTPUT_LINES = 2000;
+// Collapse threshold in characters (UI streaming preview only)
 const COLLAPSE_THRESHOLD = 2000;
-// Truncation marker (matches bash tool style)
-const TRUNCATION_MARKER = "\n\n[Output truncated at ~1MB — full output saved to temp file]";
+// Truncation marker (matches pi core bash tool style)
+const TRUNCATION_MARKER = "\n\n[Output truncated at ~50KB/2000 lines — full output saved to temp file]";
 // Preview lines shown when collapsed
 const CMD_PREVIEW_LINES = 5;
 
@@ -59,7 +70,7 @@ export default function (pi: ExtensionAPI) {
       "Execute a shell command via cmd.exe on Windows. Returns stdout, stderr, and exit code. " +
       "Use this for directory listing (dir), file search (where, dir /s), pattern search (findstr), " +
       "or any other Windows shell commands. " +
-      `Output limited to ~${Math.round(MAX_OUTPUT_BYTES / 1024)}KB. ` +
+      `Output limited to ~${Math.round(MAX_OUTPUT_BYTES / 1024)}KB / ${MAX_OUTPUT_LINES} lines (whichever first). ` +
       "When truncated, full output saved to a temp file — use read tool to view it. " +
       "Use the timeout parameter (seconds) to adjust timeout; default 30s, no upper cap. " +
       "Use the codepage parameter for encoding: defaults to system code page; use 936 for GBK on Chinese Windows.",
@@ -210,11 +221,13 @@ export default function (pi: ExtensionAPI) {
         const child = spawn("cmd.exe", ["/c", params.command], {
           cwd: ctx?.cwd ?? process.cwd(),
           windowsHide: true,
+          windowsVerbatimArguments: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
 
         let output = "";
         let byteCount = 0;
+        let lineCount = 1;
         let truncated = false;
         let savedTempPath: string | undefined;
         let killed = false;
@@ -222,7 +235,7 @@ export default function (pi: ExtensionAPI) {
 
         const timer = setTimeout(() => {
           killed = true;
-          child.kill();
+          if (child.pid) killProcessTree(child.pid);
         }, timeoutSec * 1000);
 
         const finish = (result: Parameters<typeof resolve>[0]) => {
@@ -236,7 +249,7 @@ export default function (pi: ExtensionAPI) {
 
         // 1) 如果信号已经处于终止状态，直接提前结束
         if (signal?.aborted) {
-          child.kill();
+          if (child.pid) killProcessTree(child.pid);
           finish({
             content: [{ type: "text", text: "Cancelled (signal already aborted before execution)" }],
             details: { command: params.command, exitCode: -1, cancelled: true },
@@ -253,7 +266,7 @@ export default function (pi: ExtensionAPI) {
           if (output.length > 0 && !truncated) {
             saveTruncatedOutput(output);
           }
-          child.kill();
+          if (child.pid) killProcessTree(child.pid);
           // ★ 强制摧毁管道：Windows 上 child.kill() 只杀 cmd.exe，
           // 孙进程（如 ping -t, start 的后台进程）可能变成孤儿继续持有 stdout pipe，
           // 导致 close 事件永不触发，agent loop 永久卡死。
@@ -285,13 +298,13 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        // 保存完整输出到临时文件（bash 风格）
+        // 保存完整输出到临时文件（pi 内核风格：os.tmpdir()）
         async function saveTruncatedOutput(fullOutput: string): Promise<string | undefined> {
           try {
-            const tempDir = join(ctx?.cwd ?? process.cwd(), ".pi", "cmd-temp");
+            const tempDir = join(tmpdir(), "pi-cmd");
             const timestamp = Date.now();
             const rand = Math.random().toString(36).slice(2, 6);
-            const tempFile = join(tempDir, `cmd-output-${timestamp}-${rand}.txt`);
+            const tempFile = join(tempDir, `cmd-output-${timestamp}-${rand}.log`);
             await mkdir(tempDir, { recursive: true });
             await writeFile(tempFile, fullOutput, "utf8");
             return tempFile;
@@ -303,11 +316,16 @@ export default function (pi: ExtensionAPI) {
         const onOutputData = (chunk: Buffer) => {
           if (truncated) {
             // 截断后仍追加到完整缓冲（用于保存到文件），但不再流式推
-            output += decoder.decode(chunk, { stream: true });
+            const text = decoder.decode(chunk, { stream: true });
+            output += text;
+            lineCount += (text.match(/\n/g) || []).length;
             return;
           }
           byteCount += chunk.length;
-          if (byteCount > MAX_OUTPUT_BYTES) {
+          const text = decoder.decode(chunk, { stream: true });
+          output += text;
+          lineCount += (text.match(/\n/g) || []).length;
+          if (byteCount > MAX_OUTPUT_BYTES || lineCount > MAX_OUTPUT_LINES) {
             output += TRUNCATION_MARKER;
             truncated = true;
             // 异步保存完整输出
@@ -315,8 +333,6 @@ export default function (pi: ExtensionAPI) {
             saveTruncatedOutput(fullSnapshot).then((path) => {
               savedTempPath = path;
             });
-          } else {
-            output += decoder.decode(chunk, { stream: true });
           }
           scheduleUpdate();
         };

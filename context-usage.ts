@@ -9,13 +9,14 @@ import { Box, Text, matchesKey, Key, type Component } from "@earendil-works/pi-t
 
 // ---- helpers ----
 
+/** 粗略估算 token 数（1 token ≈ 4 英文字符 ≈ 1.5 中文字符） */
 function estimateTokens(text: string): number {
   let tokens = 0;
   for (const char of text) {
     const code = char.codePointAt(0) ?? 0;
-    if (code > 0x2000) tokens += 1 / 1.5;
-    else if (char === " " || char === "\n" || char === "\t") tokens += 1 / 6;
-    else tokens += 1 / 3.5;
+    if (code >= 0x4e00) tokens += 1 / 1.5;        // CJK
+    else if (char === " " || char === "\n") tokens += 1 / 6;
+    else tokens += 1 / 4;                           // ASCII/其他
   }
   return Math.round(tokens);
 }
@@ -27,37 +28,30 @@ function fmt(n: number): string {
 }
 
 function pct(part: number, total: number): string {
-  if (total <= 0) return " 0.0%";
-  return ((part / total) * 100).toFixed(1).padStart(5) + "%";
+  if (total <= 0) return "  0.0%";
+  return ((part / total) * 100).toFixed(1).padStart(6) + "%";
 }
 
-function extractXmlBlock(text: string, tag: string): string {
-  const open = `<${tag}>`;
-  const close = `</${tag}>`;
-  const start = text.indexOf(open);
-  if (start === -1) return "";
-  const end = text.indexOf(close, start + open.length);
-  if (end === -1) return "";
-  return text.slice(start + open.length, end);
+/** 从 system prompt 中提取 <available_skills> 块 */
+function extractSkillsBlock(systemPrompt: string): string {
+  const match = systemPrompt.match(/<available_skills>([\s\S]*?)<\/available_skills>/);
+  return match ? match[1] : "";
 }
 
 // ---- 浮层组件 ----
 
-/** 一个只读文本面板，Escape/Enter 关闭 */
 class ContextPanel implements Component {
   private text: Text;
   private box: Box;
-  private onClose: () => void;
 
-  constructor(content: string, onClose: () => void) {
-    this.onClose = onClose;
+  constructor(content: string, private onClose: () => void) {
     this.text = new Text(content, 2, 1);
     this.box = new Box(0, 0);
     this.box.addChild(this.text);
   }
 
   render(width: number): string[] {
-    return this.box.render(width);
+    return this.box.render(Math.max(width, 40));
   }
 
   handleInput(data: string): void {
@@ -86,45 +80,38 @@ export default function (pi: ExtensionAPI) {
       }
 
       const cw = usage.contextWindow;
+      const total = usage.tokens;
+      const totalPct = usage.percent;
 
       // --- 解析各部分 ---
-      const skillsBlock = extractXmlBlock(systemPrompt, "available_skills");
+      const skillsBlock = extractSkillsBlock(systemPrompt);
       const skillsTok = estimateTokens(skillsBlock);
 
-      const openTag = "<available_skills>";
-      const closeTag = "</available_skills>";
-      const si = systemPrompt.indexOf(openTag);
-      const ei = systemPrompt.indexOf(closeTag, si);
-      const sysNoSkills =
-        si !== -1 && ei !== -1
-          ? systemPrompt.slice(0, si) + systemPrompt.slice(ei + closeTag.length)
-          : systemPrompt;
+      // System = 完整 system prompt 去掉 skills 块后的 token 估计
+      const sysNoSkills = systemPrompt.replace(/<available_skills>[\s\S]*?<\/available_skills>/, "");
       const baseSysTok = estimateTokens(sysNoSkills);
 
-      const total = usage.tokens!;
-      const totalPct = usage.percent;
       const userCtxTok = Math.max(0, total - baseSysTok - skillsTok);
       const estTotal = baseSysTok + skillsTok + userCtxTok;
 
       // --- 构建内容 ---
       const content = [
-        "📊 上下文统计",
+        "\u{1F4CA} 上下文统计",
         "",
-        `总用量      ${String(fmt(total)).padStart(6)} / ${String(fmt(cw)).padStart(6)} tokens   ${String(totalPct?.toFixed(1) ?? "??").padStart(5)}%`,
+        `总用量      ${fmt(total).padStart(6)} / ${fmt(cw).padStart(6)} tokens   ${totalPct?.toFixed(1) ?? "??"}%`,
         "",
-        "── 明细 ────────────────────",
+        "\u2500\u2500 明细 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
         "",
-        `System     ${String(fmt(baseSysTok)).padStart(6)} tokens   ${pct(baseSysTok, cw)}`,
-        `Skills     ${String(fmt(skillsTok)).padStart(6)} tokens   ${pct(skillsTok, cw)}`,
-        `用户上下文  ${String(fmt(userCtxTok)).padStart(6)} tokens   ${pct(userCtxTok, cw)}`,
+        `System      ${fmt(baseSysTok).padStart(6)} tokens  ${pct(baseSysTok, cw)}`,
+        `Skills      ${fmt(skillsTok).padStart(6)} tokens  ${pct(skillsTok, cw)}`,
+        `用户上下文   ${fmt(userCtxTok).padStart(6)} tokens  ${pct(userCtxTok, cw)}`,
         "",
-        `合计(估算) ${String(fmt(estTotal)).padStart(6)} tokens   ${pct(estTotal, cw)}`,
-        `模型报告   ${String(fmt(total)).padStart(6)} tokens   ${pct(total, cw)}`,
+        `合计(估算)  ${fmt(estTotal).padStart(6)} tokens  ${pct(estTotal, cw)}`,
+        `模型报告    ${fmt(total).padStart(6)} tokens  ${pct(total, cw)}`,
         "",
-        "按 Escape / Enter 关闭",
+        "Esc / Enter 关闭",
       ].join("\n");
 
-      // 浮层显示
       await ctx.ui.custom<undefined>(
         (_tui, _theme, _keybindings, done) => {
           return new ContextPanel(content, () => done(undefined));

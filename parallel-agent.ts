@@ -76,45 +76,24 @@ async function loadContext(paths: string[], cwd: string): Promise<string> {
 }
 
 async function loadSkill(name: string): Promise<string> {
-  const skillPath = resolve(
-    `${process.env.USERPROFILE}\\.agents\\skills`,
-    name,
-    "SKILL.md",
-  );
-  try {
-    await access(skillPath);
-    const content = await readFile(skillPath, "utf-8");
-    return `\n--- SKILL: ${name} ---\n${content.slice(0, 30_000)}`;
-  } catch {
-    return `\n[无法加载 skill: ${name}]`;
+  // 按优先级尝试多个路径：项目 skills → pi agent skills → 全局 .agents/skills
+  const searchPaths = [
+    resolve(process.cwd(), "skills", name, "SKILL.md"),
+    resolve(process.env.USERPROFILE ?? ".", ".pi", "agent", "skills", name, "SKILL.md"),
+    resolve(process.env.USERPROFILE ?? ".", ".agents", "skills", name, "SKILL.md"),
+  ];
+  for (const skillPath of searchPaths) {
+    try {
+      await access(skillPath);
+      const content = await readFile(skillPath, "utf-8");
+      return `\n--- SKILL: ${name} ---\n${content.slice(0, 30_000)}`;
+    } catch { /* try next */ }
   }
+  return `\n[无法加载 skill: ${name}]`;
 }
 
-// ---- 初始化锁（防止 globalThis 竞态） ----
-
-class InitLock {
-  private _locked = false;
-  private _queue: (() => void)[] = [];
-
-  async acquire(): Promise<void> {
-    if (!this._locked) {
-      this._locked = true;
-      return;
-    }
-    return new Promise((resolve) => this._queue.push(resolve));
-  }
-
-  release(): void {
-    if (this._queue.length > 0) {
-      const next = this._queue.shift()!;
-      next();
-    } else {
-      this._locked = false;
-    }
-  }
-}
-
-const initLock = new InitLock();
+// ---- Session 创建串行化（防止并发 globalThis 写入） ----
+let sessionChain = Promise.resolve();
 
 // ---- 单子 Agent 执行（事件驱动，注册实例） ----
 
@@ -132,18 +111,19 @@ function runSingleAgent(
   const name =
     task.prompt.slice(0, 20).replace(/\n/g, " ").trim() || task.id;
 
-  return new Promise(async (resolve) => {
+  return new Promise((resolve) => {
     let settled = false;
 
     const finish = (result: SubResult) => {
       if (settled) return;
       settled = true;
-      // 清理注册
-      try { unregisterInstance(jobId, task.id); } catch { /* */ }
+      try { unregisterInstance(jobId, task.id); } catch (e) { console.warn("[parallel-agent] unregisterInstance 失败:", e); }
       resolve(result);
     };
 
-    try {
+    // 异步执行体：避免 async Promise executor 反模式
+    (async () => {
+      try {
       // 上下文 + skill 注入
       let extra = "";
       if (task.context?.length) extra += await loadContext(task.context, cwd);
@@ -154,28 +134,28 @@ function runSingleAgent(
         ? `${task.prompt}\n\n[注入上下文]\n${extra}`
         : task.prompt;
 
-      // ---- 加锁保护 globalThis 设置 ----
-      await initLock.acquire();
-      let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
-      try {
+      // ---- 串行化 globalThis 写入（Promise 链替代 InitLock） ----
+      sessionChain = sessionChain.then(async () => {
         (globalThis as Record<string, unknown>).__pi_default_mode =
           task.mode || "plan";
         (globalThis as Record<string, unknown>).__pi_is_sub_agent = true;
 
-        const sm = SessionManager.inMemory();
-        const created = await createAgentSession({
-          sessionManager: sm,
-          authStorage,
-          modelRegistry,
-          model: subModel,
-          cwd,
-        });
-        session = created.session;
-      } finally {
-        delete (globalThis as Record<string, unknown>).__pi_default_mode;
-        delete (globalThis as Record<string, unknown>).__pi_is_sub_agent;
-        initLock.release();
-      }
+        try {
+          const sm = SessionManager.inMemory();
+          const created = await createAgentSession({
+            sessionManager: sm,
+            authStorage,
+            modelRegistry,
+            model: subModel,
+            cwd,
+          });
+          return created.session;
+        } finally {
+          delete (globalThis as Record<string, unknown>).__pi_default_mode;
+          delete (globalThis as Record<string, unknown>).__pi_is_sub_agent;
+        }
+      });
+      const session = await sessionChain;
 
       // ---- 外部控制状态 ----
       let abortedExternally = false;
@@ -203,9 +183,9 @@ function runSingleAgent(
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
           abortedExternally = false;
-          try { unsub(); } catch { /* */ }
-          try { session.abort(); } catch { /* */ }
-          try { session.dispose(); } catch { /* */ }
+          try { unsub(); } catch (e) { console.warn("[parallel-agent] unsub 失败:", e); }
+          try { session.abort(); } catch (e) { console.warn("[parallel-agent] session.abort 失败:", e); }
+          try { session.dispose(); } catch (e) { console.warn("[parallel-agent] session.dispose 失败:", e); }
           finish({
             id: task.id,
             name,
@@ -250,15 +230,16 @@ function runSingleAgent(
 
       // 启动子 Agent
       await session.prompt(prompt);
-    } catch (err: unknown) {
-      finish({
-        id: task.id,
-        name,
-        order,
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+      } catch (err: unknown) {
+        finish({
+          id: task.id,
+          name,
+          order,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
   });
 }
 
@@ -364,6 +345,7 @@ export default function (pi: ExtensionAPI) {
     bus.on(Events.TASK_RESULT, onEvent);
 
     // 定时刷新（兜底 outputLength 更新）
+    if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
     widgetRefreshTimer = setInterval(refreshWidget, 1500);
 
     ctx.ui.setWidget("sub-agents", (tui, theme) => {
@@ -398,7 +380,7 @@ export default function (pi: ExtensionAPI) {
 
           return lines;
         },
-        invalidate: () => {},
+        invalidate: () => tui.requestRender?.(),
       };
     });
   });
@@ -442,10 +424,13 @@ export default function (pi: ExtensionAPI) {
       timeout: Type.Optional(Type.Number({ description: "单任务超时秒（默认 60）" })),
       autoInject: Type.Optional(Type.Boolean({ description: "完成后自动推送结果到主对话（默认 true）" })),
     }),
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const total = params.tasks.length;
       const deadline = (params.timeout ?? 60) * 1000;
       const autoInject = params.autoInject !== false; // 默认 true
+
+      // AbortSignal: 操作前检查
+      if (signal?.aborted) throw new Error("操作已取消");
 
       let defaultModel: Model<any> | undefined = undefined;
       if (ctx.model) defaultModel = ctx.model as Model<any>;
@@ -554,7 +539,10 @@ export default function (pi: ExtensionAPI) {
       wait: Type.Optional(Type.Boolean({ description: "是否阻塞等待完成（默认 false）" })),
       timeout: Type.Optional(Type.Number({ description: "等待超时秒（默认 300）" })),
     }),
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      // AbortSignal: 操作前检查
+      if (signal?.aborted) throw new Error("操作已取消");
+
       if (!params.jobId) {
         const allJobs = listJobs();
         if (allJobs.length === 0) {
@@ -627,7 +615,7 @@ export default function (pi: ExtensionAPI) {
       const waitTimeout = (params.timeout ?? 300) * 1000;
       ctx.ui.notify(`⏳ 等待 Job ${params.jobId.slice(0, 8)} 完成...`, "info");
 
-      const completedJob = await waitForJob(params.jobId, waitTimeout);
+      const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
       ctx.ui.setStatus("sub-agent", undefined);
 
       const elapsed = completedJob.finishedAt
@@ -655,7 +643,9 @@ export default function (pi: ExtensionAPI) {
       type: Type.Optional(StringEnum(["info", "request", "response", "error"] as const)),
       payload: Type.String({ description: "消息内容" }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      // AbortSignal: 操作前检查
+      if (signal?.aborted) throw new Error("操作已取消");
       const msgId = sendMessage("main", params.to, params.type ?? "info", params.payload);
       return {
         content: [{ type: "text", text: `📨 消息已发送 → ${params.to} (id: ${msgId.slice(0, 8)})` }],
@@ -687,7 +677,9 @@ export default function (pi: ExtensionAPI) {
       taskId: Type.Optional(Type.String({ description: "Task ID（单 agent 操作时必填）" })),
       input: Type.Optional(Type.String({ description: "消息内容（send/resume 操作时使用）" })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      // AbortSignal: 操作前检查
+      if (signal?.aborted) throw new Error("操作已取消");
       const { action, jobId, taskId, input } = params;
 
       // ---- list: 列出所有实例 ----
@@ -834,7 +826,7 @@ function formatJobResult(job: AgentJob, elapsed: string) {
   const body = job.results.map((r) => {
     const icon = r.ok ? "✅" : "❌";
     const text = r.ok
-      ? (r.output ?? "").slice(0, 300)
+      ? (r.output ?? "").slice(0, 500)
       : `错误: ${r.error ?? "未知"}`;
     return `${icon} [${r.order}/${job.total}] ${r.name}\n   ${text}\n`;
   });
@@ -852,7 +844,7 @@ function formatJobResult(job: AgentJob, elapsed: string) {
         id: r.id,
         name: r.name,
         ok: r.ok,
-        output: r.output?.slice(0, 200),
+        output: r.output?.slice(0, 500),
         error: r.error,
       })),
     },
