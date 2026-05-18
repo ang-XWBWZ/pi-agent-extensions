@@ -32,6 +32,15 @@ import {
 type WorkMode = "plan" | "work" | "yolo";
 type AppState = "idle" | "planning" | "awaiting_confirm" | "working" | "error";
 
+/** 步骤状态 —— 逻辑顺序模型：每步有独立生命周期 */
+type StepStatus = "pending" | "current" | "done" | "error" | "skipped";
+
+interface PlanStep {
+  id: number;
+  text: string;
+  status: StepStatus;
+}
+
 interface ModeEntry {
   type: "custom";
   customType: "work-mode-state";
@@ -212,14 +221,14 @@ const MAX_PLAN_STEPS = 10;
 const DEFAULT_VISIBLE_STEPS = 5;
 
 /** 从 AI 输出的计划文本中提取步骤列表 —— 仅解析 ## Execution Plan 段落 */
-function parsePlanSteps(text: string): string[] {
+function parsePlanSteps(text: string): PlanStep[] {
   // 只提取 ## Execution Plan 之后到下一个 ## 标题或文件末尾的内容
   const planMatch = text.match(/(?:^|\n)##\s+Execution\s+Plan\s*\n([\s\S]*?)(?:\n##\s|\n*$)/i);
   const section = planMatch ? planMatch[1] : "";
   if (!section.trim()) return [];
 
   const lines = section.split("\n");
-  const steps: string[] = [];
+  const steps: PlanStep[] = [];
   let inCodeBlock = false;
 
   for (const raw of lines) {
@@ -231,33 +240,35 @@ function parsePlanSteps(text: string): string[] {
     const numbered = line.match(/^\s*(?:\d+[\.\)]|[a-z][\.\)])\s+(.+)/i);
     if (numbered) {
       const desc = numbered[1].trim();
-      if (desc.length > 3) { steps.push(desc); continue; }
+      if (desc.length > 3) { steps.push({ id: ++stepIdCounter, text: desc, status: "pending" }); continue; }
     }
 
     const bullet = line.match(/^\s*[-*]\s+(.+)/);
     if (bullet) {
       const desc = bullet[1].trim();
-      if (desc.length > 3) { steps.push(desc); continue; }
+      if (desc.length > 3) { steps.push({ id: ++stepIdCounter, text: desc, status: "pending" }); continue; }
     }
   }
 
-  return steps.slice(0, MAX_PLAN_STEPS);
+  const result = steps.slice(0, MAX_PLAN_STEPS);
+  // 第一个步骤自动标记为 current
+  if (result.length > 0) result[0].status = "current";
+  return result;
 }
 
-/** 渲染计划面板行（含错误状态、折叠支持） */
+/** 渲染计划面板行（逻辑顺序模型 —— 每步独立状态） */
 function renderPlanPanel(
-  steps: string[],
-  currentIdx: number,
-  errors: boolean[],
+  steps: PlanStep[],
   theme: any,
   expanded: boolean,
 ): string[] {
   if (steps.length === 0) return [];
 
+  const currentIdx = steps.findIndex(s => s.status === "current");
   const header = theme?.fg("accent", theme?.bold("执行计划")) ?? "执行计划";
   const lines: string[] = [header, ""];
 
-  // 滑动窗口：展开模式显示全部，否则以 currentIdx 为中心显示 5 步
+  // 滑动窗口
   let windowStart: number;
   let windowEnd: number;
   const collapsed = !expanded && steps.length > DEFAULT_VISIBLE_STEPS;
@@ -266,50 +277,54 @@ function renderPlanPanel(
     windowStart = 0;
     windowEnd = steps.length;
   } else if (currentIdx < 0) {
-    // 计划阶段尚未开始执行，显示前 5 步
     windowStart = 0;
     windowEnd = Math.min(steps.length, DEFAULT_VISIBLE_STEPS);
   } else {
-    // 以当前步骤为中心，前 2 后 2（共 5 步可见）
     const half = Math.floor(DEFAULT_VISIBLE_STEPS / 2);
     windowStart = Math.max(0, currentIdx - half);
     windowEnd = Math.min(steps.length, windowStart + DEFAULT_VISIBLE_STEPS);
-    // 靠近末尾时，窗口起点往前移以保持 5 步可见
     if (windowEnd - windowStart < DEFAULT_VISIBLE_STEPS) {
       windowStart = Math.max(0, windowEnd - DEFAULT_VISIBLE_STEPS);
     }
   }
 
-  // 窗口前省略提示
   if (windowStart > 0) {
-    lines.push(theme?.fg("muted", `  ... 前 ${windowStart} 步已完成`) ?? `  ... 前 ${windowStart} 步已完成`);
+    lines.push(theme?.fg("muted", `  ... 前 ${windowStart} 步`) ?? `  ... 前 ${windowStart} 步`);
   }
 
   for (let i = windowStart; i < windowEnd; i++) {
+    const step = steps[i];
     let icon: string;
     let style: (s: string) => string;
 
-    if (errors[i]) {
-      icon = "❌";
-      style = (s) => theme?.fg("error", s) ?? s;
-    } else if (i < currentIdx) {
-      icon = "✅";
-      style = (s) => theme?.fg("success", s) ?? s;
-    } else if (i === currentIdx) {
-      icon = "▶";
-      style = (s) => theme?.fg("accent", s) ?? s;
-    } else {
-      icon = "○";
-      style = (s) => theme?.fg("muted", s) ?? s;
+    switch (step.status) {
+      case "error":
+        icon = "❌";
+        style = (s) => theme?.fg("error", s) ?? s;
+        break;
+      case "skipped":
+        icon = "⏭";
+        style = (s) => theme?.fg("muted", s) ?? s;
+        break;
+      case "done":
+        icon = "✅";
+        style = (s) => theme?.fg("success", s) ?? s;
+        break;
+      case "current":
+        icon = "▶";
+        style = (s) => theme?.fg("accent", s) ?? s;
+        break;
+      default: // pending
+        icon = "○";
+        style = (s) => theme?.fg("muted", s) ?? s;
     }
 
-    const label = steps[i].length > 70
-      ? steps[i].slice(0, 67) + "..."
-      : steps[i];
+    const label = step.text.length > 70
+      ? step.text.slice(0, 67) + "..."
+      : step.text;
     lines.push(" " + icon + " " + style(label));
   }
 
-  // 窗口后省略提示
   if (windowEnd < steps.length) {
     const remaining = steps.length - windowEnd;
     lines.push(theme?.fg("muted", `  ... 后 ${remaining} 步待执行`) ?? `  ... 后 ${remaining} 步待执行`);
@@ -535,13 +550,28 @@ export default function (pi: ExtensionAPI) {
   let needsPlan = false;
   let planAccepted = false;
 
-  // Plan panel state
-  let planSteps: string[] = [];
+  // Plan panel state — logical step model (each step has independent lifecycle)
+  let planSteps: PlanStep[] = [];
   let planFullText = "";
-  let currentStepIndex = -1;
-  let toolCallsInCurrentStep = 0;
-  let stepErrors: boolean[] = [];
+  let stepIdCounter = 0;
   let planPanelExpanded = false;
+
+  /** 获取当前活跃步骤（第一个 status==="current" 的步骤，无则 -1） */
+  function getCurrentStepIndex(): number {
+    return planSteps.findIndex(s => s.status === "current");
+  }
+
+  /** 获取步骤总数 */
+  function getStepCount(): number { return planSteps.length; }
+
+  /** 清除所有步骤状态 */
+  function clearAllSteps() {
+    planSteps = [];
+    planFullText = "";
+    stepIdCounter = 0;
+    planPanelExpanded = false;
+    pendingErrorInfo = null;
+  }
 
   // Error recovery
   let pendingErrorInfo: { stepIndex: number; message: string; isSevere: boolean } | null = null;
@@ -601,7 +631,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     ctx.ui.setWidget("plan-panel", (tui, theme) => ({
-      render: () => renderPlanPanel(planSteps, currentStepIndex, stepErrors, theme, planPanelExpanded),
+      render: () => renderPlanPanel(planSteps, theme, planPanelExpanded),
       invalidate: () => tui.requestRender?.(),
     }));
   }
@@ -609,23 +639,13 @@ export default function (pi: ExtensionAPI) {
   /** 关闭计划面板（完成时调用，清理状态防止重渲染） */
   function closePlanPanel(ctx: ExtensionContext) {
     if (isSubAgent) return;
-    planSteps = [];
-    planFullText = "";
-    currentStepIndex = -1;
-    toolCallsInCurrentStep = 0;
-    stepErrors = [];
+    clearAllSteps();
     ctx.ui.setWidget("plan-panel", undefined);
   }
 
   /** 清除计划面板 */
   function clearPlanPanel(ctx: ExtensionContext) {
-    planSteps = [];
-    planFullText = "";
-    currentStepIndex = -1;
-    toolCallsInCurrentStep = 0;
-    stepErrors = [];
-    planPanelExpanded = false;
-    pendingErrorInfo = null;
+    clearAllSteps();
     ctx.ui.setWidget("plan-panel", undefined);
   }
 
@@ -735,9 +755,6 @@ export default function (pi: ExtensionAPI) {
   function acceptPlan(ctx: ExtensionContext) {
     planAccepted = true;
     needsPlan = false;
-    currentStepIndex = planSteps.length > 0 ? 0 : -1;
-    toolCallsInCurrentStep = 0;
-    stepErrors = new Array(planSteps.length).fill(false);
     pendingErrorInfo = null;
     setMode("work", ctx);
     appState = "working";
@@ -785,7 +802,6 @@ export default function (pi: ExtensionAPI) {
       const parsed = parsePlanSteps(planFullText);
       if (parsed.length > 0) {
         planSteps = parsed;
-        currentStepIndex = -1;
       }
       return;
     }
@@ -801,7 +817,6 @@ export default function (pi: ExtensionAPI) {
         const parsed = parsePlanSteps(planFullText);
         if (parsed.length > 0) {
           planSteps = parsed;
-          currentStepIndex = -1;
         }
         appState = "planning";
         mode = "plan";
@@ -824,13 +839,13 @@ export default function (pi: ExtensionAPI) {
         );
         if (choice === "是") {
           acceptPlan(ctx);
-          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(advance) 推进面板");
+          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板");
         }
         else if (choice === "建议") {
           const s = await requestInput("请输入修改建议", "");
           if (s?.trim()) {
             pi.sendUserMessage("用户对计划的建议:" + s, { deliverAs: "steer" });
-            appState = "planning"; planProduced = false; planSteps = []; planFullText = "";
+            appState = "planning"; planProduced = false; clearAllSteps();
           } else { appState = "idle"; }
         } else { ctx.ui.notify("计划未被接受", "info"); appState = "idle"; }
       } else {
@@ -840,12 +855,12 @@ export default function (pi: ExtensionAPI) {
         );
         if (choice === "是，开始执行") {
           acceptPlan(ctx);
-          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(advance) 推进面板");
+          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板");
         } else if (choice === "建议，修改计划") {
           const s = await ctx.ui.editor("请输入修改建议（Esc 取消）", "");
           if (s?.trim()) {
             pi.sendUserMessage("用户对计划的建议:" + s, { deliverAs: "steer" });
-            appState = "planning"; planProduced = false; planSteps = []; planFullText = "";
+            appState = "planning"; planProduced = false; clearAllSteps();
           } else { ctx.ui.notify("未输入建议", "info"); appState = "idle"; }
         } else { ctx.ui.notify("计划未被接受", "info"); appState = "idle"; }
       }
@@ -872,7 +887,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", async (event, ctx) => {
     if (mode !== "work" || planSteps.length === 0) return;
     if (appState === "error") return;
-    if (currentStepIndex < 0 || currentStepIndex >= planSteps.length) return;
+
+    const currentIdx = getCurrentStepIndex();
+    if (currentIdx < 0) return;
 
     // 仅框架级错误（isError=true）触发 error 状态；
     // 命令返回非零退出码（exitCode != 0）是正常结果，由 AI 自行判断处理
@@ -892,17 +909,14 @@ export default function (pi: ExtensionAPI) {
       textContent.includes("Access denied") ||
       textContent.includes("权限");
 
-    if (currentStepIndex < stepErrors.length) {
-      stepErrors[currentStepIndex] = true;
-    }
+    // 标记当前步骤为 error
+    planSteps[currentIdx].status = "error";
     appState = "error";
     updatePlanPanel(ctx);
 
-    const stepLabel = currentStepIndex < planSteps.length
-      ? planSteps[currentStepIndex]
-      : "当前步骤";
+    const stepLabel = planSteps[currentIdx].text;
     pendingErrorInfo = {
-      stepIndex: currentStepIndex,
+      stepIndex: currentIdx,
       message: "步骤" + stepLabel + "执行出错:\n" + textContent.slice(0, 300),
       isSevere,
     };
@@ -936,10 +950,14 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ) {
     if (choice === "继续执行" || choice === "继续执行 (跳过该步)") {
-      currentStepIndex++;
-      toolCallsInCurrentStep = 0;
-      if (currentStepIndex >= planSteps.length) {
-        currentStepIndex = planSteps.length;
+      // 当前步骤标记为 skipped，下一步标记为 current
+      const currIdx = getCurrentStepIndex();
+      if (currIdx >= 0 && currIdx < planSteps.length) {
+        planSteps[currIdx].status = "skipped";
+      }
+      const nextIdx = currIdx + 1;
+      if (nextIdx < planSteps.length) {
+        planSteps[nextIdx].status = "current";
       }
       appState = "working";
       pendingErrorInfo = null;
@@ -960,7 +978,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ============================================================
-  // manage_plan: AI 可操控计划面板
+  // manage_plan: AI 可操控计划面板（逻辑顺序模型）
   // ============================================================
 
   pi.registerTool({
@@ -972,99 +990,120 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Update the plan panel (set steps, advance, mark errors, clear)",
     promptGuidelines: [
       "Use manage_plan to update the execution plan panel during task execution.",
-      "Actions: 'set_steps' (replace all steps), 'advance' (move to next step), 'complete' (mark all done + close), 'mark_error' (flag a step as errored), 'clear' (remove panel).",
-      "Call advance after completing each major step so the panel stays in sync.",
+      "Actions: 'set_steps' (replace all steps), 'set_step_status' (set a step's status), 'insert_step' (insert at position), 'delete_step' (remove by id/index), 'update_step' (edit step text), 'complete' (mark all done + close), 'clear' (remove panel).",
+      "Step statuses: 'pending' | 'current' | 'done' | 'error' | 'skipped'. Only ONE step should be 'current' at a time.",
+      "Use set_step_status to advance: mark current step 'done', mark next step 'current'.",
       "Use set_steps to replace the current plan with a refined one (max 10 steps).",
       "Use clear when the task is done or the plan is no longer relevant.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "操作: set_steps | advance | complete | mark_error | clear" }),
-      steps: Type.Optional(Type.Array(Type.String(), { description: "步骤列表 (set_steps 时使用，上限10)" })),
-      stepIndex: Type.Optional(Type.Number({ description: "步骤索引 (mark_error 时使用，0-based)" })),
+      action: Type.String({ description: "操作: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear" }),
+      steps: Type.Optional(Type.Array(Type.String(), { description: "步骤文本列表 (set_steps 时使用，上限10)" })),
+      stepId: Type.Optional(Type.Number({ description: "步骤 id（set_step_status/delete_step/update_step 时使用）" })),
+      stepIndex: Type.Optional(Type.Number({ description: "步骤索引（insert_step 时使用，0-based，默认追加到末尾）" })),
+      status: Type.Optional(Type.String({ description: "步骤状态: pending | current | done | error | skipped（set_step_status 时使用）" })),
+      text: Type.Optional(Type.String({ description: "步骤文本（insert_step/update_step 时使用）" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const isStatus = (s: unknown): s is StepStatus =>
+        s === "pending" || s === "current" || s === "done" || s === "error" || s === "skipped";
+
       switch (params.action) {
+        // ── 全量设置步骤 ──
         case "set_steps": {
           if (!params.steps || params.steps.length === 0) {
-            return {
-              content: [{ type: "text", text: "错误: set_steps 需要 steps 参数" }],
-              details: { error: "missing_steps" },
-            };
+            return { content: [{ type: "text", text: "错误: set_steps 需要 steps 参数" }], details: { error: "missing_steps" } };
           }
-          planSteps = params.steps.slice(0, MAX_PLAN_STEPS);
-          currentStepIndex = planSteps.length > 0 ? 0 : -1;
-          toolCallsInCurrentStep = 0;
-          stepErrors = new Array(planSteps.length).fill(false);
+          const texts = params.steps.slice(0, MAX_PLAN_STEPS);
+          planSteps = texts.map((t, i) => ({
+            id: ++stepIdCounter,
+            text: t,
+            status: i === 0 ? "current" : "pending",
+          }));
           planPanelExpanded = planSteps.length <= DEFAULT_VISIBLE_STEPS;
           pendingErrorInfo = null;
           updatePlanPanel(ctx);
-          return {
-            content: [{ type: "text", text: `✅ 计划面板已更新: ${planSteps.length} 步` }],
-            details: { action: "set_steps", count: planSteps.length },
-          };
+          return { content: [{ type: "text", text: `✅ 计划面板已更新: ${planSteps.length} 步` }], details: { action: "set_steps", count: planSteps.length } };
         }
-        case "advance": {
-          if (planSteps.length === 0 || currentStepIndex < 0) {
-            return {
-              content: [{ type: "text", text: "没有活跃的计划步骤" }],
-              details: { error: "no_active_plan" },
-            };
+
+        // ── 设置单步状态（逻辑跳转）──
+        case "set_step_status": {
+          if (params.stepId == null || !isStatus(params.status)) {
+            return { content: [{ type: "text", text: "错误: set_step_status 需要 stepId (number) 和 status (pending|current|done|error|skipped)" }], details: { error: "missing_params" } };
           }
-          currentStepIndex++;
-          toolCallsInCurrentStep = 0;
-          if (currentStepIndex >= planSteps.length) {
-            currentStepIndex = planSteps.length;
-            closePlanPanel(ctx);
-            return {
-              content: [{ type: "text", text: "✅ 所有步骤已完成，面板已关闭" }],
-              details: { action: "advance", completed: true },
-            };
+          const target = planSteps.find(s => s.id === params.stepId);
+          if (!target) {
+            return { content: [{ type: "text", text: `错误: stepId ${params.stepId} 不存在` }], details: { error: "invalid_id" } };
           }
+          // 如果设为 current，先清除其他步骤的 current 状态
+          if (params.status === "current") {
+            for (const s of planSteps) { if (s.status === "current") s.status = "done"; }
+          }
+          target.status = params.status as StepStatus;
           updatePlanPanel(ctx);
-          return {
-            content: [{
-              type: "text",
-              text: `➡️ 推进到步骤 ${currentStepIndex + 1}/${planSteps.length}: ${planSteps[currentStepIndex].slice(0, 60)}`,
-            }],
-            details: { action: "advance", stepIndex: currentStepIndex, total: planSteps.length },
-          };
+          return { content: [{ type: "text", text: `步骤 #${target.id} "${target.text.slice(0, 40)}" → ${params.status}` }], details: { action: "set_step_status", stepId: target.id, status: params.status } };
         }
+
+        // ── 插入步骤 ──
+        case "insert_step": {
+          if (!params.text) {
+            return { content: [{ type: "text", text: "错误: insert_step 需要 text 参数" }], details: { error: "missing_text" } };
+          }
+          if (planSteps.length >= MAX_PLAN_STEPS) {
+            return { content: [{ type: "text", text: `错误: 已达上限 ${MAX_PLAN_STEPS} 步` }], details: { error: "max_steps" } };
+          }
+          const idx = params.stepIndex != null ? params.stepIndex : planSteps.length;
+          const clampedIdx = Math.max(0, Math.min(idx, planSteps.length));
+          planSteps.splice(clampedIdx, 0, { id: ++stepIdCounter, text: params.text, status: "pending" });
+          updatePlanPanel(ctx);
+          return { content: [{ type: "text", text: `➕ 在位置 ${clampedIdx + 1} 插入步骤: ${params.text.slice(0, 40)}` }], details: { action: "insert_step", stepIndex: clampedIdx } };
+        }
+
+        // ── 删除步骤 ──
+        case "delete_step": {
+          if (params.stepId == null) {
+            return { content: [{ type: "text", text: "错误: delete_step 需要 stepId 参数" }], details: { error: "missing_stepId" } };
+          }
+          const idx = planSteps.findIndex(s => s.id === params.stepId);
+          if (idx < 0) {
+            return { content: [{ type: "text", text: `错误: stepId ${params.stepId} 不存在` }], details: { error: "invalid_id" } };
+          }
+          const removed = planSteps[idx];
+          planSteps.splice(idx, 1);
+          updatePlanPanel(ctx);
+          return { content: [{ type: "text", text: `🗑 已删除步骤 #${removed.id}: ${removed.text.slice(0, 40)}` }], details: { action: "delete_step", stepId: removed.id } };
+        }
+
+        // ── 更新步骤文本 ──
+        case "update_step": {
+          if (params.stepId == null || !params.text) {
+            return { content: [{ type: "text", text: "错误: update_step 需要 stepId 和 text 参数" }], details: { error: "missing_params" } };
+          }
+          const target2 = planSteps.find(s => s.id === params.stepId);
+          if (!target2) {
+            return { content: [{ type: "text", text: `错误: stepId ${params.stepId} 不存在` }], details: { error: "invalid_id" } };
+          }
+          target2.text = params.text;
+          updatePlanPanel(ctx);
+          return { content: [{ type: "text", text: `✏ 步骤 #${target2.id} 已更新: ${params.text.slice(0, 40)}` }], details: { action: "update_step", stepId: target2.id } };
+        }
+
+        // ── 全部完成 ──
         case "complete": {
-          currentStepIndex = planSteps.length;
+          for (const s of planSteps) s.status = "done";
           closePlanPanel(ctx);
           appState = "working";
-          return {
-            content: [{ type: "text", text: "✅ 计划已全部完成，面板已关闭" }],
-            details: { action: "complete" },
-          };
+          return { content: [{ type: "text", text: "✅ 计划已全部完成，面板已关闭" }], details: { action: "complete" } };
         }
-        case "mark_error": {
-          const idx = params.stepIndex ?? currentStepIndex;
-          if (idx < 0 || idx >= planSteps.length) {
-            return {
-              content: [{ type: "text", text: `错误: stepIndex ${idx} 超出范围 (0-${planSteps.length - 1})` }],
-              details: { error: "invalid_index" },
-            };
-          }
-          stepErrors[idx] = true;
-          updatePlanPanel(ctx);
-          return {
-            content: [{ type: "text", text: `❌ 步骤 ${idx + 1} 已标记为错误: ${planSteps[idx].slice(0, 60)}` }],
-            details: { action: "mark_error", stepIndex: idx },
-          };
-        }
+
+        // ── 清除 ──
         case "clear": {
           clearPlanPanel(ctx);
-          return {
-            content: [{ type: "text", text: "🧹 计划面板已清除" }],
-            details: { action: "clear" },
-          };
+          return { content: [{ type: "text", text: "🧹 计划面板已清除" }], details: { action: "clear" } };
         }
+
         default:
-          return {
-            content: [{ type: "text", text: `未知操作: ${params.action}\n支持: set_steps | advance | complete | mark_error | clear` }],
-            details: { error: "unknown_action" },
-          };
+          return { content: [{ type: "text", text: `未知操作: ${params.action}\n支持: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear` }], details: { error: "unknown_action" } };
       }
     },
   });

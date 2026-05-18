@@ -24,8 +24,6 @@ function killProcessTree(pid: number): void {
 // Buffer limits — aligned with pi core truncate.ts (50KB / 2000 lines, whichever first)
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
-// Collapse threshold in characters (UI streaming preview only)
-const COLLAPSE_THRESHOLD = 2000;
 // Truncation marker (matches pi core bash tool style)
 const TRUNCATION_MARKER = "\n\n[Output truncated at ~50KB/2000 lines — full output saved to temp file]";
 // Preview lines shown when collapsed
@@ -132,27 +130,14 @@ export default function (pi: ExtensionAPI) {
         interval?: ReturnType<typeof setInterval>;
       };
 
-      // Track elapsed time
-      if (
-        state.startedAt !== undefined &&
-        options.isPartial &&
-        !state.interval
-      ) {
-        state.interval = setInterval(() => context.invalidate(), 1000);
-      }
-      if (!options.isPartial || context.isError) {
-        state.endedAt ??= Date.now();
-        if (state.interval) {
-          clearInterval(state.interval);
-          state.interval = undefined;
-        }
-      }
+      state.endedAt ??= Date.now();
 
-      // Extract text output
+      // Extract text output — strip \r (Windows cmd.exe uses \r\n,
+      // and \r causes TUI padding spaces to overwrite line text)
       const rawOutput =
         result.content
           ?.filter((c: { type: string; text?: string }) => c.type === "text")
-          .map((c: { type: string; text?: string }) => c.text ?? "")
+          .map((c: { type: string; text?: string }) => (c.text ?? "").replace(/\r/g, ""))
           .join("\n")
           .trim() ?? "";
 
@@ -160,48 +145,55 @@ export default function (pi: ExtensionAPI) {
       const hasError =
         context.isError || (exitCode !== undefined && exitCode !== 0);
 
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      let displayText = "";
+      // Format all output as a single string — matches grep/read pattern
+      let text = "";
 
       if (rawOutput) {
-        const styledOutput = rawOutput
+        const styledLines = rawOutput
           .split("\n")
-          .map((line) => theme.fg("toolOutput", line))
-          .join("\n");
+          .map((line) => theme.fg("toolOutput", line));
 
         if (options.expanded || hasError) {
-          displayText = `\n${styledOutput}`;
+          text += "\n" + styledLines.join("\n");
         } else {
-          const lines = styledOutput.split("\n");
-          if (lines.length <= CMD_PREVIEW_LINES) {
-            displayText = `\n${styledOutput}`;
+          if (styledLines.length <= CMD_PREVIEW_LINES) {
+            text += "\n" + styledLines.join("\n");
           } else {
-            const preview = lines.slice(-CMD_PREVIEW_LINES).join("\n");
-            const skipped = lines.length - CMD_PREVIEW_LINES;
+            const preview = styledLines.slice(-CMD_PREVIEW_LINES);
+            const skipped = styledLines.length - CMD_PREVIEW_LINES;
             const hint =
               theme.fg("muted", `... (${skipped} earlier lines,`) +
               ` ${keyHint("app.tools.expand", "to expand")})`;
-            displayText = `\n${hint}\n${preview}`;
+            text += "\n" + hint + "\n" + preview.join("\n");
           }
         }
 
-        // Show exit code on error
         if (hasError && exitCode !== undefined) {
-          displayText += `\n${theme.fg("error", `Command exited with code ${exitCode}`)}`;
+          text += "\n" + theme.fg("error", `Command exited with code ${exitCode}`);
         }
       } else if (hasError) {
-        displayText = `\n${theme.fg("error", `Command exited with code ${exitCode}`)}`;
+        text += "\n" + theme.fg("error", `Command exited with code ${exitCode}`);
       }
 
-      // Add duration
+      // Truncation warning
+      const details = result.details as Record<string, unknown> | undefined;
+      if (details?.truncated) {
+        const fullPath = details.fullOutputPath as string | undefined;
+        text += "\n" + theme.fg("warning",
+          fullPath
+            ? `[Output truncated. Full output: ${fullPath}]`
+            : "[Output truncated]");
+      }
+
+      // Duration
       if (state.startedAt !== undefined) {
-        const label = options.isPartial ? "Elapsed" : "Took";
         const endTime = state.endedAt ?? Date.now();
-        displayText += `\n${theme.fg("muted", `${label} ${formatDuration(endTime - state.startedAt)}`)}`;
+        text += "\n" + theme.fg("muted", `Took ${formatDuration(endTime - state.startedAt)}`);
       }
 
-      text.setText(displayText);
-      return text;
+      const component = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      component.setText(text);
+      return component;
     },
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -281,23 +273,6 @@ export default function (pi: ExtensionAPI) {
           signal?.removeEventListener("abort", onAbort);
         }
 
-        // stdout + stderr: 合并推送，50ms 节流防闪跳
-        let pendingUpdate: ReturnType<typeof setTimeout> | null = null;
-        function flushUpdate() {
-          pendingUpdate = null;
-          const view =
-            output.length > COLLAPSE_THRESHOLD
-              ? output.slice(0, COLLAPSE_THRESHOLD) +
-                "\n... [running, collapsed]"
-              : output;
-          onUpdate?.({ content: [{ type: "text", text: view }] });
-        }
-        function scheduleUpdate() {
-          if (!pendingUpdate) {
-            pendingUpdate = setTimeout(flushUpdate, 50);
-          }
-        }
-
         // 保存完整输出到临时文件（pi 内核风格：os.tmpdir()）
         async function saveTruncatedOutput(fullOutput: string): Promise<string | undefined> {
           try {
@@ -334,7 +309,6 @@ export default function (pi: ExtensionAPI) {
               savedTempPath = path;
             });
           }
-          scheduleUpdate();
         };
 
         child.stdout?.on("data", onOutputData);
@@ -363,8 +337,6 @@ export default function (pi: ExtensionAPI) {
           output += decoder.decode();
 
           if (killed) {
-            const isLong = output.length > COLLAPSE_THRESHOLD;
-            const reason = signal?.aborted ? "Cancelled" : "Timed out";
             const killedDetails: Record<string, unknown> = {
               command: params.command,
               exitCode: signal?.aborted ? -1 : (code ?? -1),
@@ -374,20 +346,14 @@ export default function (pi: ExtensionAPI) {
             // 打断时可能 saveTruncatedOutput 还没写完，等一下
             const finalize = () => {
               if (truncated && savedTempPath) {
+                killedDetails.truncated = true;
                 killedDetails.fullOutputPath = savedTempPath;
-              } else if (isLong) {
-                killedDetails.fullOutput = output;
-              } else if (output.length > 0) {
-                // 短内容但被打断了，也带上文件路径方便查看
-                killedDetails.partialOutput = output;
               }
               finish({
                 content: [
                   {
                     type: "text",
-                    text: isLong
-                      ? `${reason}.\n${output.slice(0, COLLAPSE_THRESHOLD)}\n... [collapsed]`
-                      : `${reason}.\n${output || "(no output)"}`,
+                    text: output || "(no output)",
                   },
                 ],
                 details: killedDetails,
@@ -412,30 +378,19 @@ export default function (pi: ExtensionAPI) {
             output = "(no output)";
           }
 
-          const isLong = output.length > COLLAPSE_THRESHOLD;
-
-          // 截断后：提示 LLM 用 read 查看完整输出（bash 风格）
-          let textContent: string;
+          // 截断信息放 details，content 保持完整输出（对齐 bash.ts）
           const details: Record<string, unknown> = {
             command: params.command,
             exitCode: code ?? 0,
-            truncated,
           };
 
           if (truncated && savedTempPath) {
-            textContent = `[Output truncated at ~${Math.round(MAX_OUTPUT_BYTES / 1024)}KB — full output saved to:\n  ${savedTempPath}\nUse read tool to view it]`;
+            details.truncated = true;
             details.fullOutputPath = savedTempPath;
-          } else if (isLong) {
-            textContent =
-              output.slice(0, COLLAPSE_THRESHOLD) +
-              `\n... [collapsed — ${(output.length / 1024).toFixed(0)}KB total, use details to see full output]`;
-            details.fullOutput = output;
-          } else {
-            textContent = output;
           }
 
           finish({
-            content: [{ type: "text", text: textContent }],
+            content: [{ type: "text", text: output }],
             details,
           });
         });
