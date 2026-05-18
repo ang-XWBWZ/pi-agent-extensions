@@ -1,6 +1,6 @@
 # Pi Agent Extensions
 
-> 一套为 [pi coding agent](https://github.com/earendil-works/pi-mono) 量身打造的生产级扩展集合，赋予其子 Agent 并行调度、模型热切换、上下文监控等高级能力。
+> 一套为 [pi coding agent](https://github.com/earendil-works/pi/) 量身打造的生产级扩展集合，赋予其子 Agent 并行调度、模型热切换、上下文监控等高级能力。
 
 ## 为什么需要这些扩展？
 
@@ -83,7 +83,8 @@ pi 本身是一个极简的终端 AI 编码助手，只提供 `read` / `write` /
 ## 安装
 
 ```bash
-# 直接复制文件到 ~/.pi/agent/extensions/
+# 克隆到 pi 的全局扩展目录
+# 或者直接复制文件到 ~/.pi/agent/extensions/
 cp extensions/*.ts ~/.pi/agent/extensions/
 cp extensions/lib/*.ts ~/.pi/agent/extensions/lib/
 ```
