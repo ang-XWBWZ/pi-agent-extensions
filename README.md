@@ -1,123 +1,200 @@
 # Pi Agent Extensions
 
-> 一套为 [pi coding agent](https://github.com/earendil-works/pi/) 量身打造的生产级扩展集合，赋予其子 Agent 并行调度、模型热切换、上下文监控等高级能力。
+A collection of extensions for the [pi coding agent](https://github.com/earendil-works/pi) that add sub-agent parallelism, Windows shell support, model switching, and observability — without modifying pi's core.
 
-## 为什么需要这些扩展？
+## Overview
 
-pi 本身是一个极简的终端 AI 编码助手，只提供 `read` / `write` / `edit` / `bash` 四个基础工具。这套扩展在不修改 pi 内核的前提下，大幅拓展了它的工程化能力：
+pi ships with four built-in tools: `read`, `write`, `edit`, and `bash`. These extensions layer additional capabilities on top via the Extension API:
 
-- **子 Agent 系统** — 将复杂任务拆解到多个独立 Agent 并行执行，结果自动汇入主对话
-- **Windows 原生支持** — 为没有 WSL/Bash 的环境提供 `cmd` 工具
-- **运行时可观测** — 实时统计上下文占用、子 Agent 进度可视化
-- **灵活切换** — Plan/Work/YOLO 三模式 + LLM 可自行切换模型
+| Extension | File | Purpose |
+|-----------|------|---------|
+| Sub-Agent System | `parallel-agent.ts` | Dispatch parallel sub-agents for multi-file analysis |
+| Agent Message Bus | `lib/agent-bus.ts` | Cross-session EventEmitter for inter-agent communication |
+| Confirm Dialog Bus | `lib/confirm-bus.ts` | Route sub-agent confirmation dialogs to the main session |
+| Windows Command Tool | `cmd-tool.ts` | Execute commands via `cmd.exe` on Windows |
+| Windows PowerShell Tool | `powershell-tool.ts` | Execute PowerShell commands with native UTF-8 output |
+| Model Switching | `model-switch.ts` | Switch between AI models at runtime |
+| Work Mode Manager | `work-mode.ts` | Plan/Work/YOLO modes with execution plan panel and path guards |
+| Context Usage | `context-usage.ts` | `/context` command showing token usage breakdown |
+| Token Stats | `token-stats.ts` | Status bar indicator for context window usage |
 
-## 扩展列表
+## Extensions
 
-| 扩展 | 文件 | 功能 |
-|------|------|------|
-| 🔀 子 Agent 系统 | `parallel-agent.ts` | v8 · 并行派发子 Agent，AbortSignal 支持，生命周期管理，结果自动注入 |
-| 🚌 Agent 通信总线 | `lib/agent-bus.ts` | 全局 EventEmitter，跨 session 消息传递 |
-| ✅ 确认弹窗总线 | `lib/confirm-bus.ts` | 子 Agent 的安全确认弹窗路由至主 session |
-| 🪟 Windows 命令工具 | `cmd-tool.ts` | 用 `cmd.exe` 替代 `bash`，适配 Windows 环境 |
-| 🔄 模型热切换 | `model-switch.ts` | LLM 可通过 `switch_model` 工具自行切换模型 |
-| 🎯 工作模式 | `work-mode.ts` | v3 · Plan/Work/YOLO，滑动窗口计划面板，Unicode 状态图标 |
-| 📊 上下文统计 | `context-usage.ts` | `/context` 命令，浮层展示 token 占用明细 |
-| 💍 上下文环 | `token-stats.ts` | 状态栏实时显示上下文使用百分比 |
+### parallel-agent.ts — Sub-Agent System (v8)
 
----
+Dispatches background sub-agents for parallel task execution. Results are automatically injected into the main conversation when all sub-tasks complete.
 
-## 核心亮点：子 Agent 系统
+**Tools provided:**
 
-### 架构
+| Tool | Description |
+|------|-------------|
+| `spawn_agent` | Launch sub-agents with context injection and skill loading |
+| `check_agent_results` | Poll progress, wait for completion, or list all jobs |
+| `send_agent_message` | Send messages between agents (broadcast or point-to-point) |
+| `control_agent` | Lifecycle management: kill, abort, pause, resume, status |
 
+Requires `lib/agent-bus.ts` and `lib/confirm-bus.ts`.
+
+### cmd-tool.ts — Windows Command Execution
+
+Provides a `cmd` tool that runs commands via `cmd.exe /c`. Handles encoding by detecting the system's active code page at startup and prepending `chcp <codepage> >nul &` to each command to keep the shell output encoding consistent with the decoder.
+
+**Parameters:** `command` (required), `timeout` (optional, default 30s), `codepage` (optional, defaults to system code page; use 65001 for UTF-8, 936 for GBK).
+
+**Key behaviors:**
+- Output truncated at 2000 lines / 50KB (whichever first), full output saved to a temp file
+- Three-phase abort: pre-spawn check, runtime signal listener, post-close cleanup
+- `\r` stripped from output to prevent TUI rendering artifacts
+
+### powershell-tool.ts — Windows PowerShell Execution
+
+Provides a `powershell` tool with native UTF-8 support. Commands are encoded as Base64 (UTF-16LE) and passed via `-EncodedCommand`, bypassing Node.js `spawn`'s ANSI code page conversion on Windows.
+
+**Advantages over cmd-tool:**
+- Native UTF-8 output — no code page parameter needed
+- `Select-String` handles mixed-encoding content search
+- `Get-Content -Encoding` for explicit encoding control
+- Base64 command encoding prevents corruption of non-ASCII characters in command strings
+
+**Parameters:** `command` (required), `timeout` (optional, default 60s).
+
+**Internal wrapper applied to every command:**
+```powershell
+$OutputEncoding = [System.Text.Encoding]::UTF8;
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
+$ErrorActionPreference = 'Continue';
+$ProgressPreference = 'SilentlyContinue';
+& { <user command> } 2>&1 | Out-String -Width 200
 ```
-┌──────────────────────────────────────────────────┐
-│                    主 Agent                       │
-│  spawn_agent ──→ 立即返回 jobId                   │
-│       │                                           │
-│       ↓ 注册完成回调                               │
-│  用户正常交互 ←───────────────┐                    │
-│       │                       │                    │
-│       │   子 Agent₁ ●─────────┤                    │
-│       │   子 Agent₂ ●─────────┤  后台并行运行       │
-│       │   子 Agent₃ ●─────────┘                    │
-│       │                       │                    │
-│       ↓  全部完成             │                    │
-│  autoInject 推送结果 ─────────┘                    │
-│       ↓                                           │
-│  LLM 自动看到结果 → 无需阻塞等待                    │
-└──────────────────────────────────────────────────┘
+
+**Known limitation:** `exit N` inside PowerShell pipelines may not propagate correctly through `Out-String`. For native commands (git, node, etc.), `$LASTEXITCODE` is preserved.
+
+### work-mode.ts — Work Mode Manager (v3)
+
+Implements three execution modes controlled via `globalThis.__pi_default_mode`:
+
+| Mode | Behavior |
+|------|----------|
+| `plan` | Generate plan first, await confirmation, then execute |
+| `work` | Direct execution with path guards (default) |
+| `yolo` | Full automation, no confirmations |
+
+**Execution plan panel** uses a logical step model where each step has an independent lifecycle: `pending → current → done | error | skipped`. The AI controls the panel through the `manage_plan` tool.
+
+**Path guards** intercept `tool_call` events and block `write`/`edit` operations on protected paths: `node_modules/`, `.git/`, `.pi/`, `.agents/`, `.claude/`.
+
+### model-switch.ts — Model Switching
+
+Registers a `switch_model` tool that allows the AI to change its model at runtime. Lists available models when called without arguments; switches when called with `provider` and `model`.
+
+Default model is read from `settings.json`.
+
+### context-usage.ts & token-stats.ts — Observability
+
+- `context-usage.ts`: Registers `/context` command displaying a breakdown of token usage across system prompt, skills, and conversation context.
+- `token-stats.ts`: Adds a persistent status bar widget showing context window usage as a percentage ring.
+
+## Deployment
+
+### Prerequisites
+
+- [pi coding agent](https://github.com/earendil-works/pi) installed
+- Node.js ≥ 18
+
+### Install
+
+Clone this repository and copy the files to pi's extensions directory:
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/ang-XWBWZ/pi-agent-extensions.git
+cd pi-agent-extensions
+
+$dst = "$env:USERPROFILE\.pi\agent\extensions"
+New-Item -ItemType Directory -Force "$dst\lib"
+Copy-Item *.ts $dst
+Copy-Item lib\*.ts "$dst\lib"
 ```
 
-### 提供的工具
-
-| 工具 | 用途 |
-|------|------|
-| `spawn_agent` | 派发子 Agent，支持多任务并行 + 上下文注入 + skill 加载 |
-| `check_agent_results` | 非阻塞轮询进度 / 阻塞等待完成 / 列出所有 Job |
-| `send_agent_message` | Agent 间消息传递（广播 / 点对点） |
-| `control_agent` | 完整生命周期：`kill` / `abort` / `pause` / `resume` / `send` / `list` / `status` |
-
-### v8 改进
-
-- **AbortSignal 支持** — 4 个工具的 `execute()` 全部接入 AbortSignal，`check_agent_results(wait=true)` 可被用户取消
-- **Promise 反模式修复** — `runSingleAgent` 从 `new Promise(async)` 改为同步 executor + async IIFE
-- **异常日志** — 8 处静默吞异常改为 `console.warn`，问题排查不再黑盒
-
-### v7 新特性：结果自动注入
-
-子任务全部完成后，结果通过 `steer` 机制自动推送到主对话——**主 Agent 不再需要阻塞式等待**。你在派发任务后可以继续交互，结果到了自会出现在对话中。
-
----
-
-## 计划面板 v3
-
-| 特性 | 说明 |
-|------|------|
-| Unicode 图标 | `✅` 完成 `▶` 进行中 `○` 待定 `❌` 出错 |
-| 命令 ≠ 任务失败 | 命令返回非零退出码不再自动中断执行，由 AI 自主判断 |
-| 滑动窗口 | 面板以当前步骤为中心显示 5 步，前后省略提示，始终跟踪最新进度 |
-
----
-
-## 安装
-
+**Linux / macOS:**
 ```bash
-# 克隆到 pi 的全局扩展目录
-# 或者直接复制文件到 ~/.pi/agent/extensions/
-cp extensions/*.ts ~/.pi/agent/extensions/
-cp extensions/lib/*.ts ~/.pi/agent/extensions/lib/
+git clone https://github.com/ang-XWBWZ/pi-agent-extensions.git
+cd pi-agent-extensions
+
+DST="$HOME/.pi/agent/extensions"
+mkdir -p "$DST/lib"
+cp *.ts "$DST/"
+cp lib/*.ts "$DST/lib/"
 ```
 
-在 pi 中运行 `/reload` 即可加载。
+### Activate
 
-> **依赖**：扩展使用 pi 内置的 `@earendil-works/pi-coding-agent`、`typebox`、`@earendil-works/pi-ai`、`@earendil-works/pi-tui`，无需额外安装。
-
----
-
-## 快速上手
-
-### 并行分析多个文件
+In your pi session, run:
 
 ```
-> 分析这 3 个模块的代码质量，给出优化建议
+/reload
 ```
 
-LLM 会自动调用 `spawn_agent` 将 3 个模块分发给 3 个子 Agent 并行分析，完成后结果自动出现在对话中。
+This unloads existing extensions and loads all `.ts` files from the extensions directory.
 
-### 切换模型
+### Verify
 
-LLM 可自行调用 `switch_model` 在可用模型间切换，无需手动配置。
-
-### 查看上下文占用
+Ask the AI to use one of the extension tools. For example:
 
 ```
-/context
+> List files in the current directory using cmd
+> What's my context usage? (/context)
+> Switch to a different model
 ```
 
-浮层展示 System / Skills / 用户上下文的 token 用量占比。
+If the tool executes successfully, the extension is working.
 
----
+### Configuration
+
+- **Default model**: Edit `settings.json` in the extensions directory to set `defaultProvider` and `defaultModel`.
+- **Work mode**: Set `__pi_default_mode` in your pi configuration to `"plan"`, `"work"`, or `"yolo"`.
+- **AI behavior**: Copy `SYSTEM.md` to pi's skills or configuration directory to apply behavioral constraints to the AI agent. See below.
+
+### Installing SYSTEM.md
+
+`SYSTEM.md` defines rules the AI follows during every session — no unauthorized file operations, mandatory user confirmation for risky actions, working directory boundaries, etc.
+
+Place it where pi loads system-level instructions. Typically one of:
+
+- `~/.pi/agent/SYSTEM.md`
+- Your project root as `CLAUDE.md` or `AGENTS.md`
+- pi's configured system prompt directory
+
+After placing the file, `/reload` to apply.
+
+## Compatibility
+
+These extensions use pi's public Extension API (`registerTool`, `registerCommand`, lifecycle events) and do not modify pi's source code. They depend on packages bundled with pi:
+
+- `@earendil-works/pi-coding-agent`
+- `@earendil-works/pi-tui`
+- `@earendil-works/pi-ai`
+- `typebox`
+
+Global singletons (`globalThis.__pi_agent_bus`, `globalThis.__pi_confirm_bus`) are used for cross-session communication. This is incompatible with ISOLATE mode.
+
+## Project Structure
+
+```
+github-dist/
+├── README.md
+├── SYSTEM.md
+├── cmd-tool.ts
+├── context-usage.ts
+├── model-switch.ts
+├── parallel-agent.ts
+├── powershell-tool.ts
+├── token-stats.ts
+├── work-mode.ts
+└── lib/
+    ├── agent-bus.ts
+    └── confirm-bus.ts
+```
 
 ## License
 

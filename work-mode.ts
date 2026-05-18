@@ -219,6 +219,7 @@ async function confirmAndRemember(
 
 const MAX_PLAN_STEPS = 10;
 const DEFAULT_VISIBLE_STEPS = 5;
+let stepIdCounter = 0;
 
 /** 从 AI 输出的计划文本中提取步骤列表 —— 仅解析 ## Execution Plan 段落 */
 function parsePlanSteps(text: string): PlanStep[] {
@@ -553,7 +554,7 @@ export default function (pi: ExtensionAPI) {
   // Plan panel state — logical step model (each step has independent lifecycle)
   let planSteps: PlanStep[] = [];
   let planFullText = "";
-  let stepIdCounter = 0;
+  stepIdCounter = 0;
   let planPanelExpanded = false;
 
   /** 获取当前活跃步骤（第一个 status==="current" 的步骤，无则 -1） */

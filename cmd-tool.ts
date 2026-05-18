@@ -71,7 +71,8 @@ export default function (pi: ExtensionAPI) {
       `Output limited to ~${Math.round(MAX_OUTPUT_BYTES / 1024)}KB / ${MAX_OUTPUT_LINES} lines (whichever first). ` +
       "When truncated, full output saved to a temp file — use read tool to view it. " +
       "Use the timeout parameter (seconds) to adjust timeout; default 30s, no upper cap. " +
-      "Use the codepage parameter for encoding: defaults to system code page; use 936 for GBK on Chinese Windows.",
+      "Use the codepage parameter for encoding: defaults to system code page; use 936 for GBK on Chinese Windows. " +
+      "Each command auto-prepends 'chcp <codepage>' so cmd.exe output encoding always matches the decoder — no more garbled Chinese text.",
 
     promptSnippet: "Execute a command via cmd.exe and return its output",
 
@@ -81,7 +82,10 @@ export default function (pi: ExtensionAPI) {
       "For text search use 'findstr /s /i pattern *' instead of 'grep -r'.",
       "For file search use 'dir /s /b filename' or 'where /r . filename' instead of 'find'.",
       "When cmd output is truncated, the full output is saved to a temp file. Use the read tool to view the temp file path listed in the output.",
-      "Use codepage parameter for encoding: defaults to system code page; use 936 for GBK on Chinese Windows.",
+      "The codepage parameter controls both the cmd.exe output encoding AND the TextDecoder — they are always kept in sync.",
+      "Use codepage=65001 for UTF-8 files (modern editors, git output). Use codepage=936 for GBK files (Chinese Windows legacy).",
+      "When findstr returns no results searching non-ASCII text, retry with the other codepage: 65001 for UTF-8 files, 936 for GBK files.",
+      "For mixed-encoding directories, run findstr twice — once per codepage — and combine results.",
     ],
 
     parameters: Type.Object({
@@ -210,7 +214,9 @@ export default function (pi: ExtensionAPI) {
         const encodingLabel = codepageToEncoding(codepage);
         const decoder = new TextDecoder(encodingLabel, { fatal: false });
 
-        const child = spawn("cmd.exe", ["/c", params.command], {
+        // 强制 cmd.exe 输出编码与 TextDecoder 保持一致，消除 GBK/UTF-8 乱码
+        const safeCommand = `chcp ${codepage} >nul & ${params.command}`;
+        const child = spawn("cmd.exe", ["/c", safeCommand], {
           cwd: ctx?.cwd ?? process.cwd(),
           windowsHide: true,
           windowsVerbatimArguments: true,
