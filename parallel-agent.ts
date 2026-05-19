@@ -52,6 +52,7 @@ import {
   getJobInstances,
   getAgentBus,
   Events,
+  updateInstanceStatus,
   type SubTask,
   type SubResult,
   type AgentJob,
@@ -160,13 +161,19 @@ function runSingleAgent(
       // ---- 外部控制状态 ----
       let abortedExternally = false;
 
-      // ---- 注册实例（记录输入长度供 widget 显示） ----
+      // ---- 注册实例（含行为状态追踪字段） ----
       const instRef: AgentInstance = {
         jobId,
         taskId: task.id,
         name,
         session,
         status: "running",
+        detailedStatus: "running",
+        currentTool: undefined,
+        toolHistory: [],
+        lastActivityAt: Date.now(),
+        autoContinue: (task as Record<string, unknown>).autoContinue === true,
+        autoContinueDelay: ((task as Record<string, unknown>).autoContinueDelay as number) ?? 30,
         startedAt: Date.now(),
         promptLength: prompt.length,
         outputLength: 0,
@@ -178,6 +185,33 @@ function runSingleAgent(
       // ---- 输出收集 ----
       let output = "";
       let timer: ReturnType<typeof setTimeout> | null = null;
+
+      // ---- 空闲检测 + 自动续推 ----
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      let autoContinueTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const clearIdle = () => {
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        if (autoContinueTimer) { clearTimeout(autoContinueTimer); autoContinueTimer = null; }
+      };
+
+      const startIdleDetection = () => {
+        clearIdle();
+        if (instRef.detailedStatus === "done") return;
+        idleTimer = setTimeout(() => {
+          updateInstanceStatus(jobId, task.id, { detailedStatus: "idle" });
+          instRef._idleTimer = idleTimer;
+          // 自动续推
+          if (instRef.autoContinue && !settled) {
+            autoContinueTimer = setTimeout(() => {
+              if (!settled) {
+                try { session.steer("继续执行未完成的任务。"); } catch { /* ignore */ }
+              }
+            }, instRef.autoContinueDelay * 1000);
+          }
+        }, 5000);
+        instRef._idleTimer = idleTimer;
+      };
 
       const resetTimer = () => {
         if (timer) clearTimeout(timer);
@@ -202,15 +236,50 @@ function runSingleAgent(
       resetTimer();
 
       const unsub = session.subscribe((event) => {
+        // ---- text delta → thinking ----
         if (event.type === "message_update") {
           if (event.assistantMessageEvent.type === "text_delta") {
             output += event.assistantMessageEvent.delta;
             instRef.outputLength = output.length;
             if (output.length > 10_000)
               output = output.slice(0, 10_000) + "\n...";
+            updateInstanceStatus(jobId, task.id, { detailedStatus: "thinking", outputLength: instRef.outputLength });
           }
         }
+        // ---- tool start → tool_calling ----
+        if (event.type === "tool_execution_start") {
+          clearIdle();
+          updateInstanceStatus(jobId, task.id, {
+            detailedStatus: "tool_calling",
+            currentTool: event.toolName,
+            logTool: { toolName: event.toolName, status: "started" },
+          });
+        }
+        // ---- tool end → thinking ----
+        if (event.type === "tool_execution_end") {
+          updateInstanceStatus(jobId, task.id, {
+            detailedStatus: "thinking",
+            logTool: {
+              toolName: event.toolName,
+              status: event.isError ? "error" : "done",
+              error: event.isError ? String(event.result).slice(0, 200) : undefined,
+            },
+          });
+        }
+        // ---- turn start → running ----
+        if (event.type === "turn_start") {
+          clearIdle();
+          updateInstanceStatus(jobId, task.id, { detailedStatus: "running" });
+        }
+        // ---- turn end → idle detection ----
+        if (event.type === "turn_end") {
+          updateInstanceStatus(jobId, task.id, { detailedStatus: "thinking" });
+          startIdleDetection();
+        }
+        // ---- agent end → done ----
         if (event.type === "agent_end") {
+          clearIdle();
+          updateInstanceStatus(jobId, task.id, { detailedStatus: "done" });
           if (abortedExternally) {
             abortedExternally = false;
             return;
@@ -343,6 +412,7 @@ export default function (pi: ExtensionAPI) {
     bus.on(Events.AGENT_PAUSED, onEvent);
     bus.on(Events.AGENT_RESUMED, onEvent);
     bus.on(Events.TASK_RESULT, onEvent);
+    bus.on(Events.STATUS_CHANGED, onEvent);
 
     // 定时刷新（兜底 outputLength 更新）
     if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
@@ -359,9 +429,22 @@ export default function (pi: ExtensionAPI) {
           lines.push(theme.fg("accent", theme.bold(`🤖 子 Agent (${insts.length})`)));
 
           for (const inst of insts) {
-            const icon =
-              inst.status === "running" ? "🟢" :
-              inst.status === "paused" ? "⏸️" : "⏳";
+            // 精细状态 → 图标 + 文字
+            const statusIcon =
+              inst.detailedStatus === "thinking" ? "🧠" :
+              inst.detailedStatus === "tool_calling" ? "🔧" :
+              inst.detailedStatus === "idle" ? "⏳" :
+              inst.detailedStatus === "paused" ? "⏸️" :
+              inst.detailedStatus === "done" ? "✅" :
+              inst.status === "paused" ? "⏸️" : "🟢";
+            const statusText =
+              inst.detailedStatus === "tool_calling" && inst.currentTool
+                ? inst.currentTool
+                : inst.detailedStatus === "thinking" ? "思考中"
+                : inst.detailedStatus === "idle" ? "空闲等待"
+                : inst.detailedStatus === "done" ? "完成"
+                : inst.detailedStatus === "paused" ? "已暂停"
+                : "运行中";
             const elapsed = ((Date.now() - inst.startedAt) / 1000).toFixed(0);
             const inLen = inst.promptLength > 1000
               ? `${(inst.promptLength / 1000).toFixed(1)}k`
@@ -374,7 +457,7 @@ export default function (pi: ExtensionAPI) {
               : inst.name;
 
             lines.push(
-              `  ${icon} ${theme.fg("muted", title)}  ${theme.fg("dim", `入${inLen}字 → 出${outLen}字  ${elapsed}s`)}`,
+              `  ${statusIcon} ${theme.fg("muted", title)}  ${theme.fg("dim", `入${inLen} → 出${outLen}  ${elapsed}s  ${statusText}`)}`,
             );
           }
 
@@ -692,17 +775,24 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const lines = insts.map((inst) => {
-          const icon = inst.status === "running" ? "🟢" : inst.status === "paused" ? "⏸️" : "⏳";
+          const icon =
+            inst.detailedStatus === "thinking" ? "🧠" :
+            inst.detailedStatus === "tool_calling" ? "🔧" :
+            inst.detailedStatus === "idle" ? "⏳" :
+            inst.detailedStatus === "paused" ? "⏸️" :
+            inst.detailedStatus === "done" ? "✅" :
+            inst.status === "paused" ? "⏸️" : "🟢";
+          const extra = inst.currentTool ? ` [${inst.currentTool}]` : "";
           const elapsed = ((Date.now() - inst.startedAt) / 1000).toFixed(1);
-          return `${icon} [${inst.jobId.slice(0, 8)}] ${inst.taskId} — ${inst.name.slice(0, 30)} — ${inst.status} (${elapsed}s)`;
+          return `${icon} [${inst.jobId.slice(0, 8)}] ${inst.taskId} — ${inst.name.slice(0, 30)} — ${inst.detailedStatus}${extra} (${elapsed}s)`;
         });
         return {
           content: [{ type: "text", text: `运行中的子 Agent (${insts.length}):\n${lines.join("\n")}` }],
-          details: { instances: insts.map((i) => ({ jobId: i.jobId, taskId: i.taskId, name: i.name, status: i.status })) },
+          details: { instances: insts.map((i) => ({ jobId: i.jobId, taskId: i.taskId, name: i.name, status: i.status, detailedStatus: i.detailedStatus, currentTool: i.currentTool })) },
         };
       }
 
-      // ---- status: 查看单个实例 ----
+      // ---- status: 查看单个实例（增强：精细状态 + 工具历史） ----
       if (action === "status") {
         if (!jobId || !taskId) {
           return { content: [{ type: "text", text: "status 操作需要 jobId 和 taskId" }], details: { error: "missing_args" } };
@@ -712,18 +802,35 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `实例不存在: ${jobId}/${taskId}` }], details: { error: "not_found" } };
         }
         const elapsed = ((Date.now() - inst.startedAt) / 1000).toFixed(1);
+        const idleSec = inst.lastActivityAt ? ((Date.now() - inst.lastActivityAt) / 1000).toFixed(0) : "?";
+
+        // 工具历史格式化
+        const toolLines = inst.toolHistory.length > 0
+          ? ["", "📋 工具调用历史:", ...inst.toolHistory.slice(-10).map((t, i) => {
+              const icon = t.status === "started" ? "▶" : t.status === "error" ? "❌" : "✅";
+              const dur = t.duration ? ` ${t.duration}ms` : "";
+              const err = t.error ? ` (${t.error.slice(0, 60)})` : "";
+              return `  ${icon} ${t.toolName} [${t.status}]${dur}${err}`;
+            })]
+          : [];
+
+        const lines = [
+          `📊 ${inst.name}`,
+          `   Job: ${inst.jobId.slice(0, 8)} | Task: ${inst.taskId}`,
+          `   精细状态: ${inst.detailedStatus}${inst.currentTool ? ` (${inst.currentTool})` : ""} | 传统: ${inst.status} | 运行: ${elapsed}s | 空闲: ${idleSec}s`,
+          `   输入: ${inst.promptLength}字 | 输出: ${inst.outputLength}字 | 自动续推: ${inst.autoContinue ? "✅" : "❌"}(${inst.autoContinueDelay}s)`,
+          ...toolLines,
+        ];
+
         return {
-          content: [
-            {
-              type: "text",
-              text: [
-                `📊 ${inst.name}`,
-                `   Job: ${inst.jobId.slice(0, 8)} | Task: ${inst.taskId}`,
-                `   状态: ${inst.status} | 运行: ${elapsed}s`,
-              ].join("\n"),
-            },
-          ],
-          details: { jobId: inst.jobId, taskId: inst.taskId, name: inst.name, status: inst.status, elapsed },
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: {
+            jobId: inst.jobId, taskId: inst.taskId, name: inst.name,
+            status: inst.status, detailedStatus: inst.detailedStatus,
+            currentTool: inst.currentTool, elapsed, idleSec,
+            promptLength: inst.promptLength, outputLength: inst.outputLength,
+            autoContinue: inst.autoContinue, toolHistory: inst.toolHistory.slice(-10),
+          },
         };
       }
 

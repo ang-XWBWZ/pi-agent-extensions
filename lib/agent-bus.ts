@@ -57,13 +57,46 @@ export interface AgentJob {
   finishedAt?: number;
 }
 
+/** 子 Agent 精细行为状态 */
+export type SubAgentStatus =
+  | "thinking"       // LLM 正在生成文本（message_update text_delta）
+  | "tool_calling"   // 正在执行工具调用
+  | "idle"           // turn 结束，等待 LLM 下一轮决策（可能因缺少输入而停滞）
+  | "running"        // 通用活跃状态
+  | "paused"         // 手动暂停
+  | "done";          // agent_end，任务完成
+
+/** 工具调用记录 */
+export interface ToolCallRecord {
+  toolName: string;
+  status: "started" | "done" | "error";
+  timestamp: number;
+  /** 工具执行耗时（ms），仅 done/error 时有值 */
+  duration?: number;
+  /** 错误信息，仅 error 时有值 */
+  error?: string;
+}
+
 /** 运行中的子 Agent 实例 */
 export interface AgentInstance {
   jobId: string;
   taskId: string;
   name: string;
   session: AgentSession;
+  /** 传统状态（兼容旧代码、控制动作） */
   status: "running" | "paused" | "waiting_input";
+  /** 精细行为状态（新增，供面板和查询用） */
+  detailedStatus: SubAgentStatus;
+  /** 当前正在调用的工具名（tool_calling 时有值） */
+  currentTool?: string;
+  /** 工具调用历史（最近 N 条，最新在末尾） */
+  toolHistory: ToolCallRecord[];
+  /** 最后一次活动时间戳 */
+  lastActivityAt: number;
+  /** 是否启用自动续推（idle 后自动 steer） */
+  autoContinue: boolean;
+  /** 自动续推延迟秒（默认 30，idle 后等 N 秒再续推） */
+  autoContinueDelay: number;
   startedAt: number;
   /** 输入提示词长度（字符数） */
   promptLength: number;
@@ -73,6 +106,8 @@ export interface AgentInstance {
   _abortExternally?: () => void;
   /** 内部：重置超时计时器 */
   _resetTimer?: () => void;
+  /** 内部：空闲检测定时器 */
+  _idleTimer?: ReturnType<typeof setTimeout>;
 }
 
 export interface AgentMessage {
@@ -95,6 +130,7 @@ export const Events = {
   INSTANCE_UNREGISTERED: "instance:unregistered",
   AGENT_PAUSED: "agent:paused",
   AGENT_RESUMED: "agent:resumed",
+  STATUS_CHANGED: "instance:status_changed",
 } as const;
 
 // ---- 存储 ----
@@ -175,6 +211,7 @@ export function registerInstance(inst: AgentInstance): void {
 export function unregisterInstance(jobId: string, taskId: string): void {
   const key = instanceKey(jobId, taskId);
   const inst = instances.get(key);
+  if (inst?._idleTimer) clearTimeout(inst._idleTimer);
   instances.delete(key);
   if (inst) {
     globalBus.emit(Events.INSTANCE_UNREGISTERED, { jobId, taskId, name: inst.name });
@@ -195,6 +232,56 @@ export function getJobInstances(jobId: string): AgentInstance[] {
 /** 列出所有 Agent 实例 */
 export function listInstances(): AgentInstance[] {
   return Array.from(instances.values());
+}
+
+/**
+ * 更新实例精细状态并触发 STATUS_CHANGED 事件。
+ * 由 parallel-agent.ts 的 session 事件订阅调用。
+ */
+export function updateInstanceStatus(
+  jobId: string,
+  taskId: string,
+  update: {
+    detailedStatus?: SubAgentStatus;
+    currentTool?: string;
+    logTool?: { toolName: string; status: "started" | "done" | "error"; duration?: number; error?: string };
+    outputLength?: number;
+  },
+): void {
+  const key = instanceKey(jobId, taskId);
+  const inst = instances.get(key);
+  if (!inst) return;
+
+  if (update.detailedStatus !== undefined) {
+    inst.detailedStatus = update.detailedStatus;
+  }
+  if (update.currentTool !== undefined) {
+    inst.currentTool = update.currentTool || undefined;
+  }
+  if (update.logTool) {
+    inst.toolHistory.push({
+      toolName: update.logTool.toolName,
+      status: update.logTool.status,
+      timestamp: Date.now(),
+      duration: update.logTool.duration,
+      error: update.logTool.error,
+    });
+    if (inst.toolHistory.length > 20) {
+      inst.toolHistory = inst.toolHistory.slice(-10);
+    }
+  }
+  if (update.outputLength !== undefined) {
+    inst.outputLength = update.outputLength;
+  }
+  inst.lastActivityAt = Date.now();
+
+  globalBus.emit(Events.STATUS_CHANGED, {
+    jobId,
+    taskId,
+    detailedStatus: inst.detailedStatus,
+    currentTool: inst.currentTool,
+    toolHistory: inst.toolHistory,
+  });
 }
 
 // ---- Agent 控制操作 ----
