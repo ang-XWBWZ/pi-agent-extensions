@@ -1,100 +1,259 @@
 # Pi Agent Extensions
 
-A collection of extensions for the [pi coding agent](https://github.com/earendil-works/pi) that add sub-agent parallelism, Windows shell support, model switching, and observability — without modifying pi's core.
+> **Engineering-grade extensions for the pi coding agent.** Adds sub-agent parallelism, Windows dual-shell, mode-based execution control, observability, model hot-switching, and a wiki knowledge base — without modifying pi's kernel.
 
-## Overview
+---
 
-pi ships with four built-in tools: `read`, `write`, `edit`, and `bash`. These extensions layer additional capabilities on top via the Extension API:
+## Native vs Extended: At a Glance
 
-| Extension | File | Purpose |
-|-----------|------|---------|
-| Sub-Agent System | `parallel-agent.ts` | Dispatch parallel sub-agents for multi-file analysis |
-| Agent Message Bus | `lib/agent-bus.ts` | Cross-session EventEmitter for inter-agent communication |
-| Confirm Dialog Bus | `lib/confirm-bus.ts` | Route sub-agent confirmation dialogs to the main session |
-| Windows Command Tool | `cmd-tool.ts` | Execute commands via `cmd.exe` on Windows |
-| Windows PowerShell Tool | `powershell-tool.ts` | Execute PowerShell commands with native UTF-8 output |
-| Model Switching | `model-switch.ts` | Switch between AI models at runtime |
-| Work Mode Manager | `work-mode.ts` | Plan/Work/YOLO modes with execution plan panel and path guards |
-| Context Usage | `context-usage.ts` | `/context` command showing token usage breakdown |
-| Token Stats | `token-stats.ts` | Status bar indicator for context window usage |
+pi ships with only four built-in tools (`read` / `write` / `edit` / `bash`). Here's what the extensions add:
 
-## Extensions
+| Dimension | pi Native | With Extensions |
+|-----------|:---------:|:----------------|
+| **Available tools** | 4 | **12** (8 new AI tools + 4 native) |
+| **User commands** | 0 custom | **17** (`/plan`, `/wiki-search`, `/context`, etc.) |
+| **Parallel execution** | ❌ Serial only | ✅ `spawn_agent` dispatches N sub-agents in background |
+| **Windows support** | ❌ `bash` has poor encoding, garbled Chinese | ✅ `cmd` + `powershell` dual engine, native UTF-8 / smart GBK |
+| **Execution control** | ❌ No mode concept, AI free-for-all | ✅ Plan → Confirm → Work → YOLO three modes + safety guards |
+| **Plan visualization** | ❌ None | ✅ Logical-order plan panel, independent step lifecycle, 7 API operations |
+| **Token monitoring** | ❌ Invisible, sudden truncation | ✅ Status bar real-time percent ring + `/context` detail overlay |
+| **Model switching** | ❌ Manual config restart required | ✅ `switch_model` hot-switch, AI chooses per task complexity |
+| **Knowledge base** | ❌ No built-in retrieval | ✅ `/wiki-search` full-text search, TUI display, `kb_search` AI tool |
+| **Inter-agent communication** | ❌ None | ✅ AgentBus broadcast / point-to-point + ConfirmBus dialog routing |
+| **Sub-agent control** | ❌ None | ✅ Full lifecycle: `kill` · `abort` · `pause` · `resume` · `status` |
+| **Safety guards** | ❌ No path protection | ✅ Auto-block `write`/`edit` on `.git/` `.pi/` `.agents/` etc. |
 
-### parallel-agent.ts — Sub-Agent System (v8)
+---
 
-Dispatches background sub-agents for parallel task execution. Results are automatically injected into the main conversation when all sub-tasks complete.
+## 🏗️ Architecture
 
-**Tools provided:**
-
-| Tool | Description |
-|------|-------------|
-| `spawn_agent` | Launch sub-agents with context injection and skill loading |
-| `check_agent_results` | Poll progress, wait for completion, or list all jobs |
-| `send_agent_message` | Send messages between agents (broadcast or point-to-point) |
-| `control_agent` | Lifecycle management: kill, abort, pause, resume, status |
-
-Requires `lib/agent-bus.ts` and `lib/confirm-bus.ts`.
-
-### cmd-tool.ts — Windows Command Execution
-
-Provides a `cmd` tool that runs commands via `cmd.exe /c`. Handles encoding by detecting the system's active code page at startup and prepending `chcp <codepage> >nul &` to each command to keep the shell output encoding consistent with the decoder.
-
-**Parameters:** `command` (required), `timeout` (optional, default 30s), `codepage` (optional, defaults to system code page; use 65001 for UTF-8, 936 for GBK).
-
-**Key behaviors:**
-- Output truncated at 2000 lines / 50KB (whichever first), full output saved to a temp file
-- Three-phase abort: pre-spawn check, runtime signal listener, post-close cleanup
-- `\r` stripped from output to prevent TUI rendering artifacts
-
-### powershell-tool.ts — Windows PowerShell Execution
-
-Provides a `powershell` tool with native UTF-8 support. Commands are encoded as Base64 (UTF-16LE) and passed via `-EncodedCommand`, bypassing Node.js `spawn`'s ANSI code page conversion on Windows.
-
-**Advantages over cmd-tool:**
-- Native UTF-8 output — no code page parameter needed
-- `Select-String` handles mixed-encoding content search
-- `Get-Content -Encoding` for explicit encoding control
-- Base64 command encoding prevents corruption of non-ASCII characters in command strings
-
-**Parameters:** `command` (required), `timeout` (optional, default 60s).
-
-**Internal wrapper applied to every command:**
-```powershell
-$OutputEncoding = [System.Text.Encoding]::UTF8;
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;
-$ErrorActionPreference = 'Continue';
-$ProgressPreference = 'SilentlyContinue';
-& { <user command> } 2>&1 | Out-String -Width 200
+```
+┌─────────────────────────────────────────────────────────┐
+│                    pi Kernel (read-only)                  │
+│            read · write · edit · bash                    │
+└──────────────────────┬──────────────────────────────────┘
+                       │ Extension API
+     ┌─────────┬───────┼───────┬─────────┬─────────┐
+     ▼         ▼       ▼       ▼         ▼         ▼
+┌────────┐┌────────┐┌────────┐┌────────┐┌────────┐┌──────────┐
+│work-m. ││parallel││cmd-    ││context ││wiki    ││model-    │
+│3-mode  ││-agent  ││tool    ││-usage  ││knowledge││switch    │
+│safety  ││v8 sub- ││power-  ││token-  ││base    ││hot-switch│
+│plan    ││agents  ││shell   ││stats   ││search/ ││persist   │
+│panel   ││        ││dual    ││observ. ││TUI     ││          │
+└────────┘└───┬────┘└────────┘└────────┘└────────┘└──────────┘
+              │
+     ┌────────┴────────┐
+     ▼                 ▼
+┌──────────┐    ┌─────────────┐
+│agent-bus │    │confirm-bus  │
+│global msg│    │confirmation │
+│bus(single│    │dialog router│
+│instance) │    │             │
+└──────────┘    └─────────────┘
 ```
 
-**Known limitation:** `exit N` inside PowerShell pipelines may not propagate correctly through `Out-String`. For native commands (git, node, etc.), `$LASTEXITCODE` is preserved.
+---
 
-### work-mode.ts — Work Mode Manager (v3)
+## 🔥 Features
 
-Implements three execution modes controlled via `globalThis.__pi_default_mode`:
+### 1. Sub-Agent Parallel Dispatch — `parallel-agent.ts` v8
 
-| Mode | Behavior |
-|------|----------|
-| `plan` | Generate plan first, await confirmation, then execute |
-| `work` | Direct execution with path guards (default) |
-| `yolo` | Full automation, no confirmations |
+**Problem**: pi is a single-threaded conversational model — analyzing 5 modules requires 5 serial reads, with the AI thrashing context between them.
 
-**Execution plan panel** uses a logical step model where each step has an independent lifecycle: `pending → current → done | error | skipped`. The AI controls the panel through the `manage_plan` tool.
+**Solution**: Split complex problems into N sub-tasks, dispatch them to background agents running in parallel, and auto-inject results into the main conversation.
 
-**Path guards** intercept `tool_call` events and block `write`/`edit` operations on protected paths: `node_modules/`, `.git/`, `.pi/`, `.agents/`, `.claude/`.
+```
+Main Agent: "Review these 5 modules"
 
-### model-switch.ts — Model Switching
+   ├─ spawn_agent → Sub-Agent₁ ●── auth module
+   ├─ spawn_agent → Sub-Agent₂ ●── api module      Background
+   ├─ spawn_agent → Sub-Agent₃ ●── db module       parallel
+   ├─ spawn_agent → Sub-Agent₄ ●── ui module       non-blocking
+   └─ spawn_agent → Sub-Agent₅ ●── utils module
+   │
+   ▼  autoInject: true  →  auto-push on completion
+```
 
-Registers a `switch_model` tool that allows the AI to change its model at runtime. Lists available models when called without arguments; switches when called with `provider` and `model`.
+| Tool | Capability |
+|------|-----------|
+| `spawn_agent` | Parallel multi-task dispatch, model selection, skill injection, context carrying |
+| `check_agent_results` | Non-blocking poll / blocking wait / list all jobs |
+| `send_agent_message` | Inter-agent broadcast / point-to-point communication |
+| `control_agent` | Full lifecycle: `kill` `abort` `pause` `resume` `status` `list` |
 
-Default model is read from `settings.json`.
+**v8 highlights**: AbortSignal full-chain support, Promise anti-pattern fixes, no more silently swallowed exceptions, `autoInject` auto-push on completion.
 
-### context-usage.ts & token-stats.ts — Observability
+---
 
-- `context-usage.ts`: Registers `/context` command displaying a breakdown of token usage across system prompt, skills, and conversation context.
-- `token-stats.ts`: Adds a persistent status bar widget showing context window usage as a percentage ring.
+### 2. Windows Dual Engine — `cmd-tool.ts` + `powershell-tool.ts`
 
-## Deployment
+**Problem**: pi's `bash` tool requires WSL on Windows, and `findstr` can't handle mixed-encoding Chinese search.
+
+**Solution**: Two engines selected by scenario — `cmd` for quick commands (~100ms startup), `powershell` for complex searches (native UTF-8).
+
+| Feature | `cmd` | `powershell` |
+|---------|:-----:|:------------:|
+| Startup speed | ⚡ ~100ms | 🐢 ~1s |
+| Simple commands | ✅ `dir` `type` `echo` | ✅ `ls` `gc` `echo` |
+| UTF-8 files | ⚠️ needs `codepage=65001` | ✅ **Native UTF-8, zero config** |
+| Mixed-encoding search | ❌ `findstr` byte match | ✅ **`Select-String` auto-detect** |
+| Command safety | ⚠️ spawn ANSI conversion corrupts | ✅ **Base64(UTF-16LE) zero loss** |
+| Structured output | ❌ Plain text only | ✅ JSON / CSV / objects |
+| Timeout control | ✅ Default 30s, no hard cap | ✅ Default 60s, no hard cap |
+| Truncation guard | ✅ 2000 lines / 50KB | ✅ 2000 lines / 50KB |
+
+**Killer feature — Cross-encoding search**:
+
+```powershell
+# What findstr can't do — one command searches UTF-8 + GBK files
+Select-String -Path *.txt -Pattern "connection timeout"
+→ utf8-log.txt:42:  [ERROR] database connection timeout, retry #3
+→ gbk-log.txt:17:   [ERROR] database connection timeout, retry #1
+```
+
+**Technical implementation**:
+- `powershell`: `-EncodedCommand` + Base64(UTF-16LE) bypasses Node.js spawn's ANSI code page conversion; `$OutputEncoding=UTF8` + `2>&1 | Out-String -Width 200` ensures pure text UTF-8 output
+- `cmd`: Auto-prepends `chcp <codepage>` prefix, eliminating encoding mismatch
+- Both implement full termination state machines: AbortSignal three-phase checks + `killProcessTree` + residual cleanup
+
+---
+
+### 3. Smart Work Mode — `work-mode.ts` v3
+
+**Problem**: AI acts freely — complex tasks jump in without planning, simple tasks get stuck in needless confirmation loops. No safety guardrails — AI might accidentally write to `.git/` or `node_modules/`.
+
+**Solution**: Three modes + logical-order plan panel + path safety guards.
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| **Plan** | Plan first → user confirms → step-by-step execution | Complex multi-step, cross-module refactoring |
+| **Work** | Direct execution + safety guards (default) | Routine dev, single-file edits |
+| **YOLO** | Full automation, no confirmations | High-trust batch operations |
+
+**Plan panel** (logical step model, each step has independent lifecycle):
+
+```
+✅ 1. Analyze root cause
+▶ 2. Modify cmd-tool.ts         ← current step
+○ 3. Deploy to production
+○ 4. /reload & verify
+○ 5. Git commit & push
+```
+
+| Status | Meaning |
+|:------:|---------|
+| ○ | Pending |
+| ▶ | In progress |
+| ✅ | Complete |
+| ❌ | Error (doesn't abort the plan; can skip/retry) |
+| ⏭ | Skipped |
+
+**`manage_plan` API**: AI controls panel via tool calls — `set_steps`, `set_step_status`, `insert_step`, `delete_step`, `update_step`, `complete`, `clear`.
+
+**Safety guards**: Auto-blocks `write`/`edit` on `.git/`, `.pi/`, `.agents/`, `.claude/`, `node_modules/`.
+
+**User commands**: `/plan`, `/work`, `/yolo`, `/security-review`, `/plan-expand`, `/plan-collapse`, `/plan-cancel`
+
+---
+
+### 4. Observability — `context-usage.ts` + `token-stats.ts`
+
+**Problem**: No visibility into token consumption — conversation suddenly truncates due to context overflow, losing all prior analysis.
+
+**Solution**:
+
+| Component | Capability |
+|-----------|-----------|
+| Status bar token ring | Real-time percent indicator `[████░░] 87%`, warns before overflow |
+| `/context` command | Overlay showing System / Skills / Conversation token usage breakdown |
+| Proactive offloading | AI detects high water mark, delegates to sub-agents / compresses history |
+
+---
+
+### 5. Model Hot-Switching — `model-switch.ts`
+
+**Problem**: Changing models requires editing config and restarting. Small tasks waste tokens on large models.
+
+**Solution**:
+
+| Tool / Command | Capability |
+|----------------|-----------|
+| `switch_model` tool | AI chooses per task complexity — demote to Haiku for simple queries, switch to stronger model for complex analysis |
+| `/set-default` | Persists default model to settings.json, auto-loaded on startup |
+| `/reset-default` | Clears default model config |
+| `/model-info` | Shows current / default model status |
+
+**Smart behavior**: Manually-switched sessions are not overwritten by default config, preserving user intent.
+
+---
+
+### 6. Wiki Knowledge Base — `wiki.ts` v3
+
+**Problem**: Project documentation scattered everywhere, search relies on `grep` with noisy results. Previously recorded notes are completely isolated from the current conversation.
+
+**Solution**:
+
+| Command / Tool | Capability |
+|----------------|-----------|
+| `/wiki-load <directory>` | Load data source, auto-scan `.md` files recursively, build search index |
+| `/wiki-unload [index]` | Unload data source / list loaded sources |
+| `/wiki-search <keyword>` | Full-text search, TUI panel displays results (zero AI token cost) |
+| `/wiki-ask <question>` | Search + return full source content, triggers AI summarization |
+| `/wiki-close` | Close search results panel |
+| `/wiki-status` | View index status |
+| `kb_search` tool | LLM can actively call to search knowledge base when answering questions |
+
+**Key design**: Search and indexing are deterministic and token-free — the AI only uses results to answer questions.
+
+---
+
+### 7. Agent Communication Layer — `agent-bus.ts` + `confirm-bus.ts`
+
+**Problem**: Different agents (main, sub) are completely isolated from each other, cannot coordinate.
+
+**Solution**:
+
+| Component | Capability |
+|-----------|-----------|
+| **AgentBus** (`globalThis.__pi_agent_bus`) | Cross-session message broadcast / point-to-point, EventEmitter singleton |
+| **ConfirmBus** (`globalThis.__pi_confirm_bus`) | Sub-agent safety dialog routing, operation confirmations relayed to main agent |
+
+---
+
+## 📂 Project Structure
+
+```
+pi-agent-extensions/
+├── README.md                        # This file
+├── cmd-tool.ts                      # Windows cmd.exe tool (auto chcp)
+├── context-usage.ts                 # /context token usage overlay
+├── model-switch.ts                  # Model hot-switching + default persistence
+├── parallel-agent.ts                # ⭐ Sub-agent parallel dispatch v8
+├── powershell-tool.ts               # Windows PowerShell (UTF-8 / Select-String)
+├── token-stats.ts                   # Status bar token percent ring
+├── wiki.ts                          # ⭐ Wiki knowledge base v3
+├── work-mode.ts                     # ⭐ 3-mode + safety guards + plan panel
+├── lib/
+│   ├── agent-bus.ts                 # Global message bus singleton
+│   └── confirm-bus.ts               # Sub-agent confirmation dialog router
+└── wiki/                            # Wiki sub-modules
+    ├── commands/
+    │   ├── query-cmds.ts            # /wiki-search, /wiki-ask, /wiki-load etc.
+    │   └── repo-cmds.ts             # Wiki repository management
+    ├── lib/
+    │   ├── indexer.ts               # Full-text indexer
+    │   ├── search.ts                # Search engine
+    │   ├── store.ts                 # Data store
+    │   └── types.ts                 # Type definitions
+    └── tools/
+        ├── kb-search.ts             # kb_search AI tool
+        └── management.ts            # Wiki management tools
+```
+
+---
+
+## 📦 Installation
 
 ### Prerequisites
 
@@ -111,20 +270,22 @@ git clone https://github.com/ang-XWBWZ/pi-agent-extensions.git
 cd pi-agent-extensions
 
 $dst = "$env:USERPROFILE\.pi\agent\extensions"
-New-Item -ItemType Directory -Force "$dst\lib"
+New-Item -ItemType Directory -Force "$dst\lib", "$dst\wiki"
 Copy-Item *.ts $dst
 Copy-Item lib\*.ts "$dst\lib"
+Copy-Item wiki\**\* "$dst\wiki\" -Recurse
 ```
 
-**Linux / macOS:**
+**Linux / macOS (with WSL):**
 ```bash
 git clone https://github.com/ang-XWBWZ/pi-agent-extensions.git
 cd pi-agent-extensions
 
 DST="$HOME/.pi/agent/extensions"
-mkdir -p "$DST/lib"
+mkdir -p "$DST/lib" "$DST/wiki"
 cp *.ts "$DST/"
 cp lib/*.ts "$DST/lib/"
+cp wiki/**/*.ts "$DST/wiki/"
 ```
 
 ### Activate
@@ -142,32 +303,90 @@ This unloads existing extensions and loads all `.ts` files from the extensions d
 Ask the AI to use one of the extension tools. For example:
 
 ```
-> List files in the current directory using cmd
+> List files using cmd
 > What's my context usage? (/context)
 > Switch to a different model
+> Search the wiki for "configuration"
 ```
 
 If the tool executes successfully, the extension is working.
 
-### Configuration
+---
+
+## 🎬 Usage Scenarios
+
+### Scenario 1: Multi-Module Code Review
+
+```
+You: "Review src/auth, src/api, and src/db for security vulnerabilities"
+
+→ AI spawns 3 sub-agents in parallel
+→ All 3 analyze simultaneously, non-blocking
+→ Results auto-injected on completion
+→ AI compiles a security report with severity levels
+```
+
+### Scenario 2: Mixed-Encoding Log Search
+
+```
+You: "Search logs/ for all lines containing 'connection timeout'"
+
+→ AI selects powershell (auto-detects Chinese content)
+→ Select-String -Path logs\*.log -Pattern "connection timeout"
+→ Hits both UTF-8 and GBK files
+→ Displays file name + line number for each match
+```
+
+### Scenario 3: Batch Refactoring with Plan Control
+
+```
+You: "Replace all console.log with logger.debug in src/"
+
+→ AI outputs Execution Plan
+  ✅ 1. Find all files containing console.log
+  ▶ 2. Replace one by one with logger.debug       ← current
+  ○ 3. Check for remaining direct calls
+  ○ 4. Run linter to verify
+→ You confirm → panel advances step by step
+→ Safety guards protect node_modules/
+→ If a step errors → mark ❌ → skip or retry
+```
+
+### Scenario 4: Long-Running Build
+
+```
+You: "Run npm run build"
+
+→ AI selects cmd-tool (fast ~100ms startup)
+→ Sets timeout to 120s (no hard cap)
+→ Ctrl+C at any time → full killProcessTree cleanup
+→ Output >2000 lines → auto-saved to temp file
+→ "Use read tool to view full output"
+```
+
+### Scenario 5: Token Warning Saves Context
+
+```
+Status bar: [████████░░] 87%
+
+→ AI detects impending context overflow
+→ Proactively:
+  1. Delegates current analysis to sub-agents
+  2. Compresses redundant history
+  3. Uses kb_search instead of full file reads
+→ Conversation continues without sudden truncation
+```
+
+---
+
+## ⚙️ Configuration
 
 - **Default model**: Edit `settings.json` in the extensions directory to set `defaultProvider` and `defaultModel`.
 - **Work mode**: Set `__pi_default_mode` in your pi configuration to `"plan"`, `"work"`, or `"yolo"`.
-- **AI behavior**: Copy `SYSTEM.md` to pi's skills or configuration directory to apply behavioral constraints to the AI agent. See below.
 
-### Installing SYSTEM.md
+---
 
-`SYSTEM.md` defines rules the AI follows during every session — no unauthorized file operations, mandatory user confirmation for risky actions, working directory boundaries, etc.
-
-Place it where pi loads system-level instructions. Typically one of:
-
-- `~/.pi/agent/SYSTEM.md`
-- Your project root as `CLAUDE.md` or `AGENTS.md`
-- pi's configured system prompt directory
-
-After placing the file, `/reload` to apply.
-
-## Compatibility
+## 🔒 Compatibility
 
 These extensions use pi's public Extension API (`registerTool`, `registerCommand`, lifecycle events) and do not modify pi's source code. They depend on packages bundled with pi:
 
@@ -176,26 +395,10 @@ These extensions use pi's public Extension API (`registerTool`, `registerCommand
 - `@earendil-works/pi-ai`
 - `typebox`
 
-Global singletons (`globalThis.__pi_agent_bus`, `globalThis.__pi_confirm_bus`) are used for cross-session communication. This is incompatible with ISOLATE mode.
+Global singletons (`globalThis.__pi_agent_bus`, `globalThis.__pi_confirm_bus`) are used for cross-session communication. This is **incompatible with ISOLATE mode**.
 
-## Project Structure
+---
 
-```
-github-dist/
-├── README.md
-├── SYSTEM.md
-├── cmd-tool.ts
-├── context-usage.ts
-├── model-switch.ts
-├── parallel-agent.ts
-├── powershell-tool.ts
-├── token-stats.ts
-├── work-mode.ts
-└── lib/
-    ├── agent-bus.ts
-    └── confirm-bus.ts
-```
-
-## License
+## 📄 License
 
 MIT

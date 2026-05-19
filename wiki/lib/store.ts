@@ -65,6 +65,31 @@ export function mergeIndex(entries: FileEntry[]): void {
   writeAll(s);
 }
 
+/** 从索引移除单条记录 */
+export function removeEntry(relPath: string): boolean {
+  const s = readAll();
+  if (!s.index[relPath]) return false;
+  delete s.index[relPath];
+  writeAll(s);
+  return true;
+}
+
+/** 更新条目路径（重命名/移动后同步索引） */
+export function updateEntryPath(oldRelPath: string, newRelPath: string, entry: FileEntry): boolean {
+  const s = readAll();
+  if (!s.index[oldRelPath]) return false;
+  delete s.index[oldRelPath];
+  s.index[newRelPath] = entry;
+  writeAll(s);
+  return true;
+}
+
+/** 获取单条索引记录 */
+export function getEntry(relPath: string): FileEntry | null {
+  const idx = getIndex();
+  return idx[relPath] ?? null;
+}
+
 export function getWikiModel(): string {
   return "opencode-go/deepseek-v4-flash";
 }
