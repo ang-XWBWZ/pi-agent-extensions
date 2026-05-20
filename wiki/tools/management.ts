@@ -128,6 +128,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "The directory path can be absolute or relative to the project root.",
       "Returns the number of .md files indexed.",
       "Use wiki_list_sources to see what's already loaded.",
+      "FORBIDDEN: Do NOT auto-enable semantic search after loading. Ask the user first.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "数据源目录路径（绝对路径或相对路径）" }),
@@ -161,6 +162,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "Pass the source path (or its basename) to unload.",
       "Unloading removes the source and its index entries.",
       "The original files on disk are NOT deleted.",
+      "FORBIDDEN: Do NOT unload a source without user confirmation.",
     ],
     parameters: Type.Object({
       path: Type.Optional(Type.String({ description: "要卸载的数据源路径（留空列出所有）" })),
@@ -192,6 +194,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "Call before wiki_create_entry or wiki_get_entry to discover available sources.",
       "Returns source paths, file counts, and last scan time.",
     ],
+    // 无禁令 — 只读操作
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
       if (signal?.aborted) throw new Error("aborted");
@@ -209,6 +212,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "Call after making file changes (rename, create, delete) outside wiki tools.",
       "Call when you suspect the index is stale.",
       "Pass the source path to refresh a single source, or omit to refresh all.",
+      "FORBIDDEN: Do NOT refresh without user request or explicit need (e.g. after wiki_create_entry, index is already auto-updated).",
     ],
     parameters: Type.Object({
       source: Type.Optional(Type.String({ description: "要刷新的数据源路径（留空刷新全部）" })),
@@ -257,6 +261,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "content: optional initial body content.",
       "Automatically creates parent directories if needed.",
       "The new entry is immediately indexed for search.",
+      "FORBIDDEN: Do NOT create entries without user confirmation of the content.",
     ],
     parameters: Type.Object({
       source: Type.String({ description: "目标数据源路径" }),
@@ -318,6 +323,8 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "source: the data source path. path: relative path within the source.",
       "Supports both .md and resource files (images, PDFs, etc.).",
       "Binary files will be read as text — use for small text-based resources only.",
+      "FORBIDDEN: path MUST be a file, NOT a directory. Directories will fail.",
+      "FORBIDDEN: Do NOT call this without user picking a specific entry first. Never auto-read after kb_search.",
     ],
     parameters: Type.Object({
       source: Type.String({ description: "数据源路径" }),
@@ -434,6 +441,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "The index is automatically updated — no need to call wiki_refresh afterward.",
       "For directories, all contained entries are re-indexed after rename.",
       "If oldPath is a directory, newPath must also be a directory path.",
+      "FORBIDDEN: Do NOT rename without user confirmation.",
     ],
     parameters: Type.Object({
       source: Type.String({ description: "数据源路径" }),
@@ -529,6 +537,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "source: the data source path. from / to: relative paths within the source.",
       "The index is automatically updated.",
       "If 'to' is an existing directory, the file is moved inside it (keeping its name).",
+      "FORBIDDEN: Do NOT move files without user confirmation.",
     ],
     parameters: Type.Object({
       source: Type.String({ description: "数据源路径" }),
@@ -631,29 +640,17 @@ export function registerManagementTools(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Call this when the user wants to enable semantic search.",
       "Set autoInstall: true to auto-trigger npm install to wiki/node_modules/",
-      "",
+      // ── 网络失败自动回退脚本 ──
+      "ON 'fetch failed' ERROR: Do NOT ask user — immediately run the init scripts:",
+      "  ① C:\\Users\\93061\\.pi\\agent\\extensions\\wiki\\init-wiki-deps.bat  (npm install)",
+      "  ② C:\\Users\\93061\\.pi\\agent\\extensions\\wiki\\init-wiki-model.bat (model download via hf-mirror)",
+      "  Then call wiki_enable_semantic again with autoInstall: false.",
+      "FORBIDDEN: Do NOT retry wiki_enable_semantic more than once after a failure. Do NOT call it repeatedly without running init scripts first.",
+      // ── 模型信息 ──
       "📦 依赖: @huggingface/transformers（transformers.js）",
-      "   安装: npm install @huggingface/transformers（安装至 extensions/wiki/node_modules/）",
-      "   体积: ~500MB（含 ONNX runtime 原生二进制）",
-      "",
       "🧠 模型: Xenova/paraphrase-multilingual-MiniLM-L12-v2（多语言 384 维）",
-      "   来源: HuggingFace Hub → https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2",
       "   镜像: https://hf-mirror.com/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/",
-      "   精度: INT8 量化 ~118MB（推荐） ｜ FP32 全精度 ~470MB",
-      "   文件: config.json · tokenizer.json · tokenizer_config.json · onnx/model_quantized.onnx",
-      "   本地: wiki/models/paraphrase-multilingual-MiniLM-L12-v2/（存在即优先离线加载）",
-      "",
-      "🔧 一键初始化（网络受限时）:",
-      "   分两步初始化（三平台通用）:",
-      "     ① npm 依赖: init-wiki-deps.bat / .ps1 / .sh",
-      "     ② 模型下载: init-wiki-model.bat / .ps1 / .sh",
-      "",
-      "⚠️ 常见坑:",
-      "   ① embedder.ts 的 model_file_name 只需主干名 \"model_quantized\"，",
-      "      transformers.js 自动补 onnx/ + .onnx，勿写完整路径",
-      "   ② 部署 robocopy 加 /XD wiki\\models 避免覆盖已下载的模型",
-      "   ③ 启用前确保 wiki_load_source 已加载数据源",
-      "",
+      "   本地: extensions/wiki/models/paraphrase-multilingual-MiniLM-L12-v2/",
       "This will re-index all sources to generate embeddings.",
       "Use wiki_semantic_status to check progress/results.",
     ],
@@ -729,6 +726,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "Call when user wants to disable semantic search.",
       "Embeddings are preserved — re-enabling won't require regeneration.",
       "Keyword search remains fully functional.",
+      "FORBIDDEN: Do NOT disable without explicit user request.",
     ],
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
@@ -754,6 +752,7 @@ export function registerManagementTools(pi: ExtensionAPI): void {
       "Returns enabled state, dependency status, embedding count, model name.",
       "If not enabled, suggest wiki_enable_semantic to set up.",
     ],
+    // 无禁令 — 只读操作
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
       if (signal?.aborted) throw new Error("aborted");

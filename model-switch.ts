@@ -109,6 +109,9 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "List or switch between available models",
     promptGuidelines: [
       "Use switch_model without arguments to list available models. Use switch_model with provider and model to switch.",
+      // ── 体验 ──
+      "Switch when the user explicitly requests a model change, or to downgrade for simple tasks to save cost/tokens.",
+      "FORBIDDEN: Do NOT switch models mid-task without user confirmation. Do NOT switch during a running plan unless user asks.",
     ],
     parameters: Type.Object({
       provider: Type.Optional(Type.String()),

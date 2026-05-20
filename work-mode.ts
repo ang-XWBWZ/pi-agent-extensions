@@ -996,6 +996,9 @@ export default function (pi: ExtensionAPI) {
       "Use set_step_status to advance: mark current step 'done', mark next step 'current'.",
       "Use set_steps to replace the current plan with a refined one (max 10 steps).",
       "Use clear when the task is done or the plan is no longer relevant.",
+      // ── 体验 ──
+      "Advance one step at a time via set_step_status. Mark errors honestly — don't skip silently.",
+      "FORBIDDEN: Do NOT clear the panel when steps remain unfinished, unless the user explicitly says so.",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "操作: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear" }),

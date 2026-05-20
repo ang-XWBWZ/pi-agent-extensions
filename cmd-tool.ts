@@ -86,6 +86,9 @@ export default function (pi: ExtensionAPI) {
       "Use codepage=65001 for UTF-8 files (modern editors, git output). Use codepage=936 for GBK files (Chinese Windows legacy).",
       "When findstr returns no results searching non-ASCII text, retry with the other codepage: 65001 for UTF-8 files, 936 for GBK files.",
       "For mixed-encoding directories, run findstr twice — once per codepage — and combine results.",
+      // ── 体验 ──
+      "Prefer cmd over powershell for simple builtins (dir, type, findstr) — it starts faster and has lower overhead.",
+      "FORBIDDEN: Do NOT use cmd for complex text processing, JSON/CSV parsing, or mixed-encoding files — use powershell for those.",
     ],
 
     parameters: Type.Object({

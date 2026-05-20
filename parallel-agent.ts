@@ -492,6 +492,9 @@ export default function (pi: ExtensionAPI) {
       "After spawning, use check_agent_results(jobId) to retrieve results.",
       "For multiple independent tasks, spawn them together for parallel execution.",
       "Results are auto-injected into the conversation when complete — you DO NOT need to block-wait. Keep interacting with the user normally.",
+      // ── 体验 ──
+      "Delegate independent read/search/analysis tasks only. Sub-agents are YOUR workers — dispatch and move on.",
+      "FORBIDDEN: Do NOT spawn sub-agents for trivial single-file reads or single kb_search calls. These are faster done directly.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(
@@ -616,6 +619,9 @@ export default function (pi: ExtensionAPI) {
       "Call without jobId to list all pending/completed jobs.",
       "PREFER non-blocking poll (wait=false, the default). Results are auto-injected via steer when complete — no need to block.",
       "Use wait=true ONLY when you must synchronize before the next action, but know it blocks user interaction.",
+      // ── 体验 ──
+      "Default to wait=false. Results auto-inject on completion — polling is rarely needed.",
+      "FORBIDDEN: Do NOT use wait=true during interactive conversation. It freezes the UI and kills user experience.",
     ],
     parameters: Type.Object({
       jobId: Type.Optional(Type.String({ description: "Job ID（不传则列出所有）" })),
@@ -720,6 +726,9 @@ export default function (pi: ExtensionAPI) {
       "Use to communicate with running sub-agents or coordinate multi-agent workflows.",
       'Set to="broadcast" to send to all agents.',
       "Messages are fire-and-forget — no response is returned.",
+      // ── 体验 ──
+      "Use 'broadcast' for coordination signals (e.g. 'pause all', 'update context'). Use taskId for targeted instructions.",
+      "FORBIDDEN: Do NOT expect a reply or block waiting for one. Messages are strictly one-way.",
     ],
     parameters: Type.Object({
       to: Type.String({ description: "目标: 'broadcast' | jobId | taskId" }),
@@ -753,6 +762,9 @@ export default function (pi: ExtensionAPI) {
       "  'pause' (abort + mark paused), 'resume' (continue paused agent),",
       "  'kill' (dispose one agent), 'kill_job' (kill all agents in a job).",
       "taskId is required for single-agent actions; omit taskId for job-wide operations.",
+      // ── 体验 ──
+      "Use 'list' first to survey. Use 'kill'/'kill_job' to clean up stuck or zombie agents.",
+      "FORBIDDEN: Do NOT kill agents silently. Always report to the user what was killed and why.",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "操作: list | status | send | abort | pause | resume | kill | kill_job" }),

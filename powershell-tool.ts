@@ -147,6 +147,9 @@ export default function (pi: ExtensionAPI) {
       "For reading a file with specific encoding: Get-Content -Path file.txt -Encoding UTF8",
       "For reading a GBK file: Get-Content -Path file.txt -Encoding Default  (uses system ANSI code page, which is GBK on Chinese Windows)",
       "When powershell output is truncated, the full output is saved to a temp file. Use the read tool to view the temp file path listed in the output.",
+      // ── 体验 ──
+      "Use powershell when cmd garbles output or for structured data (JSON, CSV, objects). It handles UTF-8 natively.",
+      "FORBIDDEN: Do NOT use powershell for trivial dir/type/cd commands — cmd is faster for those. PowerShell startup adds ~2s overhead.",
     ],
 
     parameters: Type.Object({

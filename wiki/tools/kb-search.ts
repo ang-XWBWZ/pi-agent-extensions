@@ -50,10 +50,23 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       "搜索 wiki 知识库。支持 keyword / semantic / hybrid 模式。每页最多 10 条，返回总数。",
     promptSnippet: "Search wiki knowledge base",
     promptGuidelines: [
-      "Use kb_search to find relevant notes before answering questions.",
-      "Default mode: hybrid when semantic enabled, keyword otherwise.",
-      "Each page returns up to 10 results with document summaries (no scores).",
-      "Use page parameter to paginate (1-based). Total count is returned.",
+      // ── 搜索策略：拆解 · 翻译 · 联想 · 组合 ──
+      "BEFORE searching, decompose the user's query: identify abbreviations, mixed-language terms, compound concepts, and domain jargon.",
+      "For the FIRST search, construct keyword variants by:",
+      "  • Expanding abbreviations to full names",
+      "  • Translating between the user's language and the knowledge base's dominant language",
+      "  • Splitting compound terms and searching core concepts separately",
+      "  • Trying domain synonyms or alternative phrasings",
+      "A query that fails on its raw form may succeed on a translated, expanded, or simplified variant. Do NOT re-search with the same query.",
+      // ── 模式选择 ──
+      "PREFER keyword mode. Semantic/hybrid adds noise on short/technical queries and does NOT understand abbreviations.",
+      "Use semantic mode only for vague natural-language intent.",
+      "Each page returns up to 10 results (3 when fullContent=true). Check total count — if ≤10, no pagination needed.",
+      // ── 刹车 ──
+      "STOP after at most 2 kb_search calls. After 2 searches, present results and ASK the user before reading any document.",
+      "Never auto-read wiki_get_entry. Wait for the user to pick one.",
+      // ── 无结果 ──
+      "If no results: try a different variant immediately. If still no results after 2: tell user and STOP.",
       "If no results, suggest loading a data source via wiki_load_source.",
     ],
     parameters: Type.Object({
