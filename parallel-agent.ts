@@ -19,6 +19,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   createAgentSession,
   SessionManager,
@@ -445,12 +446,13 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("sub-agents", (tui, theme) => {
       widgetTui = tui;
       return {
-        render: () => {
+        render: (width: number) => {
           const insts = listInstances();
           if (insts.length === 0) return [];
 
           const lines: string[] = [];
-          lines.push(theme.fg("accent", theme.bold(`🤖 子 Agent (${insts.length})`)));
+          const hdr = theme.fg("accent", theme.bold(`🤖 子 Agent (${insts.length})`));
+          lines.push(truncateToWidth(hdr, width));
 
           for (const inst of insts) {
             // 精细状态 → 图标 + 文字
@@ -484,8 +486,13 @@ export default function (pi: ExtensionAPI) {
               ? modelShort.slice(0, 30) + "…"
               : modelShort;
 
+            // 构建完整行，用 visibleWidth 测量后截断
+            const fullLine =
+              `  ${statusIcon} ${theme.fg("accent", inst.taskId)} ${theme.fg("muted", title)}  ${theme.fg("dim", modelTag)}  ${theme.fg("dim", `↑${tokIn} ↓${tokOut}  ${elapsed}s  ${statusText}`)}`;
             lines.push(
-              `  ${statusIcon} ${theme.fg("accent", inst.taskId)} ${theme.fg("muted", title)}  ${theme.fg("dim", modelTag)}  ${theme.fg("dim", `↑${tokIn} ↓${tokOut}  ${elapsed}s  ${statusText}`)}`,
+              visibleWidth(fullLine) > width
+                ? truncateToWidth(fullLine, width - 1) + "…"
+                : fullLine,
             );
           }
 
@@ -760,7 +767,7 @@ export default function (pi: ExtensionAPI) {
                   (r) => `  ${r.ok ? "✅" : "❌"} ${r.name}: ${(r.output ?? r.error ?? "").slice(0, 120)}`,
                 ),
                 ``,
-                `使用 check_agent_results("${params.jobId}", true) 阻塞等待全部完成。`,
+                `结果将在完成后自动推送。主动查询进度: check_agent_results("${params.jobId}")（非阻塞）。`,
               ].join("\n"),
             },
           ],
