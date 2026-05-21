@@ -13,7 +13,10 @@
 
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 // ---- 全局单例 ----
 
@@ -55,6 +58,8 @@ export interface AgentJob {
   status: "dispatched" | "running" | "complete" | "error" | "killed";
   createdAt: number;
   finishedAt?: number;
+  /** 是否已通过 autoInject 或 check_agent_results 推送过结果，防止重复 */
+  _autoInjected?: boolean;
 }
 
 /** 子 Agent 精细行为状态 */
@@ -102,12 +107,20 @@ export interface AgentInstance {
   promptLength: number;
   /** 当前已输出字符数（实时更新） */
   outputLength: number;
+  /** 子 Agent 使用的模型标识 */
+  model?: string;
+  /** 累计输入 token 数 */
+  inputTokens: number;
+  /** 累计输出 token 数 */
+  outputTokens: number;
   /** 内部：标记外部触发的 abort，阻止 agent_end 自动 finish */
   _abortExternally?: () => void;
   /** 内部：重置超时计时器 */
   _resetTimer?: () => void;
   /** 内部：空闲检测定时器 */
   _idleTimer?: ReturnType<typeof setTimeout>;
+  /** 内部：agent_end 时捕获的消息快照（session dispose 后仍可用） */
+  _savedMessages?: AgentMessage[];
 }
 
 export interface AgentMessage {
@@ -141,6 +154,105 @@ const instances = new Map<string, AgentInstance>(); // key = `${jobId}:${taskId}
 /** 获取全局 EventEmitter（供外部监听） */
 export function getAgentBus(): EventEmitter {
   return globalBus;
+}
+
+// ---- 存档 ----
+
+export interface AgentSaveState {
+  saveId: string;
+  taskId: string;
+  name: string;
+  model: string;
+  messages: AgentMessage[];
+  savedAt: number;
+}
+
+function saveDir(): string {
+  const dir = join(process.env.USERPROFILE ?? ".", ".pi", "agent", "sub-agent-saves");
+  try { mkdirSync(dir, { recursive: true }); } catch { /* */ }
+  return dir;
+}
+
+export function saveAgentState(jobId: string, taskId: string): AgentSaveState | null {
+  const inst = getInstance(jobId, taskId);
+  if (!inst) return null;
+
+  // 优先使用 session 实时消息，session dispose 后用快照
+  let messages: AgentMessage[];
+  try {
+    messages = inst.session.state.messages;
+  } catch {
+    messages = inst._savedMessages ?? [];
+  }
+
+  const state: AgentSaveState = {
+    saveId: taskId,
+    taskId,
+    name: inst.name,
+    model: inst.model ?? "?",
+    messages,
+    savedAt: Date.now(),
+  };
+
+  const dir = saveDir();
+  try {
+    writeFileSync(join(dir, `${taskId}.json`), JSON.stringify(state, null, 2), "utf-8");
+  } catch (e) {
+    // 消息可能含不可序列化内容（ImageContent 等），尝试清理后重试
+    try {
+      const cleaned = {
+        ...state,
+        messages: messages.map((m) => {
+          const content = typeof m.content === "string" ? m.content : "(binary content)";
+          return { ...m, content: content.slice(0, 5000) };
+        }),
+      };
+      writeFileSync(join(dir, `${taskId}.json`), JSON.stringify(cleaned, null, 2), "utf-8");
+    } catch {
+      console.warn("[agent-bus] 存档失败:", String(e));
+      return null;
+    }
+  }
+  return state;
+}
+
+export function loadAgentState(saveId: string): AgentSaveState | null {
+  try {
+    const dir = saveDir();
+    const raw = readFileSync(join(dir, `${saveId}.json`), "utf-8");
+    return JSON.parse(raw) as AgentSaveState;
+  } catch {
+    return null;
+  }
+}
+
+export function deleteAgentSave(saveId: string): boolean {
+  try {
+    const dir = saveDir();
+    unlinkSync(join(dir, `${saveId}.json`));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function listAgentSaves(): AgentSaveState[] {
+  try {
+    const dir = saveDir();
+    const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+    return files
+      .map((f) => {
+        try {
+          return JSON.parse(readFileSync(join(dir, f), "utf-8")) as AgentSaveState;
+        } catch {
+          return null;
+        }
+      })
+      .filter((s): s is AgentSaveState => s !== null)
+      .sort((a, b) => b.savedAt - a.savedAt);
+  } catch {
+    return [];
+  }
 }
 
 // ---- Job API ----
@@ -246,6 +358,8 @@ export function updateInstanceStatus(
     currentTool?: string;
     logTool?: { toolName: string; status: "started" | "done" | "error"; duration?: number; error?: string };
     outputLength?: number;
+    inputTokens?: number;
+    outputTokens?: number;
   },
 ): void {
   const key = instanceKey(jobId, taskId);
@@ -272,6 +386,12 @@ export function updateInstanceStatus(
   }
   if (update.outputLength !== undefined) {
     inst.outputLength = update.outputLength;
+  }
+  if (update.inputTokens !== undefined) {
+    inst.inputTokens = update.inputTokens;
+  }
+  if (update.outputTokens !== undefined) {
+    inst.outputTokens = update.outputTokens;
   }
   inst.lastActivityAt = Date.now();
 

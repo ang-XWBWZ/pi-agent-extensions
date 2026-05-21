@@ -18,13 +18,12 @@
  *   - 主 Agent 不再需要阻塞式 check_agent_results(wait=true)，完成即通知
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-  AuthStorage,
-  ModelRegistry,
   createAgentSession,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { type Model } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -53,10 +52,15 @@ import {
   getAgentBus,
   Events,
   updateInstanceStatus,
+  saveAgentState,
+  loadAgentState,
+  deleteAgentSave,
+  listAgentSaves,
   type SubTask,
   type SubResult,
   type AgentJob,
   type AgentInstance,
+  type AgentSaveState,
 } from "./lib/agent-bus.js";
 
 // ---- helpers ----
@@ -93,6 +97,13 @@ async function loadSkill(name: string): Promise<string> {
   return `\n[无法加载 skill: ${name}]`;
 }
 
+// ---- Token 估算（匹配系统启发式） ----
+function estimateTokens(text: string): number {
+  const cjk = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]/g) || []).length;
+  const other = text.length - cjk;
+  return Math.max(1, Math.ceil(cjk / 1.5 + other / 4));
+}
+
 // ---- Session 创建串行化（防止并发 globalThis 写入） ----
 let sessionChain = Promise.resolve();
 
@@ -105,7 +116,6 @@ function runSingleAgent(
   cwd: string,
   subModel: Model<any>,
   modelRegistry: ModelRegistry,
-  authStorage: AuthStorage,
   deadline: number,
   pi: ExtensionAPI,
 ): Promise<SubResult> {
@@ -145,7 +155,6 @@ function runSingleAgent(
           const sm = SessionManager.inMemory();
           const created = await createAgentSession({
             sessionManager: sm,
-            authStorage,
             modelRegistry,
             model: subModel,
             cwd,
@@ -177,6 +186,9 @@ function runSingleAgent(
         startedAt: Date.now(),
         promptLength: prompt.length,
         outputLength: 0,
+        model: `${subModel.provider}/${subModel.id}`,
+        inputTokens: estimateTokens(prompt),
+        outputTokens: 0,
         _abortExternally: () => { abortedExternally = true; },
         _resetTimer: () => {},
       };
@@ -241,9 +253,14 @@ function runSingleAgent(
           if (event.assistantMessageEvent.type === "text_delta") {
             output += event.assistantMessageEvent.delta;
             instRef.outputLength = output.length;
+            instRef.outputTokens += estimateTokens(event.assistantMessageEvent.delta);
             if (output.length > 10_000)
               output = output.slice(0, 10_000) + "\n...";
-            updateInstanceStatus(jobId, task.id, { detailedStatus: "thinking", outputLength: instRef.outputLength });
+            updateInstanceStatus(jobId, task.id, {
+              detailedStatus: "thinking",
+              outputLength: instRef.outputLength,
+              outputTokens: instRef.outputTokens,
+            });
           }
         }
         // ---- tool start → tool_calling ----
@@ -280,6 +297,11 @@ function runSingleAgent(
         if (event.type === "agent_end") {
           clearIdle();
           updateInstanceStatus(jobId, task.id, { detailedStatus: "done" });
+          // 捕获消息快照 + 自动存档
+          try {
+            instRef._savedMessages = session.state.messages;
+            saveAgentState(jobId, task.id);
+          } catch { /* */ }
           if (abortedExternally) {
             abortedExternally = false;
             return;
@@ -320,7 +342,6 @@ function spawnAllBackground(
   cwd: string,
   defaultModel: Model<any> | undefined,
   modelRegistry: ModelRegistry,
-  authStorage: AuthStorage,
   deadline: number,
   pi: ExtensionAPI,
 ): void {
@@ -330,7 +351,13 @@ function spawnAllBackground(
     let subModel: Model<any> | undefined = defaultModel;
     if (task.model) {
       const [p, m] = task.model.split("/");
-      subModel = modelRegistry.find(p, m) ?? defaultModel;
+      const found = modelRegistry.find(p, m);
+      if (found) {
+        subModel = found;
+      } else {
+        console.warn(`[parallel-agent] 模型 ${task.model} 未找到，降价使用默认模型`);
+        subModel = defaultModel;
+      }
     }
 
     if (!subModel) {
@@ -354,7 +381,6 @@ function spawnAllBackground(
       cwd,
       subModel,
       modelRegistry,
-      authStorage,
       deadline,
       pi,
     )
@@ -390,8 +416,6 @@ function spawnAllBackground(
 // ---- extension ----
 
 export default function (pi: ExtensionAPI) {
-  const authStorage = AuthStorage.create();
-  const modelRegistry = ModelRegistry.create(authStorage);
 
   // ==================== 子 Agent 状态面板 Widget ====================
 
@@ -446,18 +470,22 @@ export default function (pi: ExtensionAPI) {
                 : inst.detailedStatus === "paused" ? "已暂停"
                 : "运行中";
             const elapsed = ((Date.now() - inst.startedAt) / 1000).toFixed(0);
-            const inLen = inst.promptLength > 1000
-              ? `${(inst.promptLength / 1000).toFixed(1)}k`
-              : String(inst.promptLength);
-            const outLen = inst.outputLength > 1000
-              ? `${(inst.outputLength / 1000).toFixed(1)}k`
-              : String(inst.outputLength);
-            const title = inst.name.length > 25
-              ? inst.name.slice(0, 25) + "…"
+            const tokIn = inst.inputTokens > 1000
+              ? `${(inst.inputTokens / 1000).toFixed(1)}k`
+              : String(inst.inputTokens);
+            const tokOut = inst.outputTokens > 1000
+              ? `${(inst.outputTokens / 1000).toFixed(1)}k`
+              : String(inst.outputTokens);
+            const title = inst.name.length > 20
+              ? inst.name.slice(0, 20) + "…"
               : inst.name;
+            const modelShort = inst.model || "?";
+            const modelTag = modelShort.length > 30
+              ? modelShort.slice(0, 30) + "…"
+              : modelShort;
 
             lines.push(
-              `  ${statusIcon} ${theme.fg("muted", title)}  ${theme.fg("dim", `入${inLen} → 出${outLen}  ${elapsed}s  ${statusText}`)}`,
+              `  ${statusIcon} ${theme.fg("accent", inst.taskId)} ${theme.fg("muted", title)}  ${theme.fg("dim", modelTag)}  ${theme.fg("dim", `↑${tokIn} ↓${tokOut}  ${elapsed}s  ${statusText}`)}`,
             );
           }
 
@@ -492,6 +520,7 @@ export default function (pi: ExtensionAPI) {
       "After spawning, use check_agent_results(jobId) to retrieve results.",
       "For multiple independent tasks, spawn them together for parallel execution.",
       "Results are auto-injected into the conversation when complete — you DO NOT need to block-wait. Keep interacting with the user normally.",
+      "To resume from a saved state, set resumeFrom on the task to the saveId from control_agent save/list_saves.",
       // ── 体验 ──
       "Delegate independent read/search/analysis tasks only. Sub-agents are YOUR workers — dispatch and move on.",
       "FORBIDDEN: Do NOT spawn sub-agents for trivial single-file reads or single kb_search calls. These are faster done directly.",
@@ -505,6 +534,7 @@ export default function (pi: ExtensionAPI) {
           skills: Type.Optional(Type.Array(Type.String())),
           mode: Type.Optional(StringEnum(["plan", "work", "yolo"] as const)),
           model: Type.Optional(Type.String()),
+          resumeFrom: Type.Optional(Type.String({ description: "从存档恢复（saveId），继承历史对话上下文" })),
         }),
       ),
       timeout: Type.Optional(Type.Number({ description: "单任务超时秒（默认 60）" })),
@@ -528,14 +558,43 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const job = createJob(params.tasks);
+      // ---- 处理 resumeFrom：注入存档上下文 ----
+      const resolvedTasks: SubTask[] = [];
+      for (const task of params.tasks as SubTask[]) {
+        const resumeId = (task as Record<string, unknown>).resumeFrom as string | undefined;
+        if (resumeId) {
+          const saved = loadAgentState(resumeId);
+          if (saved) {
+            // 将存档消息序列化为上下文注入
+            const historyText = saved.messages
+              .map((m) => {
+                if (m.role === "user") return `[User]: ${typeof m.content === "string" ? m.content : "(content)"}`;
+                if (m.role === "assistant") return `[Assistant]: ${typeof m.content === "string" ? m.content.slice(0, 500) : "(content)"}`;
+                return `[${m.role}]`;
+              })
+              .join("\n");
+            const resumeContext = `[从存档恢复: ${saved.name} (${saved.model}, ${saved.messages.length} 条消息)]\n\n--- 历史对话 ---\n${historyText.slice(-10_000)}\n--- 历史结束 ---`;
+            resolvedTasks.push({
+              ...task,
+              context: [...(task.context || []), resumeContext],
+            });
+          } else {
+            console.warn(`[parallel-agent] 存档 ${resumeId} 不存在，跳过恢复`);
+            resolvedTasks.push(task);
+          }
+        } else {
+          resolvedTasks.push(task);
+        }
+      }
+
+      const job = createJob(resolvedTasks);
       job.status = "running";
 
       try {
         pi.appendEntry("agent-job", {
           jobId: job.jobId,
           total,
-          tasks: params.tasks.map((t) => ({ id: t.id, prompt: t.prompt.slice(0, 80) })),
+          tasks: resolvedTasks.map((t) => ({ id: t.id, prompt: t.prompt.slice(0, 80) })),
           createdAt: job.createdAt,
           status: "running",
         });
@@ -543,11 +602,10 @@ export default function (pi: ExtensionAPI) {
 
       spawnAllBackground(
         job.jobId,
-        params.tasks as SubTask[],
+        resolvedTasks,
         ctx.cwd,
         defaultModel,
-        modelRegistry,
-        authStorage,
+        ctx.modelRegistry,
         deadline,
         pi,
       );
@@ -555,6 +613,8 @@ export default function (pi: ExtensionAPI) {
       // ---- 自动结果注入：完成时推送结果到主对话（不阻塞） ----
       if (autoInject) {
         onJobComplete(job.jobId, (completedJob) => {
+          if (completedJob._autoInjected) return;
+          completedJob._autoInjected = true;
           const elapsed = completedJob.finishedAt
             ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
             : "?";
@@ -675,6 +735,13 @@ export default function (pi: ExtensionAPI) {
         const elapsed = job.finishedAt
           ? ((job.finishedAt - job.createdAt) / 1000).toFixed(1)
           : "?";
+        if (job._autoInjected) {
+          return {
+            content: [{ type: "text", text: `📋 Job ${params.jobId!.slice(0, 8)} 已完成，结果已自动推送到对话中。` }],
+            details: { jobId: job.jobId, status: job.status, autoInjected: true },
+          };
+        }
+        job._autoInjected = true;
         return formatJobResult(job, elapsed);
       }
 
@@ -706,6 +773,13 @@ export default function (pi: ExtensionAPI) {
 
       const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
       ctx.ui.setStatus("sub-agent", undefined);
+      if (completedJob._autoInjected) {
+        return {
+          content: [{ type: "text", text: `📋 Job ${params.jobId!.slice(0, 8)} 已完成，结果已自动推送到对话中。` }],
+          details: { jobId: completedJob.jobId, status: completedJob.status, autoInjected: true },
+        };
+      }
+      completedJob._autoInjected = true;
 
       const elapsed = completedJob.finishedAt
         ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
@@ -752,22 +826,25 @@ export default function (pi: ExtensionAPI) {
     name: "control_agent",
     label: "Control Agent",
     description:
-      "控制子 Agent 生命周期：列出、查看状态、注入消息、打断、暂停、恢复、杀死。" +
+      "控制子 Agent 生命周期：列出、查看状态、注入消息、打断、暂停、恢复、杀死、存档、恢复存档、删除存档。" +
       "支持操作单个 task 或整个 job。",
-    promptSnippet: "Manage sub-agent lifecycle (list/status/send/abort/pause/resume/kill)",
+    promptSnippet: "Manage sub-agent lifecycle (list/status/send/abort/pause/resume/kill/save/load/list_saves/delete_save)",
     promptGuidelines: [
       "Use control_agent to manage running sub-agents spawned by spawn_agent.",
       "Actions: 'list' (list all instances), 'status' (get one instance details),",
       "  'send' (inject message via steer), 'abort' (interrupt but keep alive),",
       "  'pause' (abort + mark paused), 'resume' (continue paused agent),",
       "  'kill' (dispose one agent), 'kill_job' (kill all agents in a job).",
+      "  'save' (save agent state to disk), 'list_saves' (list saved agents),",
+      "  'delete_save' (delete a saved state).",
       "taskId is required for single-agent actions; omit taskId for job-wide operations.",
       // ── 体验 ──
+      "Use 'save' to checkpoint a sub-agent before risky operations. Use 'list_saves' to see available checkpoints.",
       "Use 'list' first to survey. Use 'kill'/'kill_job' to clean up stuck or zombie agents.",
       "FORBIDDEN: Do NOT kill agents silently. Always report to the user what was killed and why.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "操作: list | status | send | abort | pause | resume | kill | kill_job" }),
+      action: Type.String({ description: "操作: list | status | send | abort | pause | resume | kill | kill_job | save | list_saves | delete_save" }),
       jobId: Type.Optional(Type.String({ description: "Job ID" })),
       taskId: Type.Optional(Type.String({ description: "Task ID（单 agent 操作时必填）" })),
       input: Type.Optional(Type.String({ description: "消息内容（send/resume 操作时使用）" })),
@@ -847,7 +924,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ---- 需要 jobId + taskId 的操作 ----
-      if (["send", "abort", "pause", "resume", "kill"].includes(action)) {
+      if (["send", "abort", "pause", "resume", "kill", "save"].includes(action)) {
         if (!jobId || !taskId) {
           return { content: [{ type: "text", text: `${action} 操作需要 jobId 和 taskId` }], details: { error: "missing_args" } };
         }
@@ -915,9 +992,45 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
+        case "save": {
+          const saved = saveAgentState(jobId!, taskId!);
+          ctx.ui.notify(saved ? `💾 已存档: ${taskId}` : `❌ 存档失败: ${taskId}`, saved ? "info" : "error");
+          return {
+            content: [{ type: "text", text: saved ? `💾 子 Agent 已存档: **${saved.name}**\n   saveId: \`${saved.saveId}\`\n   模型: ${saved.model}\n   消息数: ${saved.messages.length}\n   使用 \`spawn_agent({ resumeFrom: "${saved.saveId}" })\` 恢复。` : `❌ 存档失败: ${taskId}（实例可能已结束）` }],
+            details: { action: "save", jobId, taskId, ok: !!saved, saveId: saved?.saveId },
+          };
+        }
+
+        case "list_saves": {
+          const saves = listAgentSaves();
+          if (saves.length === 0) {
+            return { content: [{ type: "text", text: "没有存档的子 Agent。" }], details: { saves: [] } };
+          }
+          const lines = saves.map((s) => {
+            const age = ((Date.now() - s.savedAt) / 1000 / 60).toFixed(0);
+            return `  💾 \`${s.saveId}\` — ${s.name.slice(0, 30)} — ${s.model} — ${s.messages.length} 消息 — ${age}分钟前`;
+          });
+          return {
+            content: [{ type: "text", text: `存档列表 (${saves.length}):\n${lines.join("\n")}` }],
+            details: { saves: saves.map((s) => ({ saveId: s.saveId, name: s.name, model: s.model, messageCount: s.messages.length, savedAt: s.savedAt })) },
+          };
+        }
+
+        case "delete_save": {
+          if (!taskId) {
+            return { content: [{ type: "text", text: "delete_save 需要 taskId（作为 saveId）" }], details: { error: "missing_args" } };
+          }
+          const ok = deleteAgentSave(taskId);
+          ctx.ui.notify(ok ? `🗑 已删除存档: ${taskId}` : `❌ 删除失败: ${taskId}`, ok ? "info" : "error");
+          return {
+            content: [{ type: "text", text: ok ? `🗑 已删除存档: \`${taskId}\`` : `❌ 存档不存在: \`${taskId}\`` }],
+            details: { action: "delete_save", saveId: taskId, ok },
+          };
+        }
+
         default:
           return {
-            content: [{ type: "text", text: `未知操作: ${action}\n支持: list | status | send | abort | pause | resume | kill | kill_job` }],
+            content: [{ type: "text", text: `未知操作: ${action}\n支持: list | status | send | abort | pause | resume | kill | kill_job | save | list_saves | delete_save` }],
             details: { error: "unknown_action" },
           };
       }
