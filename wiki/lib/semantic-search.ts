@@ -1,12 +1,13 @@
-// semantic-search.ts — 语义搜索 & 混合搜索 (v5.0)
+// semantic-search.ts — 语义搜索 & 混合搜索 (v5.1)
 //
 // semanticSearch:   query → embed → 余弦相似度 → 同文件多块聚合加分
-// hybridSearch:     关键词 + 语义并行 → 加权合并 → 按文件排序
+// hybridSearch:     关键词 + 语义并行 → RRF 融合排序 (k=60, Top-50)
 //
 // 策略:
 //   高阈值 0.50 — 只有置信度 ≥50% 的语义匹配才视为有效
 //   兜底 — 高阈值结果不足 3 条时，追加 ≤3 条低分结果（标记"弱匹配"）
 //   同文件合并 — 一个文件多个块命中时，取最高块相似度 + (块数-1)*0.05 加分（上限 0.25）
+//   RRF 融合 — 替代简单线性加权，对异构分数尺度不敏感
 
 import { getEmbeddings, getSemanticEnabled, getChunkInfo } from "./store.js";
 import { getIndex } from "./store.js";
@@ -27,9 +28,10 @@ const FALLBACK_COUNT = 3;
 const MULTI_CHUNK_BONUS = 0.05;
 const MAX_MULTI_CHUNK_BONUS = 0.25;
 
-/** 混合搜索权重 */
-const KEYWORD_WEIGHT = 0.4;
-const SEMANTIC_WEIGHT = 0.6;
+/** RRF 融合常数 (标准值 60) */
+const RRF_K = 60;
+/** 各列表参与 RRF 融合的 Top-N 上限 */
+const RRF_TOPN = 50;
 
 // ---- 内部类型 ----
 
@@ -78,9 +80,10 @@ export async function semanticSearch(query: string): Promise<SearchHit[]> {
   // 1. 计算所有块的相似度
   const allChunks: ChunkMatch[] = [];
   for (const [key, vec] of Object.entries(embeddings)) {
-    const chunkMatch = key.match(/^(.*)###(\d+)$/);
+    const chunkMatch = key.match(/^(.*)###(\d+|llm)$/);
     const relPath = chunkMatch ? chunkMatch[1] : key;
-    const chunkIdx = chunkMatch ? parseInt(chunkMatch[2], 10) : undefined;
+    const rawIdx = chunkMatch ? parseInt(chunkMatch[2], 10) : NaN;
+    const chunkIdx = isNaN(rawIdx) ? undefined : rawIdx;
 
     if (!idx[relPath]) continue;
     const similarity = cosineSimilarity(queryVec, vec);
@@ -181,55 +184,77 @@ function makeFileHit(
   };
 }
 
-/** 混合搜索：关键词 + 语义并行 → 加权合并 */
+/** 混合搜索：关键词 + 语义并行 → RRF 融合排序
+ *
+ * RRF (Reciprocal Rank Fusion):
+ *   RRF(d) = Σ 1/(k + rank_i(d))
+ *   各列表取 Top-N 参与融合，未出现在某列表中的项 rank = RRF_K*2
+ */
 export async function hybridSearch(query: string): Promise<SearchHit[]> {
   const keywordHits = keywordSearch(query);
-
-  // 归一化关键词分数到 0-100
-  const maxKwScore = keywordHits.length > 0
-    ? Math.max(...keywordHits.map(h => h.score), 1)
-    : 1;
-
   const semanticHits = await semanticSearch(query);
 
-  // 按 relPath 去重合并
-  const merged = new Map<string, SearchHit>();
+  // 按分数排序并取 Top-N
+  const kwSorted = [...keywordHits]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, RRF_TOPN);
+  const semSorted = [...semanticHits]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, RRF_TOPN);
 
-  // 先加入关键词结果
-  for (const h of keywordHits) {
-    const normalizedScore = (h.score / maxKwScore) * 100;
-    merged.set(h.relPath, {
-      ...h,
-      score: Math.round(normalizedScore * KEYWORD_WEIGHT),
+  // 构建 rank 映射 (1-based)
+  const kwRank = new Map<string, number>();
+  kwSorted.forEach((h, i) => kwRank.set(h.relPath, i + 1));
+
+  const semRank = new Map<string, number>();
+  semSorted.forEach((h, i) => semRank.set(h.relPath, i + 1));
+
+  // 收集所有唯一文件
+  const allPaths = new Set([
+    ...kwSorted.map(h => h.relPath),
+    ...semSorted.map(h => h.relPath),
+  ]);
+
+  // 构建查找表
+  const kwMap = new Map(kwSorted.map(h => [h.relPath, h]));
+  const semMap = new Map(semSorted.map(h => [h.relPath, h]));
+
+  // RRF 缺省排名（未出现在某列表中的项用此值）
+  const missingRank = RRF_K * 2;
+
+  const merged: SearchHit[] = [];
+
+  for (const relPath of allPaths) {
+    const kw = kwMap.get(relPath);
+    const sem = semMap.get(relPath);
+
+    const kwR = kwRank.get(relPath) ?? missingRank;
+    const semR = semRank.get(relPath) ?? missingRank;
+
+    const rrf = 1 / (RRF_K + kwR) + 1 / (RRF_K + semR);
+
+    // 取最佳信息源构建结果
+    const base = sem || kw!;
+
+    let snippet = "";
+    if (sem?.chunkHeading) {
+      snippet = `▸ ${sem.chunkHeading}`;
+    } else if (kw?.snippet) {
+      snippet = kw.snippet.replace(/\n/g, " | ");
+    }
+
+    merged.push({
+      relPath: base.relPath,
+      sourceDir: base.sourceDir,
+      title: base.title,
+      tags: base.tags,
+      snippet,
+      score: Math.round(rrf * 10000),
+      semanticScore: sem?.semanticScore,
+      chunkIndex: sem?.chunkIndex,
+      chunkHeading: sem?.chunkHeading,
     });
   }
 
-  // 合并语义结果
-  for (const h of semanticHits) {
-    const existing = merged.get(h.relPath);
-    if (existing) {
-      // 已存在：加权融合
-      existing.score = Math.round(
-        existing.score + (h.score * SEMANTIC_WEIGHT),
-      );
-      existing.semanticScore = h.semanticScore;
-      if (h.snippet.startsWith("⚠️")) {
-        existing.snippet = existing.snippet.includes("⚠️")
-          ? existing.snippet
-          : `${existing.snippet} | ${h.snippet}`;
-      } else {
-        existing.snippet = existing.snippet.includes("⚠️")
-          ? h.snippet
-          : `${existing.snippet} | ${h.snippet}`;
-      }
-    } else {
-      // 纯语义命中：只取语义权重
-      merged.set(h.relPath, {
-        ...h,
-        score: Math.round(h.score * SEMANTIC_WEIGHT),
-      });
-    }
-  }
-
-  return [...merged.values()].sort((a, b) => b.score - a.score);
+  return merged.sort((a, b) => b.score - a.score);
 }

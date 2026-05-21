@@ -6,22 +6,23 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ToolRenderResultOptions, ToolRenderContext } from "@earendil-works/pi-coding-agent";
 import { Container, Text, Spacer } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { keywordSearch } from "../lib/search.js";
 import { semanticSearch, hybridSearch } from "../lib/semantic-search.js";
 import { getSemanticEnabled } from "../lib/store.js";
 import type { SearchHit, SearchMode } from "../lib/types.js";
 
-const AI_LIMIT = 10;       // AI 内部每页最多条目
+const AI_LIMIT = 5;        // AI 内部每页最多条目
+const TUI_LIMIT = 5;       // TUI 收缩模式最多显示条目
 const SUMMARY_LEN = 200;   // 文档摘要长度
 
-/** 提取文件前 N 字符作为摘要 */
-function extractSummary(sourceDir: string, relPath: string): string {
-  const fullPath = resolve(sourceDir, relPath);
-  if (!existsSync(fullPath)) return "";
+import { getContent } from "../lib/content-cache.js";
+
+/** P0-3: 从内存缓存提取摘要，不再读磁盘 */
+function extractSummary(_sourceDir: string, relPath: string): string {
+  const raw = getContent(relPath);
+  if (!raw) return "";
   try {
-    const raw = readFileSync(fullPath, "utf-8");
     // 去掉 frontmatter
     const fmEnd = raw.match(/^---\n[\s\S]*?\n---/);
     const body = fmEnd ? raw.slice(fmEnd[0].length).trim() : raw;
@@ -51,6 +52,17 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
     promptSnippet: "Search wiki knowledge base",
     promptGuidelines: [
       // ── 搜索策略：拆解 · 翻译 · 联想 · 组合 ──
+      // ── 工作流前置 ──
+      "## Wiki Setup (required before searching)",
+      "Minimal: wiki_load_source → kb_search works with keyword mode.",
+      "Recommended: wiki_load_source → wiki_semantic(action='on') → kb_search (hybrid mode, bge embedding).",
+      "Best: above + wiki_compile_file on key notes → wiki_store_file_compiled → kb_search (LLM-normalized concepts).",
+      "",
+      "Semantic search (wiki_semantic(action='on')) uses bge ONNX to embed raw text directly.",
+      "Semantic compilation (wiki_compile_file) uses LLM to normalize text BEFORE embedding — higher quality.",
+      "They are independent steps. Compilation is optional but recommended for fragmented/personal notes.",
+      "",
+      // ── 搜索策略：拆解 · 翻译 · 联想 · 组合 ──
       "BEFORE searching, decompose the user's query: identify abbreviations, mixed-language terms, compound concepts, and domain jargon.",
       "For the FIRST search, construct keyword variants by:",
       "  • Expanding abbreviations to full names",
@@ -61,7 +73,7 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       // ── 模式选择 ──
       "PREFER keyword mode. Semantic/hybrid adds noise on short/technical queries and does NOT understand abbreviations.",
       "Use semantic mode only for vague natural-language intent.",
-      "Each page returns up to 10 results (3 when fullContent=true). Check total count — if ≤10, no pagination needed.",
+      "Each page returns up to 5 results (3 when fullContent=true). Check total count — if ≤5, no pagination needed.",
       // ── 刹车 ──
       "STOP after at most 2 kb_search calls. After 2 searches, present results and ASK the user before reading any document.",
       "Never auto-read wiki_get_entry. Wait for the user to pick one.",
@@ -129,7 +141,7 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
         const tagStr = h.tags.length > 0 ? ` [${h.tags.join(", ")}]` : "";
         lines.push(`📄 ${h.title}${tagStr}`);
         lines.push(`   ${h.relPath}`);
-        if (isKeyword && h.snippet) {
+        if (h.snippet) {
           lines.push(`   ${h.snippet.replace(/\n/g, "\n   ")}`);
         }
         if (h.summary) {
@@ -171,37 +183,40 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
         : d.fullContent ? " 全文" : " 关键词";
       const pageLabel = d.total > AI_LIMIT ? ` · 第${d.page}页` : "";
       const isKeyword = d.mode === "keyword";
+      const MAX_LINE = 100;  // v5.4: 行长限制防崩溃
 
       container.addChild(new Text(theme.bold(`🔍 "${d.query}" — ${d.total} 结果${modeLabel}${pageLabel}`), 0, 0));
-      container.addChild(new Text(theme.fg("dim", "─".repeat(50)), 0, 0));
+      container.addChild(new Text(theme.fg("dim", "─".repeat(Math.min(50, MAX_LINE))), 0, 0));
 
       if (options.expanded) {
-        // 展开：完整展示
+        // 展开：标题 + snippet/摘要 + 路径（最不显眼）
         for (let i = 0; i < d.results.length; i++) {
           const h = d.results[i];
-          container.addChild(new Text(theme.fg("accent", `${i + 1}. ${h.title}`), 0, 0));
-          container.addChild(new Text(theme.fg("dim", `   ${h.relPath}`), 0, 0));
-          // 行上下文
-          if (h.snippet && isKeyword) {
+          container.addChild(new Text(theme.fg("accent", `${i + 1}. ${h.title}`.slice(0, MAX_LINE)), 0, 0));
+          // snippet 优先（关键词行上下文 / 语义 chunkHeading）
+          if (h.snippet) {
             for (const sl of h.snippet.split("\n").slice(0, 3)) {
-              if (sl.trim()) container.addChild(new Text(theme.fg("muted", `   ${sl.slice(0, 120)}`), 0, 0));
+              if (sl.trim()) container.addChild(new Text(theme.fg("muted", `   ${sl.slice(0, MAX_LINE)}`), 0, 0));
             }
           }
-          // 摘要
-          if (h.summary) {
-            container.addChild(new Text(theme.fg("muted", `   ${h.summary.slice(0, 120)}`), 0, 0));
+          // 摘要兜底
+          if (h.summary && !h.snippet) {
+            container.addChild(new Text(theme.fg("muted", `   ${h.summary.slice(0, MAX_LINE)}`), 0, 0));
           }
+          // 路径放在最后，最不显眼
+          container.addChild(new Text(theme.fg("dim", `   ${h.relPath}`.slice(0, MAX_LINE)), 0, 0));
         }
       } else {
-        // 收缩：单行横排 序号. 标题 — 路径
-        for (let i = 0; i < d.results.length; i++) {
-          const h = d.results[i];
-          const line = `${i + 1}. ${h.title}  —  ${h.relPath}`;
-          container.addChild(new Text(theme.fg("accent", line), 0, 0));
+        // 收缩：单行横排，最多 TUI_LIMIT 条
+        const visible = d.results.slice(0, TUI_LIMIT);
+        for (let i = 0; i < visible.length; i++) {
+          const h = visible[i];
+          const raw = `${i + 1}. ${h.title}  —  ${h.relPath}`;
+          container.addChild(new Text(theme.fg("accent", raw.slice(0, MAX_LINE)), 0, 0));
         }
         container.addChild(new Spacer(1));
-        const hint = `💡 Ctrl+O 展开 ${d.results.length} 条详情 (共 ${d.total} 条)`;
-        container.addChild(new Text(theme.fg("dim", hint), 0, 0));
+        const more = d.results.length > TUI_LIMIT ? ` (当前页 ${d.results.length} 条，Ctrl+O 展开)` : "";
+        container.addChild(new Text(theme.fg("dim", `💡 Ctrl+O 展开详情 (共 ${d.total} 条)${more}`), 0, 0));
       }
 
       return container;

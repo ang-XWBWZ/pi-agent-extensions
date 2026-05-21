@@ -135,7 +135,7 @@ function renderWidget(ctx: any): void {
           truncateToWidth(theme.bold(`🔍 Wiki${ml}搜索: "${r.query}" — ${r.hits.length} 结果`), w, "…"),
           theme.fg("dim", truncateToWidth("─".repeat(60), w, "")),
         ];
-        for (let i = 0; i < Math.min(r.hits.length, 15); i++) {
+        for (let i = 0; i < Math.min(r.hits.length, 5); i++) {
           const h = r.hits[i];
           const scoreLabel = h.semanticScore != null
             ? `语义 ${Math.round(h.semanticScore * 100)}%`
@@ -144,7 +144,7 @@ function renderWidget(ctx: any): void {
           lines.push(truncateToWidth(theme.fg("dim", `   ${h.relPath}  (${scoreLabel})`), w, "…"));
           if (h.snippet) lines.push(truncateToWidth(theme.fg("muted", `   ${h.snippet.slice(0, 100)}`), w, "…"));
         }
-        if (r.hits.length > 15) lines.push(theme.fg("dim", truncateToWidth(`   ...还有 ${r.hits.length - 15} 个结果`, w, "…")));
+        if (r.hits.length > 5) lines.push(theme.fg("dim", truncateToWidth(`   ...还有 ${r.hits.length - 5} 个结果`, w, "…")));
         return lines;
       },
       invalidate: () => {},

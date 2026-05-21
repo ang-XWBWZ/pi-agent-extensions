@@ -1,31 +1,30 @@
-// embedder.ts — transformers.js 语义向量封装 (v4.2)
+// embedder.ts — transformers.js 语义向量封装 (v5.0)
 //
 // 设计原则:
-//   1. 懒加载 — 首次调用 initialize() 时才 import 和下载模型
-//   2. 优雅降级 — @huggingface/transformers 未安装时 isAvailable() 返回 false
-//   3. 单例 — 全局共享一个 FeatureExtractionPipeline
-//   4. 多语言 — Xenova/paraphrase-multilingual-MiniLM-L12-v2 (384-dim, 50+ 语言)
+//   1. 模型解耦 — 当前模型由 model-registry.ts 提供，无需硬编码
+//   2. 懒加载 — 首次调用 initialize() 时才 import 和下载模型
+//   3. 优雅降级 — @huggingface/transformers 未安装时 isAvailable() 返回 false
+//   4. 单例 — 全局共享一个 FeatureExtractionPipeline
 //   5. 本地优先 — wiki/models/ 本地模型优先于 HuggingFace Hub 远程下载
-//   6. 精度自适应 — 优先加载 INT8 量化版 (~118MB)，回退 FP32 (~470MB)
+//   6. 精度自适应 — 优先加载 INT8 量化版，回退 FP32
 //
 // 本地模型目录结构:
-//   wiki/models/paraphrase-multilingual-MiniLM-L12-v2/
+//   wiki/models/<model-name>/
 //   ├── config.json
 //   ├── tokenizer.json
 //   ├── tokenizer_config.json
 //   └── onnx/
-//       ├── model.onnx             ← FP32 全精度 (~470 MB) — 回退选项
-//       └── model_quantized.onnx   ← INT8 量化 (~118 MB) — 优先加载
+//       ├── model.onnx             ← FP32 全精度 — 回退选项
+//       └── model_quantized.onnx   ← INT8 量化 — 优先加载
 //
 // 下载指引:
-//   基础 URL: https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/
-//   国内镜像: https://hf-mirror.com/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/
-//   所需文件: config.json, tokenizer.json, tokenizer_config.json,
-//            onnx/model_quantized.onnx (推荐 INT8)  或  onnx/model.onnx (FP32)
+//   init-wiki-model.bat / .ps1 / .sh 自动从 HuggingFace 镜像下载
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { SEMANTIC_MODEL } from "./store.js";
+import { execSync } from "node:child_process";
+import { getCurrentModel, findModel } from "./model-registry.js";
+import type { ModelInfo } from "./model-registry.js";
 
 // ---- 模型信息 ----
 
@@ -41,7 +40,7 @@ export interface LocalModelInfo {
 // ---- 状态 ----
 
 let pipeline: any = null;
-let currentModel: string = SEMANTIC_MODEL;
+let currentModel: string = getCurrentModel().hfRepo;
 let initPromise: Promise<boolean> | null = null;
 let initError: string | null = null;
 let loadedVariant: string = "unknown";
@@ -117,10 +116,17 @@ function resolveModelPath(): string {
 // ---- 公开 API ----
 
 /** 初始化 embedder（幂等，已初始化时立即返回 true） */
-export async function initialize(model?: string): Promise<boolean> {
+export async function initialize(): Promise<boolean> {
+  const wanted = getCurrentModel().hfRepo;
+  // 模型已变化 → 强制重载
+  if (pipeline && currentModel !== wanted) {
+    pipeline = null;
+    initPromise = null;
+    initError = null;
+    currentModel = wanted;
+  }
   if (pipeline) return true;
   if (initPromise) return initPromise;
-  if (model) currentModel = model;
   initPromise = doInit();
   return initPromise;
 }
@@ -128,6 +134,37 @@ export async function initialize(model?: string): Promise<boolean> {
 /** 检查 embedder 是否就绪（不触发初始化） */
 export function isAvailable(): boolean {
   return pipeline !== null;
+}
+
+/** 下载模型文件到本地（使用 curl + hf-mirror.com） */
+export function downloadModel(modelId?: string): { ok: boolean; msg: string } {
+  const m = modelId ? findModel(modelId) : getCurrentModel();
+  if (!m) return { ok: false, msg: `未知模型: ${modelId}` };
+  const dirName = m.hfRepo.split("/").pop()!;
+  const targetDir = resolve(wikiHome(), "models", dirName);
+  const onnxDir = resolve(targetDir, "onnx");
+
+  // 已存在则跳过
+  if (existsSync(resolve(targetDir, "config.json")) && existsSync(resolve(onnxDir, "model_quantized.onnx"))) {
+    return { ok: true, msg: `模型已存在: ${dirName}` };
+  }
+
+  try {
+    mkdirSync(onnxDir, { recursive: true });
+    const baseUrl = `https://hf-mirror.com/${m.hfRepo}/resolve/main`;
+    const files = [
+      ["config.json", resolve(targetDir, "config.json")],
+      ["tokenizer_config.json", resolve(targetDir, "tokenizer_config.json")],
+      ["tokenizer.json", resolve(targetDir, "tokenizer.json")],
+      ["onnx/model_quantized.onnx", resolve(onnxDir, "model_quantized.onnx")],
+    ];
+    for (const [rel, out] of files) {
+      execSync(`curl -L -f -s -o "${out}" "${baseUrl}/${rel}"`, { timeout: 600_000 });
+    }
+    return { ok: true, msg: `已下载: ${dirName} (${fmtSize(m.int8Size)})` };
+  } catch (e: any) {
+    return { ok: false, msg: `下载失败: ${e?.message || String(e)}` };
+  }
 }
 
 /** 检查 @huggingface/transformers 是否已安装（尝试 import 但不加载模型） */
@@ -145,8 +182,13 @@ export function getInitError(): string | null {
   return initError;
 }
 
-/** 获取当前模型名 */
+/** 获取当前模型名（registry 显示名） */
 export function getModelName(): string {
+  return getCurrentModel().name;
+}
+
+/** 获取当前模型 hfRepo */
+export function getModelRepo(): string {
   return currentModel;
 }
 

@@ -1,9 +1,8 @@
 // search.ts — 关键词搜索 (v5.0)
 // 标题/路径/标签/内容匹配 → 行级上下文展示
 
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { getIndex } from "./store.js";
+import { getContent } from "./content-cache.js";
 import type { FileEntry, SearchHit } from "./types.js";
 
 /** 提取匹配行的上下文（前一行、匹配行、后一行） */
@@ -55,29 +54,26 @@ export function keywordSearch(query: string): SearchHit[] {
       score += 3;
     }
 
-    // 内容匹配（读源文件，取行上下文）
-    const fullPath = resolve(entry.sourceDir, relPath);
-    if (existsSync(fullPath)) {
-      try {
-        const content = readFileSync(fullPath, "utf-8");
-        const lower = content.toLowerCase();
+    // 内容匹配（P0-3: 从内存缓存读取，不再读磁盘）
+    const content = getContent(relPath);
+    if (content) {
+      const lower = content.toLowerCase();
 
-        let count = 0, p = lower.indexOf(q);
-        while (p >= 0 && count < 5) {
-          count++;
-          if (count === 1) score += 1;
+      let count = 0, p = lower.indexOf(q);
+      while (p >= 0 && count < 5) {
+        count++;
+        if (count === 1) score += 1;
 
-          // 取该匹配位置的行上下文
-          const ctx = lineContext(content, query);
-          if (ctx && !parts.some(pp => pp.includes(ctx.slice(0, 30)))) {
-            parts.push(ctx);
-          }
-          p = lower.indexOf(q, p + 1);
+        // 取该匹配位置的行上下文
+        const ctx = lineContext(content, query);
+        if (ctx && !parts.some(pp => pp.includes(ctx.slice(0, 30)))) {
+          parts.push(ctx);
         }
+        p = lower.indexOf(q, p + 1);
+      }
 
-        // 多次出现加分
-        score += Math.min(count - 1, 9);
-      } catch { /* skip */ }
+      // 多次出现加分
+      score += Math.min(count - 1, 9);
     }
 
     if (score > 0) {
