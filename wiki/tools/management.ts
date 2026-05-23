@@ -1,6 +1,7 @@
-// management.ts — Wiki 管理工具注册入口 (v5.4 barrel)
+// management.ts — Wiki 管理工具注册入口 (v5.5 barrel)
 //
-// 聚合所有子模块。12 个工具分布在 4 个文件中，按职责分离。
+// 聚合所有子模块。13 个工具分布在 4 个文件中，按职责分离。
+// 命名: wiki_read_* (🟢只读) / wiki_edit_* (🟡改内容) / wiki_DANGER_* (🔴危险)
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerSourceTools } from "./management-sources.js";

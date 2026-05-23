@@ -151,3 +151,51 @@ function renderWidget(ctx: any): void {
     }));
   } catch { /* TUI 不可用时忽略 */ }
 }
+
+// ============================================================
+// /wiki-edit — 搜索 + 读取 + 注入编辑上下文
+// ============================================================
+
+/** /wiki-edit <query> — 搜索匹配条目，读取全文，注入 AI 编辑上下文 */
+export function cmdEdit(raw: string, pi: any, ctx: any): string {
+  const q = raw.trim();
+  if (!q) return "💬 /wiki-edit — 修改 wiki 条目\n用法: /wiki-edit <搜索词或文件路径>";
+
+  const hits = keywordSearch(q);
+  if (!hits.length) return `🔍 未匹配 "${q}"`;
+
+  if (hits.length > 1) {
+    const list = hits.slice(0, 5).map((h, i) =>
+      `  ${i + 1}. ${h.title} — ${h.relPath}`
+    ).join("\n");
+    return `🔍 "${q}" — ${hits.length} 结果，请用更精确的搜索词定位:\n${list}`;
+  }
+
+  const h = hits[0];
+  const fullPath = resolve(h.sourceDir, h.relPath);
+  if (!existsSync(fullPath)) return `❌ 文件不存在: ${h.relPath}`;
+
+  let content: string;
+  try { content = readFileSync(fullPath, "utf-8"); } catch {
+    return `❌ 无法读取: ${h.relPath}`;
+  }
+
+  const msg = [
+    `📝 编辑 wiki 条目: **${h.title}**`,
+    `   路径: \`${h.relPath}\``,
+    `   数据源: \`${h.sourceDir}\``,
+    "",
+    "--- 当前内容 ---",
+    content,
+    "--- 结束 ---",
+    "",
+    "请修改以上内容，然后用 **wiki_edit_modify** 保存：",
+    `  wiki_edit_modify(source="${h.sourceDir}", path="${h.relPath}", content=<修改后的全文>)`,
+    "",
+    "⚠️ content 必须是完整的新全文（含 frontmatter），不是 diff。",
+    "   先 wiki_get_entry 确认最新内容，再修改，再 wiki_edit_modify 保存。",
+  ].join("\n");
+
+  pi.sendUserMessage(msg);
+  return `📝 已加载: ${h.title} (${h.relPath}) — 请 AI 修改后用 wiki_edit_modify 保存`;
+}

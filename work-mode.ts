@@ -69,15 +69,20 @@ function isProtectedPath(target: string): boolean {
 // ============================================================
 
 function wildcardMatch(pattern: string, target: string): boolean {
+  // ** → .* (跨目录匹配) · * → [^/]* (单级目录内匹配) · ? → .
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, ".*");
+    .replace(/\*\*/g, "\x00")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\x00/g, ".*")
+    .replace(/\?/g, ".");
   return new RegExp(`^${escaped}$`, "i").test(target.trim());
 }
 
 function isUnder(base: string, target: string): boolean {
-  const b = base.endsWith("\\") || base.endsWith("/") ? base : base + "\\";
-  const t = isAbsolute(target) ? target : resolve(base, target);
+  // 归一化斜杠为 / 避免正反斜杠混用误判
+  const b = (base.endsWith("/") ? base : base + "/").replace(/\\/g, "/");
+  const t = (isAbsolute(target) ? target : resolve(base, target)).replace(/\\/g, "/");
   return t.toLowerCase().startsWith(b.toLowerCase());
 }
 
@@ -486,7 +491,9 @@ const SMART_PLAN_PROMPT = `
 
 ## Smart Mode: decide for yourself
 
-You are in **WORK mode by default**. All tools including write/edit are available.
+You are in **PLAN mode by default** (read-only, write/edit/terminal blocked).
+Output ## Execution Plan for complex tasks → auto-switches to WORK mode.
+Use /work to manually switch to WORK mode.
 Protected paths (.git, .pi, .agents, .claude, node_modules) are still guarded.
 
 ### Before you act, assess the user request:
@@ -521,7 +528,8 @@ You should also self-assess security risks in your plan:
 
 ### Safety nets (always active regardless of mode):
 - Protected paths are blocked for write/edit
-- Destructive bash commands require confirmation
+- In PLAN mode: write, edit, and all terminal commands (bash/cmd/powershell) are **blocked** entirely
+- In WORK mode: destructive terminal commands require confirmation
 - Working directory boundaries are enforced
 
 ### Key rules:
@@ -538,7 +546,7 @@ export default function (pi: ExtensionAPI) {
   // ---- mode state ----
   let mode: WorkMode =
     ((globalThis as Record<string, unknown>).__pi_default_mode as WorkMode) ||
-    "work";
+    "plan";
   const isSubAgent = !!(
     (globalThis as Record<string, unknown>).__pi_is_sub_agent
   );
@@ -617,7 +625,7 @@ export default function (pi: ExtensionAPI) {
 
   function showModeNotification(ctx: ExtensionContext) {
     const labels: Record<string, string> = {
-      plan: "PLAN mode - write/edit blocked",
+      plan: "PLAN mode - read-only, all mutations blocked",
       work: "WORK mode - cwd + protected path guard",
       yolo: "YOLO mode - unrestricted, user only",
     };
@@ -671,7 +679,7 @@ export default function (pi: ExtensionAPI) {
   // ============================================================
 
   pi.registerCommand("plan", {
-    description: "PLAN mode - read-only, write/edit blocked",
+    description: "PLAN mode - read-only, write/edit & terminal blocked",
     handler: (_a, ctx) => {
       setMode("plan", ctx);
       needsPlan = true;
@@ -798,10 +806,10 @@ export default function (pi: ExtensionAPI) {
 
     // PLAN mode: detect plan produced (only first time, don't re-parse if already have steps)
     if (appState === "planning" && mode === "plan" && planSteps.length === 0) {
-      planProduced = true;
-      planFullText = fullText;
-      const parsed = parsePlanSteps(planFullText);
+      const parsed = parsePlanSteps(fullText);
       if (parsed.length > 0) {
+        planProduced = true;
+        planFullText = fullText;
         planSteps = parsed;
       }
       return;
@@ -840,7 +848,7 @@ export default function (pi: ExtensionAPI) {
         );
         if (choice === "是") {
           acceptPlan(ctx);
-          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板");
+          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板", { deliverAs: "steer" });
         }
         else if (choice === "建议") {
           const s = await requestInput("请输入修改建议", "");
@@ -856,7 +864,7 @@ export default function (pi: ExtensionAPI) {
         );
         if (choice === "是，开始执行") {
           acceptPlan(ctx);
-          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板");
+          pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板", { deliverAs: "steer" });
         } else if (choice === "建议，修改计划") {
           const s = await ctx.ui.editor("请输入修改建议（Esc 取消）", "");
           if (s?.trim()) {
@@ -905,6 +913,7 @@ export default function (pi: ExtensionAPI) {
       textContent.includes("protected path") ||
       textContent.includes("受保护路径") ||
       textContent.includes("blocked") ||
+      textContent.includes("用户拒绝") ||
       textContent.includes("被阻止") ||
       textContent.includes("Permission denied") ||
       textContent.includes("Access denied") ||
@@ -1145,15 +1154,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (isToolCallEventType("bash", event) || isToolCallEventType("cmd", event)) {
-        const cmdStr = event.input.command?.trim() ?? "";
-        const toolName = event.toolName;
-        const ok = await confirmAndRemember(
-          ctx, cmdAllowlist, "bash", "PLAN", cmdStr, isSubAgent,
-          (e) => { event.input.command = e; return true; },
-        );
-        if (!ok) return { block: true, reason: toolName + " blocked in PLAN mode" };
-        if (ok === "dialog") confirmedCalls.set(event.toolCallId, "PLAN " + toolName + " ok");
+      if (isToolCallEventType("bash", event) || isToolCallEventType("cmd", event) || isToolCallEventType("powershell", event)) {
+        return {
+          block: true,
+          reason: "终端命令在 PLAN 模式下被阻止。请先完成计划并等待系统切换到 WORK 模式，或 /work 手动切换到 WORK 模式。",
+        };
       }
       return;
     }
@@ -1195,22 +1200,22 @@ export default function (pi: ExtensionAPI) {
           if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK edit ok");
         }
       }
-      if (isToolCallEventType("bash", event) || isToolCallEventType("cmd", event)) {
+      if (isToolCallEventType("bash", event) || isToolCallEventType("cmd", event) || isToolCallEventType("powershell", event)) {
         const cmdStr = event.input.command?.trim() ?? "";
         const toolName = event.toolName;
 
-        const destructiveCommands = /(rm|del|rd|rmdir|move|ren|copy|xcopy|robocopy|attrib|icacls|takeown|format|diskpart)/i;
+        const destructiveCommands = /\b(rm|del|rd|rmdir|move|ren|copy|xcopy|robocopy|attrib|icacls|takeown|format|diskpart)\b/i;
         if (destructiveCommands.test(cmdStr) && cmdStr.includes("..")) {
           const ok = await confirmAndRemember(ctx, cmdAllowlist, "bash", "WORK (destructive)", cmdStr, isSubAgent,
             (e) => { event.input.command = e; return true; });
-          if (!ok) return { block: true, reason: toolName + " blocked: destructive command" };
+          if (!ok) return { block: true, reason: toolName + " 用户拒绝: 破坏性命令" };
           if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK " + toolName + " ok");
           return;
         }
 
         const ok = await confirmAndRemember(ctx, cmdAllowlist, "bash", "WORK", cmdStr, isSubAgent,
           (e) => { event.input.command = e; return true; });
-        if (!ok) return { block: true, reason: toolName + " blocked" };
+        if (!ok) return { block: true, reason: toolName + " 用户拒绝" };
         if (ok === "dialog") confirmedCalls.set(event.toolCallId, "WORK " + toolName + " ok");
       }
       return;

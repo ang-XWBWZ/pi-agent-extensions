@@ -1,6 +1,6 @@
-// management-entries.ts — 条目 CRUD 工具 (v5.4)
+// management-entries.ts — 条目 CRUD 工具 (v5.5)
 //
-// wiki_create_entry / wiki_get_entry / wiki_rename / wiki_move
+// wiki_edit_create / wiki_read_entry / wiki_edit_rename / wiki_edit_move / wiki_edit_modify
 
 import type { ExtensionAPI, ToolRenderResultOptions, ToolRenderContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -20,14 +20,14 @@ import { resolveSource, formatSourcesList, frontmatterTemplate } from "./_helper
 
 export function registerEntryTools(pi: ExtensionAPI): void {
   pi.registerTool({
-    name: "wiki_create_entry",
+    name: "wiki_edit_create",
     label: "Wiki Create Entry",
     description:
       "在指定数据源下创建新的 .md 条目（自动生成 frontmatter 模板）。如果路径不以 .md 结尾，自动追加。",
-    promptSnippet: "Create a new .md entry in a wiki data source",
+    promptSnippet: "Create wiki entry (source, path, title?, tags?, content?)",
     promptGuidelines: [
       "Use to save new knowledge discovered during conversation.",
-      "source: the data source path (use wiki_list_sources to discover).",
+      "source: the data source path (use wiki_read_sources to discover).",
       "path: relative path within the source, e.g. 'notes/debug/cors-fix.md'.",
       "title: optional, defaults to filename. tags: optional array of strings.",
       "content: optional initial body content.",
@@ -78,20 +78,26 @@ export function registerEntryTools(pi: ExtensionAPI): void {
         details: { source: src, path: p, title, tags },
       };
     },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.path?.slice(0, 50) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_create(${p ? `“${p}”` : ""})`)));
+      return text;
+    },
   });
 
   pi.registerTool({
-    name: "wiki_get_entry",
-    label: "Wiki Get Entry",
+    name: "wiki_read_entry",
+    label: "Wiki Read Entry",
     description:
       "读取 wiki 中某一条目的完整内容。支持 .md 文件和其他资源文件。",
-    promptSnippet: "Get full content of a wiki entry",
+    promptSnippet: "Read wiki entry (source, path)",
     promptGuidelines: [
-      "Use to read the full content of a specific entry found via kb_search.",
+      "Use to read the full content of a specific entry found via wiki_read_search.",
       "source: the data source path. path: relative path within the source.",
       "Supports both .md and resource files (images, PDFs, etc.).",
       "FORBIDDEN: path MUST be a file, NOT a directory. Directories will fail.",
-      "FORBIDDEN: Do NOT call this without user picking a specific entry first. Never auto-read after kb_search.",
+      "FORBIDDEN: Do NOT call this without user picking a specific entry first. Never auto-read after wiki_read_search.",
     ],
     parameters: Type.Object({
       source: Type.String({ description: "数据源路径" }),
@@ -112,7 +118,7 @@ export function registerEntryTools(pi: ExtensionAPI): void {
 
       const st = statSync(fullPath);
       if (st.isDirectory()) {
-        return { content: [{ type: "text", text: `❌ ${p} 是目录，不是文件。使用 wiki_list_sources 查看。` }] };
+        return { content: [{ type: "text", text: `❌ ${p} 是目录，不是文件。使用 wiki_read_sources 查看。` }] };
       }
 
       try {
@@ -197,14 +203,20 @@ export function registerEntryTools(pi: ExtensionAPI): void {
 
       return container;
     },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.path?.slice(0, 50) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_read(“${p}”)`)));
+      return text;
+    },
   });
 
   pi.registerTool({
-    name: "wiki_rename",
+    name: "wiki_edit_rename",
     label: "Wiki Rename",
     description:
       "重命名 wiki 中的文件或目录，自动同步索引。支持 .md 条目和资源文件。",
-    promptSnippet: "Rename a wiki file or directory",
+    promptSnippet: "Rename wiki entry (source, oldPath, newPath)",
     promptGuidelines: [
       "Renames a file or directory within a wiki source.",
       "Automatically updates all index entries for affected files.",
@@ -257,14 +269,21 @@ export function registerEntryTools(pi: ExtensionAPI): void {
         details: { source: src, oldPath: oldP, newPath: newP },
       };
     },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const o = args.oldPath?.slice(0, 30) ?? "";
+      const n = args.newPath?.slice(0, 30) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_rename(“${o}” → “${n}”)`)));
+      return text;
+    },
   });
 
   pi.registerTool({
-    name: "wiki_move",
+    name: "wiki_edit_move",
     label: "Wiki Move",
     description:
       "移动 wiki 中的文件或目录到其他位置，自动同步索引。支持 .md 条目和资源文件。",
-    promptSnippet: "Move a wiki file or directory",
+    promptSnippet: "Move wiki entry (source, from, to)",
     promptGuidelines: [
       "Moves a file or directory within or between wiki sources.",
       "Automatically updates all index entries for affected files.",
@@ -321,6 +340,77 @@ export function registerEntryTools(pi: ExtensionAPI): void {
         content: [{ type: "text", text: `✅ 已移动: ${fromP} → ${finalRelPath}` }],
         details: { source: src, from: fromP, to: finalRelPath },
       };
+    },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const f = args.from?.slice(0, 30) ?? "";
+      const t = args.to?.slice(0, 30) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_move(“${f}” → “${t}”)`)));
+      return text;
+    },
+  });
+
+  // ---- wiki_edit_modify (v5.5) ----
+
+  pi.registerTool({
+    name: "wiki_edit_modify",
+    label: "Wiki Edit Modify",
+    description:
+      "修改 wiki 中已有条目的完整内容，自动刷新搜索索引和语义向量。",
+    promptSnippet: "Modify wiki entry (source, path, content)",
+    promptGuidelines: [
+      "Use to modify an existing wiki entry after reading it with wiki_read_entry.",
+      "source: the data source path. path: relative path within the source.",
+      "content: the NEW full content (including frontmatter). Must be the complete file.",
+      "Automatically refreshes search index and rebuilds semantic vectors.",
+      "FORBIDDEN: Do NOT call without first reading the current content via wiki_read_entry.",
+      "FORBIDDEN: Do NOT use to create new entries — use wiki_edit_create for that.",
+      "FORBIDDEN: Do NOT modify wiki entries without user confirmation.",
+    ],
+    parameters: Type.Object({
+      source: Type.String({ description: "数据源路径" }),
+      path: Type.String({ description: "条目相对路径（如 notes/debug/cors.md）" }),
+      content: Type.String({ description: "新全文内容（包含 frontmatter）" }),
+    }),
+    async execute(_tcid, params, signal) {
+      if (signal?.aborted) throw new Error("aborted");
+      const src = resolveSource(params.source);
+      if (!src)
+        return { content: [{ type: "text", text: `❌ 未找到数据源: ${params.source}\n${formatSourcesList()}` }] };
+
+      let p = params.path.replace(/\\/g, "/");
+      if (!p.endsWith(".md")) p += ".md";
+      const fullPath = resolve(src, p);
+
+      if (!fullPath.startsWith(src)) {
+        return { content: [{ type: "text", text: `❌ 路径必须在数据源内: ${src}` }] };
+      }
+
+      if (!existsSync(fullPath)) {
+        return { content: [{ type: "text", text: `❌ 条目不存在: ${p}\n💡 使用 wiki_edit_create 创建新条目。` }] };
+      }
+
+      // 写入
+      writeFileSync(fullPath, params.content, "utf-8");
+
+      // 刷新索引
+      const entry = parseFileEntry(src, fullPath);
+      if (entry) mergeIndex([entry]);
+
+      // 重建语义向量
+      const title = entry?.title || basename(p, ".md");
+      embedSingleFile(src, p, title).catch(() => { /* 非关键路径 */ });
+
+      return {
+        content: [{ type: "text", text: `✅ 已保存: ${p}\n📄 ${title}\n🔁 索引和向量已刷新` }],
+        details: { source: src, path: p, title },
+      };
+    },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.path?.slice(0, 50) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_modify(“${p}”)`)));
+      return text;
     },
   });
 }

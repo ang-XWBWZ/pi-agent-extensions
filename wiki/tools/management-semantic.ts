@@ -25,11 +25,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
 export function registerSemanticTools(pi: ExtensionAPI): void {
   pi.registerTool({
-    name: "wiki_semantic",
+    name: "wiki_DANGER_semantic",
     label: "Wiki Semantic",
     description:
       "管理语义搜索：查看状态、启用/关闭、切换模型。不传 action 时显示状态和模型列表。",
-    promptSnippet: "Manage wiki semantic search (status/enable/disable/switch model)",
+    promptSnippet: "Manage wiki semantic (action?, autoInstall?, id?)",
     promptGuidelines: [
       "IMPORTANT: Semantic search ≠ Semantic compilation (wiki_compile_file).",
       "  • Semantic search = bge ONNX embeds raw text → cosine similarity. Basic but immediate.",
@@ -191,6 +191,13 @@ export function registerSemanticTools(pi: ExtensionAPI): void {
       }
 
       return { content: [{ type: "text", text: `❌ 未知 action: ${params.action}\n可用: on | off | model（不传=状态）` }] };
+    },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const a = args.action ?? "status";
+      const m = args.id ? ` ${args.id}` : "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_semantic(${a}${m})`)));
+      return text;
     },
   });
 }

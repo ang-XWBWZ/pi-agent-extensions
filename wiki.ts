@@ -7,7 +7,7 @@
  * 用户命令（不触发 AI）:
  *   /wiki-search[-keyword|-semantic|-hybrid]   TUI 面板搜索
  *   /wiki-load /wiki-unload /wiki-status       数据源管理
- *   /wiki-models                               查看可用模型
+ *   /wiki-edit                                  结构化编辑条目
  *   /wiki-close                                 关闭面板
  *
  * AI 命令（触发 AI）:
@@ -18,7 +18,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cmdLoad, cmdUnload, cmdStatus } from "./wiki/commands/repo-cmds.js";
 import {
   cmdSearch, cmdSearchKeyword, cmdSearchSemantic,
-  cmdAsk, cmdClose,
+  cmdAsk, cmdClose, cmdEdit,
 } from "./wiki/commands/query-cmds.js";
 import { registerKbSearchTool } from "./wiki/tools/kb-search.js";
 import { registerManagementTools } from "./wiki/tools/management.js";
@@ -77,6 +77,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("wiki-close", {
     description: "关闭 Wiki 搜索结果面板",
     handler: (args, ctx) => ctx.ui.notify(cmdClose(args, pi, ctx), "info"),
+  });
+
+  // ---- 结构化编辑 ----
+
+  pi.registerCommand("wiki-edit", {
+    description: "搜索 wiki 条目并注入编辑上下文，修改后用 wiki_edit_modify 保存",
+    handler: (args, ctx) => ctx.ui.notify(cmdEdit(args, pi, ctx), "info"),
   });
 
   // ---- AI 问答 ----

@@ -1,6 +1,6 @@
-// kb-search.ts — kb_search 工具 (v5.0)
+// kb-search.ts — wiki_read_search 工具 (v5.0)
 // 支持分页、文档摘要、可收缩 TUI 展示
-// TUI 最多 5 条，AI 内部最多 10 条/页，返回总数
+// 每页 10 条（fullContent 时 5 条），支持 page 参数分页，返回总数
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ToolRenderResultOptions, ToolRenderContext } from "@earendil-works/pi-coding-agent";
@@ -12,8 +12,8 @@ import { semanticSearch, hybridSearch } from "../lib/semantic-search.js";
 import { getSemanticEnabled } from "../lib/store.js";
 import type { SearchHit, SearchMode } from "../lib/types.js";
 
-const AI_LIMIT = 5;        // AI 内部每页最多条目
-const TUI_LIMIT = 5;       // TUI 收缩模式最多显示条目
+const AI_LIMIT = 10;       // AI 内部每页最多条目
+const TUI_LIMIT = 10;      // TUI 收缩模式最多显示条目
 const SUMMARY_LEN = 200;   // 文档摘要长度
 
 import { getContent } from "../lib/content-cache.js";
@@ -45,21 +45,20 @@ function extractSummary(_sourceDir: string, relPath: string): string {
 
 export function registerKbSearchTool(pi: ExtensionAPI): void {
   pi.registerTool({
-    name: "kb_search",
+    name: "wiki_read_search",
     label: "Wiki Search",
     description:
-      "搜索 wiki 知识库。支持 keyword / semantic / hybrid 模式。每页最多 10 条，返回总数。",
-    promptSnippet: "Search wiki knowledge base",
+      "搜索 wiki 知识库。每页 10 条，返回总数。支持 keyword / semantic / hybrid 模式。",
+    promptSnippet: "Search wiki (query, mode?, fullContent?, page?)",
     promptGuidelines: [
-      // ── 搜索策略：拆解 · 翻译 · 联想 · 组合 ──
       // ── 工作流前置 ──
       "## Wiki Setup (required before searching)",
-      "Minimal: wiki_load_source → kb_search works with keyword mode.",
-      "Recommended: wiki_load_source → wiki_semantic(action='on') → kb_search (hybrid mode, bge embedding).",
-      "Best: above + wiki_compile_file on key notes → wiki_store_file_compiled → kb_search (LLM-normalized concepts).",
+      "Minimal: wiki_DANGER_load → wiki_read_search works with keyword mode.",
+      "Recommended: wiki_DANGER_load → wiki_DANGER_semantic(action='on') → wiki_read_search (hybrid mode, bge embedding).",
+      "Best: above + wiki_DANGER_compile on key notes → wiki_DANGER_store → wiki_read_search (LLM-normalized concepts).",
       "",
-      "Semantic search (wiki_semantic(action='on')) uses bge ONNX to embed raw text directly.",
-      "Semantic compilation (wiki_compile_file) uses LLM to normalize text BEFORE embedding — higher quality.",
+      "Semantic search (wiki_DANGER_semantic(action='on')) uses bge ONNX to embed raw text directly.",
+      "Semantic compilation (wiki_DANGER_compile) uses LLM to normalize text BEFORE embedding — higher quality.",
       "They are independent steps. Compilation is optional but recommended for fragmented/personal notes.",
       "",
       // ── 搜索策略：拆解 · 翻译 · 联想 · 组合 ──
@@ -73,13 +72,16 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       // ── 模式选择 ──
       "PREFER keyword mode. Semantic/hybrid adds noise on short/technical queries and does NOT understand abbreviations.",
       "Use semantic mode only for vague natural-language intent.",
-      "Each page returns up to 5 results (3 when fullContent=true). Check total count — if ≤5, no pagination needed.",
-      // ── 刹车 ──
-      "STOP after at most 2 kb_search calls. After 2 searches, present results and ASK the user before reading any document.",
-      "Never auto-read wiki_get_entry. Wait for the user to pick one.",
+      // ── 分页 ──
+      "Each page returns up to 10 results (5 when fullContent=true). Pass page=N to paginate.",
+      "If total > page results, more pages available. Paginate when the user asks for more, or when a thorough review is needed.",
+      "Do NOT spam pagination — show first page results, then ask the user if they want more.",
+      // ── 读内容 ──
+      "Never auto-read wiki_read_entry. Summarize what you see in search results first, then ask the user which entry to read.",
+      "If the user asks for details on specific results, read those entries.",
       // ── 无结果 ──
-      "If no results: try a different variant immediately. If still no results after 2: tell user and STOP.",
-      "If no results, suggest loading a data source via wiki_load_source.",
+      "If no results: try a different variant immediately. If still no results after 2-3 tries: tell user and STOP.",
+      "If no results, suggest loading a data source via wiki_DANGER_load.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "搜索关键词" }),
@@ -89,8 +91,11 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       fullContent: Type.Optional(Type.Boolean({ description: "是否返回完整内容（默认 false）" })),
       page: Type.Optional(Type.Number({ description: "页码（1-based，默认 1）" })),
     }),
-    async execute(_tcid, params, signal) {
+    async execute(_tcid, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("aborted");
+
+      // 搜索指示器
+      try { ctx?.ui?.setStatus("wiki-search", "🔍 搜索中..."); } catch { /* ignore */ }
 
       // 确定搜索模式
       const validModes: SearchMode[] = ["keyword", "semantic", "hybrid"];
@@ -112,6 +117,7 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       const total = hits.length;
 
       if (!total) {
+        try { ctx?.ui?.setStatus("wiki-search", undefined); } catch { /* ignore */ }
         return {
           content: [{ type: "text", text: `🔍 未匹配 "${params.query}"` }],
           details: { query: params.query, hits: 0, mode },
@@ -120,7 +126,7 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
 
       const fullContent = params.fullContent === true;
       const page = Math.max(1, params.page ?? 1);
-      const limit = fullContent ? 3 : AI_LIMIT;
+      const limit = fullContent ? 5 : AI_LIMIT;
       const start = (page - 1) * limit;
       const pageHits = hits.slice(start, start + limit);
 
@@ -150,6 +156,8 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
         lines.push("");
       }
 
+      try { ctx?.ui?.setStatus("wiki-search", undefined); } catch { /* ignore */ }
+
       return {
         content: [{
           type: "text",
@@ -164,6 +172,15 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
           fullContent,
         },
       };
+    },
+
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const q = (args.query ?? "").slice(0, 60);
+      const mode = args.mode ? `, mode=${args.mode}` : "";
+      const page = args.page && args.page > 1 ? `, page=${args.page}` : "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_search(“${q}”${mode}${page})`)));
+      return text;
     },
 
     renderResult(result, options, theme, context) {

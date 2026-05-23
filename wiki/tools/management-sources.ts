@@ -1,6 +1,6 @@
-// management-sources.ts — 数据源管理工具 (v5.4)
+// management-sources.ts — 数据源管理工具 (v5.5)
 //
-// wiki_load_source / wiki_unload_source / wiki_list_sources / wiki_refresh
+// wiki_DANGER_load / wiki_DANGER_unload / wiki_read_sources / wiki_DANGER_refresh
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -20,21 +20,21 @@ import { resolve as pathResolve } from "node:path";
 
 export function registerSourceTools(pi: ExtensionAPI): void {
   pi.registerTool({
-    name: "wiki_load_source",
+    name: "wiki_DANGER_load",
     label: "Wiki Load Source",
     description:
       "加载一个目录作为 wiki 数据源。自动递归扫描该目录下所有 .md 文件并建立搜索索引。",
-    promptSnippet: "Load a directory as wiki data source",
+    promptSnippet: "Load wiki source (path)",
     promptGuidelines: [
       "## Quick Start (minimum viable)",
-      "① wiki_load_source(path) → ② kb_search(query)  // keyword-only, substring match",
+      "① wiki_DANGER_load(path) → ② wiki_read_search(query)  // keyword-only, substring match",
       "",
       "## Best Quality (recommended)",
-      "① wiki_load_source(path) → ② wiki_semantic(action='on') → ③ kb_search(query)  // hybrid RRF, bge embedding",
+      "① wiki_DANGER_load(path) → ② wiki_DANGER_semantic(action='on') → ③ wiki_read_search(query)  // hybrid RRF, bge embedding",
       "",
       "## Ultimate Quality (for fragmented/personal notes)",
-      "① wiki_load_source(path) → ② wiki_semantic(action='on') → ③ wiki_compile_file on key files",
-      "→ ④ spawn sub-agent (Flash, work mode) to compile → ⑤ wiki_store_file_compiled → ⑥ kb_search(query)",
+      "① wiki_DANGER_load(path) → ② wiki_DANGER_semantic(action='on') → ③ wiki_DANGER_compile on key files",
+      "→ ④ spawn sub-agent (Flash, work mode) to compile → ⑤ wiki_DANGER_store → ⑥ wiki_read_search(query)",
       "",
       "Use to add new knowledge base directories to the wiki.",
       "The directory path can be absolute or relative to the project root.",
@@ -64,13 +64,19 @@ export function registerSourceTools(pi: ExtensionAPI): void {
         details: { source: abs, indexed: entries.length, embeddings: embCount },
       };
     },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.path ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_load(${p ? `“${p.slice(0, 50)}”` : ""})`)));
+      return text;
+    },
   });
 
   pi.registerTool({
-    name: "wiki_unload_source",
+    name: "wiki_DANGER_unload",
     label: "Wiki Unload Source",
     description: "卸载一个 wiki 数据源。不传路径时列出所有已加载的数据源。",
-    promptSnippet: "Unload a wiki data source or list all sources",
+    promptSnippet: "Unload wiki source (path?) — omit to list all",
     promptGuidelines: [
       "Pass no argument to list all loaded sources.",
       "Pass the source path (or its basename) to unload.",
@@ -97,15 +103,21 @@ export function registerSourceTools(pi: ExtensionAPI): void {
       }
       return { content: [{ type: "text", text: `🗑️ 已卸载: ${basename(removed)}` }] };
     },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.path ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_unload(${p ? `“${p.slice(0, 50)}”` : ""})`)));
+      return text;
+    },
   });
 
   pi.registerTool({
-    name: "wiki_list_sources",
+    name: "wiki_read_sources",
     label: "Wiki List Sources",
     description: "列出所有已加载的 wiki 数据源及其状态（文件数、最后扫描时间）。",
     promptSnippet: "List all wiki data sources",
     promptGuidelines: [
-      "Call before wiki_create_entry or wiki_get_entry to discover available sources.",
+      "Call before wiki_edit_create or wiki_read_entry to discover available sources.",
       "Returns source paths, file counts, and last scan time.",
     ],
     parameters: Type.Object({}),
@@ -113,19 +125,24 @@ export function registerSourceTools(pi: ExtensionAPI): void {
       if (signal?.aborted) throw new Error("aborted");
       return { content: [{ type: "text", text: formatSourcesList() }] };
     },
+    renderCall(_args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_sources()`)));
+      return text;
+    },
   });
 
   pi.registerTool({
-    name: "wiki_refresh",
+    name: "wiki_DANGER_refresh",
     label: "Wiki Refresh Index",
     description:
       "重新扫描数据源以更新索引。不传 source 时刷新所有数据源。用于源文件在外部变更后同步索引。",
-    promptSnippet: "Refresh wiki index for one or all sources",
+    promptSnippet: "Refresh wiki index (source?, rebuildVectors?, relPath?)",
     promptGuidelines: [
       "Call after making file changes (rename, create, delete) outside wiki tools.",
       "Call when you suspect the index is stale.",
       "Pass the source path to refresh a single source, or omit to refresh all.",
-      "FORBIDDEN: Do NOT refresh without user request or explicit need (e.g. after wiki_create_entry, index is already auto-updated).",
+      "FORBIDDEN: Do NOT refresh without user request or explicit need (e.g. after wiki_edit_create, index is already auto-updated).",
     ],
     parameters: Type.Object({
       source: Type.Optional(Type.String({ description: "要刷新的数据源路径（留空刷新全部）" })),
@@ -139,7 +156,7 @@ export function registerSourceTools(pi: ExtensionAPI): void {
         : getSources();
 
       if (!sources.length) {
-        return { content: [{ type: "text", text: "📭 无数据源可刷新。先用 wiki_load_source 加载。" }] };
+        return { content: [{ type: "text", text: "📭 无数据源可刷新。先用 wiki_DANGER_load 加载。" }] };
       }
 
       let total = 0, embTotal = 0, newFiles = 0, changedFiles = 0, deletedFiles = 0, clearedVectors = 0;
@@ -229,6 +246,13 @@ export function registerSourceTools(pi: ExtensionAPI): void {
 📝 LLM 已编译: ${mf.compiled}/${mf.total} 文件` }],
         details: { sources: sources.length, indexed: total, embeddings: embTotal, newFiles, changedFiles, deletedFiles, manifest: mf, clearedVectors },
       };
+    },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const src = args.source ? `“${args.source.slice(0, 40)}”` : "";
+      const rebuild = args.rebuildVectors ? " rebuild" : "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_refresh(${src}${rebuild})`)));
+      return text;
     },
   });
 }

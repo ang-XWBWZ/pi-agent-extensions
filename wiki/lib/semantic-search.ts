@@ -133,14 +133,15 @@ export async function semanticSearch(query: string): Promise<SearchHit[]> {
 
   // 3. 强匹配（聚合后 ≥50%）/ 弱匹配兜底
   const strong = files.filter(f => f.semanticScore >= HIGH_SIMILARITY_THRESHOLD);
-  const strongHits = strong.map(f => makeFileHit(f, idx));
+  const ci = getChunkInfo();
+  const strongHits = strong.map(f => makeFileHit(f, idx, ci));
 
   if (strongHits.length < FALLBACK_COUNT) {
     const weak = files
       .filter(f => f.semanticScore < HIGH_SIMILARITY_THRESHOLD)
       .slice(0, FALLBACK_COUNT);
     const weakHits = weak.map(f => {
-      const hit = makeFileHit(f, idx);
+      const hit = makeFileHit(f, idx, ci);
       hit.snippet = `⚠️ 弱匹配 (${Math.round(f.semanticScore * 100)}%)`;
       return hit;
     });
@@ -153,21 +154,32 @@ export async function semanticSearch(query: string): Promise<SearchHit[]> {
 function makeFileHit(
   f: FileMatch,
   idx: Record<string, import("./types.js").FileEntry>,
+  chunkInfo?: Record<string, import("./types.js").ChunkInfo>,
 ): SearchHit {
   const entry = idx[f.relPath]!;
 
+  // 优先展示 LLM 编译结果（summary / topic），其次 AST 块标题
   let snippet = "";
-  if (f.bestChunk.chunkHeading) {
+  const llmKey = `${f.relPath}###llm`;
+  const llm = chunkInfo?.[llmKey];
+  if (llm?.summary) {
+    snippet = `💡 ${llm.summary}`;
+    if (llm.topic) snippet += ` [${llm.topic}]`;
+  } else if (llm?.topic) {
+    snippet = `💡 ${llm.topic}`;
+  } else if (f.bestChunk.chunkHeading) {
     snippet = `▸ ${f.bestChunk.chunkHeading}`;
-    if (f.chunkCount > 1) {
-      const others = f.chunkHeadings
-        .filter(h => h !== f.bestChunk.chunkHeading)
-        .slice(0, 2);
-      if (others.length > 0) {
-        snippet += ` | +${f.chunkCount - 1}块: ${others.join(", ")}`;
-      } else {
-        snippet += ` | +${f.chunkCount - 1}块命中`;
-      }
+  }
+
+  // 多块命中展示（最多 5 个附加标题）
+  if (f.chunkCount > 1) {
+    const others = f.chunkHeadings
+      .filter(h => h !== f.bestChunk.chunkHeading)
+      .slice(0, 5);
+    if (others.length > 0) {
+      snippet += ` | +${f.chunkCount - 1}块: ${others.join(", ")}`;
+    } else {
+      snippet += ` | +${f.chunkCount - 1}块命中`;
     }
   }
 
@@ -236,10 +248,9 @@ export async function hybridSearch(query: string): Promise<SearchHit[]> {
     // 取最佳信息源构建结果
     const base = sem || kw!;
 
-    let snippet = "";
-    if (sem?.chunkHeading) {
-      snippet = `▸ ${sem.chunkHeading}`;
-    } else if (kw?.snippet) {
+    // 优先语义结果 snippet（含 LLM 编译内容），其次关键词 snippet
+    let snippet = sem?.snippet || "";
+    if (!snippet && kw?.snippet) {
       snippet = kw.snippet.replace(/\n/g, " | ");
     }
 

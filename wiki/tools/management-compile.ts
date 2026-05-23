@@ -1,6 +1,6 @@
 // management-compile.ts — 语义编译工具 (v5.5)
 //
-// wiki_get_chunks_raw / wiki_compile_file / wiki_store_file_compiled
+// wiki_read_chunks / wiki_DANGER_compile / wiki_DANGER_store
 // v5.1 块级工具（wiki_compile_batch / wiki_store_compiled）已移除
 
 import type { ExtensionAPI, ToolRenderResultOptions, ToolRenderContext } from "@earendil-works/pi-coding-agent";
@@ -18,21 +18,21 @@ import { resolveSource } from "./_helpers.js";
 import { updateFileState, getFileState } from "../lib/file-manifest.js";
 
 export function registerCompileTools(pi: ExtensionAPI): void {
-  // ---- v5.4 文件级编译状态 ----
+  // ---- v5.5 文件级编译状态 ----
 
   pi.registerTool({
-    name: "wiki_get_chunks_raw",
+    name: "wiki_read_chunks",
     label: "Wiki File Compile Status",
     description:
       "获取文件级编译状态列表。按文件展示编译/向量状态，支持分页。",
-    promptSnippet: "Get file-level compilation status",
+    promptSnippet: "Get compilation status (source?, uncompiledOnly?, page?, pageSize?)",
     promptGuidelines: [
       "Shows per-FILE compilation status (not per-chunk).",
       "Use to check which files still need LLM semantic compilation.",
       "Pass source to filter by data source, or omit to get all.",
       "Pass uncompiledOnly: false to also see already-compiled files.",
       "Use page/pageSize for pagination.",
-      "Then use wiki_compile_file on a specific file to compile it.",
+      "Then use wiki_DANGER_compile on a specific file to compile it.",
       "FORBIDDEN: Only call this when user explicitly checks compilation status.",
     ],
     parameters: Type.Object({
@@ -133,7 +133,7 @@ export function registerCompileTools(pi: ExtensionAPI): void {
       if (!d) return container;
 
       const MAX = 100;
-      const TUI_LIMIT = 5;  // 收缩模式只渲染前 5 条，不影响 details 全量
+      const TUI_LIMIT = 5;
       const compilingLabel = (d.compiling ?? 0) > 0 ? ` | 🔄 ${d.compiling}` : "";
       container.addChild(new Text(theme.bold(`📂 ${d.total} 文件 | ✅ ${d.compiled} | ⏳ ${d.uncompiled}${compilingLabel}`), 0, 0));
       container.addChild(new Text(theme.fg("dim", `   第 ${d.page}/${d.totalPages} 页 · 每页 ${d.pageSize} 个`), 0, 0));
@@ -164,34 +164,40 @@ export function registerCompileTools(pi: ExtensionAPI): void {
 
       return container;
     },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const src = args.source?.slice(0, 40) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_chunks(${src ? `“${src}”` : ""})`)));
+      return text;
+    },
   });
 
-  // ---- v5.4 文件级编译 (LLM 挂载单向量) ----
+  // ---- v5.5 文件级编译 (LLM 挂载单向量) ----
 
   pi.registerTool({
-    name: "wiki_compile_file",
+    name: "wiki_DANGER_compile",
     label: "Wiki Compile File",
     description:
       "对整个文件进行语义编译。LLM 输出全文的 topic/normalizedText/concepts/aliases，挂载为文件级语义向量。",
-    promptSnippet: "Compile a whole file into one LLM semantic vector",
+    promptSnippet: "Compile wiki file (source, relPath, force?)",
     promptGuidelines: [
-      "## v5.4 File-Level LLM Vector",
+      "## v5.5 File-Level LLM Vector",
       "LLM reads the FULL file and outputs ONE semantic summary:",
       "  { topic, normalizedText, concepts, aliases }",
       "This vector is stored as `file###llm` alongside AST chunk vectors `file###0..N`.",
       "AST chunks are NEVER deleted — LLM augments, not replaces.",
       "",
       "## Lock & force",
-      "Each compile_file locks the file (compilingSince) to prevent parallel conflicts.",
+      "Each wiki_DANGER_compile locks the file (compilingSince) to prevent parallel conflicts.",
       "If a file shows 🔄编译中 but no agent is actually working on it (crash/timeout):",
       "  → use force=true to clear the stale lock and re-compile.",
       "Locks auto-expire after 10 minutes.",
       "",
       "## Workflow (3 steps)",
-      "① wiki_compile_file(source, relPath) → returns system + user prompt",
+      "① wiki_DANGER_compile(source, relPath) → returns system + user prompt",
       "② Send prompt to LLM (spawn sub-agent, Flash model, work mode, timeout 300s)",
       "   LLM outputs: { topic, normalizedText, concepts, aliases }",
-      "③ wiki_store_file_compiled(source, relPath, llmResponse) → store + rebuild",
+      "③ wiki_DANGER_store(source, relPath, llmResponse) → store + rebuild",
       "",
       "Prefer file-level compilation for full context.",
       "FORBIDDEN: Do NOT compile the same file with both chunk-level and file-level tools.",
@@ -213,14 +219,12 @@ export function registerCompileTools(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `❌ 文件不存在: ${relPath}` }] };
       }
 
-      // 防并发冲突：检查是否正在编译中（force 跳过）
       const fileState = getFileState(relPath);
       if (!params.force && fileState?.compilingSince) {
         const elapsed = Date.now() - new Date(fileState.compilingSince).getTime();
-        if (elapsed < 10 * 60 * 1000) { // 10 分钟内视为活跃
+        if (elapsed < 10 * 60 * 1000) {
           return { content: [{ type: "text", text: `⏳ 文件正在编译中 (${Math.round(elapsed / 1000)}s 前开始): ${relPath}\n   请等待编译完成，或使用 force=true 强制重新编译。` }] };
         }
-        // 超时自动解除（force 也走这里）
       }
 
       let raw: string;
@@ -228,14 +232,12 @@ export function registerCompileTools(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `❌ 无法读取: ${relPath}` }] };
       }
 
-      // 标记编译中
       updateFileState(relPath, { compilingSince: new Date().toISOString() });
 
       const entry = getEntry(relPath);
       const defaultTitle = entry?.title || basename(relPath, ".md");
       const preprocessed = await preprocessFile(relPath, raw, defaultTitle);
 
-      // v5.4: 简化 prompt — 不要求 segments
       const userPrompt = buildFileCompilePrompt(relPath, raw, preprocessed);
 
       const lines = [
@@ -247,7 +249,7 @@ export function registerCompileTools(pi: ExtensionAPI): void {
         "",
         "=== 使用说明 ===",
         "1. spawn 子 Agent (Flash, work mode) 发送 prompt",
-        "2. LLM 返回 JSON 后，调用 wiki_store_file_compiled 存储",
+        "2. LLM 返回 JSON 后，调用 wiki_DANGER_store 存储",
       ];
 
       return {
@@ -265,21 +267,28 @@ export function registerCompileTools(pi: ExtensionAPI): void {
       container.addChild(new Text(theme.fg("muted", `   ${d?.preprocessedCount || 0} 程序段 → LLM 自判语义边界`), 0, 0));
       container.addChild(new Spacer(1));
       container.addChild(new Text(theme.fg("dim", "💡 prompt 已生成 (details.systemPrompt / details.userPrompt)".slice(0, MAX)), 0, 0));
-      container.addChild(new Text(theme.fg("dim", "   子 Agent 编译后调用 wiki_store_file_compiled 存储".slice(0, MAX)), 0, 0));
+      container.addChild(new Text(theme.fg("dim", "   子 Agent 编译后调用 wiki_DANGER_store 存储".slice(0, MAX)), 0, 0));
       return container;
+    },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.relPath?.slice(0, 50) ?? "";
+      const force = args.force ? " force" : "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_compile(“${p}”${force})`)));
+      return text;
     },
   });
 
   pi.registerTool({
-    name: "wiki_store_file_compiled",
+    name: "wiki_DANGER_store",
     label: "Wiki Store File Compiled",
     description:
       "存储文件级编译结果（LLM 输出的 segments）并重建语义向量。自动合并预处理器字段。",
-    promptSnippet: "Store file-level compiled result and rebuild embedding",
+    promptSnippet: "Store wiki compiled (source, relPath, data)",
     promptGuidelines: [
-      "Call after wiki_compile_file + LLM returns compilation result.",
-      "Pass the relPath (same as wiki_compile_file) and the LLM's raw JSON response.",
-      "v5.4: stores as single LLM vector (file###llm), does NOT delete AST chunks.",
+      "Call after wiki_DANGER_compile + LLM returns compilation result.",
+      "Pass the relPath (same as wiki_DANGER_compile) and the LLM's raw JSON response.",
+      "v5.5: stores as single LLM vector (file###llm), does NOT delete AST chunks.",
       "FORBIDDEN: Do NOT fabricate compilation data.",
     ],
     parameters: Type.Object({
@@ -294,25 +303,28 @@ export function registerCompileTools(pi: ExtensionAPI): void {
 
       const relPath = params.relPath.replace(/\\/g, "/");
 
-      // 解析 LLM 结果（兼容 v5.2 segments 和 v5.4 单对象格式）
       const llmData = parseFileLLMResult(params.data);
       if (!llmData) {
         return { content: [{ type: "text", text: "❌ 无法解析编译结果。需要 topic/normalizedText/concepts/aliases 字段。" }] };
       }
 
-      // v5.4: 挂载 ###llm 单向量，不删 AST 向量
       const ok = await storeFileLLMVector(src, relPath, llmData);
       if (!ok) {
         return { content: [{ type: "text", text: `❌ 存储 LLM 向量失败: ${relPath}` }] };
       }
 
-      // 清除编译中锁
       updateFileState(relPath, { compilingSince: undefined });
 
       return {
         content: [{ type: "text", text: `✅ LLM 向量已存储 (###llm): ${relPath}\n   AST 向量完整保留` }],
         details: { relPath, topic: llmData.topic, concepts: llmData.concepts },
       };
+    },
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const p = args.relPath?.slice(0, 50) ?? "";
+      text.setText(theme.fg("toolTitle", theme.bold(`wiki_store(“${p}”)`)));
+      return text;
     },
   });
 }
