@@ -102,10 +102,31 @@ export function getEmbeddingDim(): number | undefined {
   return readRaw()?.dim;
 }
 
+// ---- 质心（噪声基底）----
+
+export function getCentroid(): number[] | null {
+  return readRaw()?.centroid ?? null;
+}
+
+export function setCentroid(centroid: number[]): void {
+  const prev = readRaw();
+  if (!prev) return;
+  prev.centroid = centroid;
+  writeFileSync(vectorFile(), JSON.stringify(prev), "utf-8");
+}
+
+export function clearCentroid(): void {
+  const prev = readRaw();
+  if (!prev) return;
+  delete prev.centroid;
+  writeFileSync(vectorFile(), JSON.stringify(prev), "utf-8");
+}
+
 // ---- 统计 ----
 
 export function vectorsStats(): {
   embeddings: number;
+  centroid: boolean;
   model?: string;
   dim?: number;
 } {
@@ -113,6 +134,7 @@ export function vectorsStats(): {
   const emb = prev?.entries ?? {};
   return {
     embeddings: Object.keys(emb).length,
+    centroid: !!prev?.centroid,
     model: prev?.model,
     dim: prev?.dim,
   };

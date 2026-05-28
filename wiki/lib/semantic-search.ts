@@ -9,7 +9,7 @@
 //   同文件合并 — 一个文件多个块命中时，取最高块相似度 + (块数-1)*0.05 加分（上限 0.25）
 //   RRF 融合 — 替代简单线性加权，对异构分数尺度不敏感
 
-import { getEmbeddings, getSemanticEnabled, getChunkInfo } from "./store.js";
+import { getEmbeddings, getSemanticEnabled, getChunkInfo, getCentroid } from "./store.js";
 import { getIndex } from "./store.js";
 import { embed, initialize, isAvailable, cosineSimilarity } from "./embedder.js";
 import { keywordSearch } from "./search.js";
@@ -75,6 +75,21 @@ export async function semanticSearch(query: string): Promise<SearchHit[]> {
     queryVec = await embed(query);
   } catch {
     return [];
+  }
+
+  // 减去全局质心（降噪），α=0.3，然后归一化
+  const centroid = getCentroid();
+  if (centroid && centroid.length === queryVec.length) {
+    const alpha = 0.3;
+    for (let i = 0; i < queryVec.length; i++) {
+      queryVec[i] -= alpha * centroid[i];
+    }
+    let norm = 0;
+    for (let i = 0; i < queryVec.length; i++) norm += queryVec[i] * queryVec[i];
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+      for (let i = 0; i < queryVec.length; i++) queryVec[i] /= norm;
+    }
   }
 
   // 1. 计算所有块的相似度

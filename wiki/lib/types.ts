@@ -121,4 +121,6 @@ export interface EmbeddingData {
   entries: Record<string, number[]>;    // key: relPath 或 relPath###N
   /** 块元数据（仅标题分块文件有） */
   chunkInfo?: Record<string, ChunkInfo>;  // key: relPath###N → ChunkInfo
+  /** 全局质心（噪声基底），用于搜索降噪 */
+  centroid?: number[];
 }
