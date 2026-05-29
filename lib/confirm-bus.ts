@@ -7,6 +7,7 @@
 
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { enqueueFrontend, registerFrontendProcessor } from "./agent-bus.js";
 
 // ---- 全局单例 ----
 
@@ -73,13 +74,26 @@ export interface BusUI {
 }
 
 export function registerBusUI(ui: BusUI): () => void {
-  const handler = async (req: ConfirmRequest) => {
+  // 注册 confirm 处理器：队列游标到时才调 ui.select
+  registerFrontendProcessor("confirm", async (data) => {
+    const req = data as ConfirmRequest;
     try {
-      const choice = await ui.select(req.label, req.options);
-      globalBus.emit("confirm-response", { reqId: req.reqId, choice } satisfies ConfirmResponse);
+      return await ui.select(req.label, req.options);
     } catch {
-      globalBus.emit("confirm-response", { reqId: req.reqId, choice: undefined } satisfies ConfirmResponse);
+      return undefined;
     }
+  });
+
+  // confirm-request 事件 → 入队（不直接调 ui.select）
+  const handler = (req: ConfirmRequest) => {
+    enqueueFrontend("confirm", 0, req, 60_000)
+      .then((choice) => {
+        globalBus.emit("confirm-response", { reqId: req.reqId, choice: choice as string | undefined } satisfies ConfirmResponse);
+      })
+      .catch((err) => {
+        console.warn("[confirm-bus] enqueue failed:", err.message);
+        globalBus.emit("confirm-response", { reqId: req.reqId, choice: undefined } satisfies ConfirmResponse);
+      });
   };
   globalBus.on("confirm-request", handler);
   return () => globalBus.off("confirm-request", handler);

@@ -50,6 +50,7 @@ import {
   sendAgentInput,
   cleanupJobs,
   getJobInstances,
+  getInstance,
   getAgentBus,
   Events,
   updateInstanceStatus,
@@ -57,6 +58,8 @@ import {
   loadAgentState,
   deleteAgentSave,
   listAgentSaves,
+  enqueueFrontend,
+  registerFrontendProcessor,
   type SubTask,
   type SubResult,
   type AgentJob,
@@ -105,6 +108,18 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(cjk / 1.5 + other / 4));
 }
 
+function fmtNum(n: number): string {
+  if (n >= 1_000_000) {
+    const v = (n / 1_000_000).toFixed(1);
+    return v.endsWith(".0") ? v.slice(0, -2) + "M" : v + "M";
+  }
+  if (n >= 1_000) {
+    const v = (n / 1_000).toFixed(1);
+    return v.endsWith(".0") ? v.slice(0, -2) + "k" : v + "k";
+  }
+  return String(Math.round(n));
+}
+
 // ---- Session 创建串行化（防止并发 globalThis 写入） ----
 let sessionChain = Promise.resolve();
 
@@ -124,17 +139,32 @@ function runSingleAgent(
     task.prompt.slice(0, 20).replace(/\n/g, " ").trim() || task.id;
 
   return new Promise((resolve) => {
-    let settled = false;
-
-    const finish = (result: SubResult) => {
-      if (settled) return;
-      settled = true;
-      try { unregisterInstance(jobId, task.id); } catch (e) { console.warn("[parallel-agent] unregisterInstance 失败:", e); }
-      resolve(result);
-    };
-
-    // 异步执行体：避免 async Promise executor 反模式
+    // 改为异步立即执行，finish 内部走 _dispose 统一清理
     (async () => {
+      let unsubRef: (() => void) | undefined;
+      let timerRef: ReturnType<typeof setTimeout> | null = null;
+      let instRef: AgentInstance | undefined;
+
+      /** 统一终止入口：abort → unsub → clear timer → dispose → unregister → resolve */
+      const finish = async (result: SubResult) => {
+        const inst = instRef ? getInstance(jobId, task.id) : undefined;
+        if (inst?._settled) return;
+        if (inst) {
+          inst._settled = true;
+          // 1. Abort 当前操作
+          try { await inst.session.abort(); } catch { /* */ }
+          // 2. 取消订阅
+          try { unsubRef?.(); } catch { /* */ }
+          // 3. 清除定时器
+          if (timerRef) { clearTimeout(timerRef); timerRef = null; }
+          // 4. 销毁 session
+          try { inst.session.dispose(); } catch { /* */ }
+          // 5. 注销实例
+          try { unregisterInstance(jobId, task.id); } catch { /* */ }
+        }
+        resolve(result);
+      };
+
       try {
       // 上下文 + skill 注入
       let extra = "";
@@ -172,7 +202,7 @@ function runSingleAgent(
       let abortedExternally = false;
 
       // ---- 注册实例（含行为状态追踪字段） ----
-      const instRef: AgentInstance = {
+      instRef = {
         jobId,
         taskId: task.id,
         name,
@@ -190,6 +220,10 @@ function runSingleAgent(
         model: `${subModel.provider}/${subModel.id}`,
         inputTokens: estimateTokens(prompt),
         outputTokens: 0,
+        cacheTokens: 0,
+        cost: 0,
+        contextPercent: null,
+        contextWindow: 0,
         _abortExternally: () => { abortedExternally = true; },
         _resetTimer: () => {},
       };
@@ -215,9 +249,9 @@ function runSingleAgent(
           updateInstanceStatus(jobId, task.id, { detailedStatus: "idle" });
           instRef._idleTimer = idleTimer;
           // 自动续推
-          if (instRef.autoContinue && !settled) {
+          if (instRef.autoContinue && !instRef._settled) {
             autoContinueTimer = setTimeout(() => {
-              if (!settled) {
+              if (!instRef._settled) {
                 try { session.steer("继续执行未完成的任务。"); } catch { /* ignore */ }
               }
             }, instRef.autoContinueDelay * 1000);
@@ -227,12 +261,8 @@ function runSingleAgent(
       };
 
       const resetTimer = () => {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => {
-          abortedExternally = false;
-          try { unsub(); } catch (e) { console.warn("[parallel-agent] unsub 失败:", e); }
-          try { session.abort(); } catch (e) { console.warn("[parallel-agent] session.abort 失败:", e); }
-          try { session.dispose(); } catch (e) { console.warn("[parallel-agent] session.dispose 失败:", e); }
+        if (timerRef) clearTimeout(timerRef);
+        timerRef = setTimeout(() => {
           finish({
             id: task.id,
             name,
@@ -246,9 +276,19 @@ function runSingleAgent(
 
       // 补上 resetTimer 引用
       instRef._resetTimer = resetTimer;
+      instRef._dispose = async () => { await finish({ id: task.id, name, order, ok: false, error: "disposed" }); };
       resetTimer();
 
-      const unsub = session.subscribe((event) => {
+      unsubRef = session.subscribe(async (event) => {
+        // ---- 泄露自检：每次 turn/tool 前确认 bus 注册状态 ----
+        if (event.type === "turn_start" || event.type === "tool_execution_start") {
+          if (!getInstance(jobId, task.id)) {
+            console.warn(`[parallel-agent] ${task.id} 泄露检测: bus 注册已丢失，强制自毁`);
+            try { session.abort(); } catch { /* */ }
+            try { session.dispose(); } catch { /* */ }
+            return;
+          }
+        }
         // ---- text delta → thinking ----
         if (event.type === "message_update") {
           if (event.assistantMessageEvent.type === "text_delta") {
@@ -294,6 +334,21 @@ function runSingleAgent(
           updateInstanceStatus(jobId, task.id, { detailedStatus: "thinking" });
           startIdleDetection();
         }
+        // ---- message end → 提取原生 token 统计实时更新面板 ----
+        if (event.type === "message_end") {
+          try {
+            const stats = session.getSessionStats();
+            const cu = session.getContextUsage();
+            updateInstanceStatus(jobId, task.id, {
+              inputTokens: stats.tokens.input || instRef.inputTokens,
+              outputTokens: stats.tokens.output || instRef.outputTokens,
+              cacheTokens: (stats.tokens.cacheRead || 0) + (stats.tokens.cacheWrite || 0),
+              cost: stats.cost,
+              contextPercent: cu?.percent ?? null,
+              contextWindow: cu?.contextWindow ?? 0,
+            });
+          } catch { /* session stats unavailable */ }
+        }
         // ---- agent end → done ----
         if (event.type === "agent_end") {
           clearIdle();
@@ -303,19 +358,37 @@ function runSingleAgent(
             instRef._savedMessages = session.state.messages;
             saveAgentState(jobId, task.id);
           } catch { /* */ }
+          // 提取原生 token 统计（覆盖启发式估算）
+          try {
+            const stats = session.getSessionStats();
+            const cu = session.getContextUsage();
+            updateInstanceStatus(jobId, task.id, {
+              inputTokens: stats.tokens.input || instRef.inputTokens,
+              outputTokens: stats.tokens.output || instRef.outputTokens,
+              cacheTokens: (stats.tokens.cacheRead || 0) + (stats.tokens.cacheWrite || 0),
+              cost: stats.cost,
+              contextPercent: cu?.percent ?? null,
+              contextWindow: cu?.contextWindow ?? 0,
+            });
+          } catch { /* session stats unavailable */ }
           if (abortedExternally) {
             abortedExternally = false;
             return;
           }
-          unsub();
-          if (timer) clearTimeout(timer);
-          session.dispose();
-          finish({
+          await finish({
             id: task.id,
             name,
             order,
             ok: true,
             output: output.trim() || "(无输出)",
+            tokens: {
+              input: instRef.inputTokens,
+              output: instRef.outputTokens,
+              cache: instRef.cacheTokens,
+              cost: instRef.cost,
+              contextPercent: instRef.contextPercent,
+              contextWindow: instRef.contextWindow,
+            },
           });
         }
       });
@@ -323,7 +396,7 @@ function runSingleAgent(
       // 启动子 Agent
       await session.prompt(prompt);
       } catch (err: unknown) {
-        finish({
+        await finish({
           id: task.id,
           name,
           order,
@@ -418,6 +491,12 @@ function spawnAllBackground(
 
 export default function (pi: ExtensionAPI) {
 
+  // ---- 注册前端消息处理器（仅一次） ----
+  registerFrontendProcessor("steer", async (data) => {
+    const text = data as string;
+    pi.sendUserMessage(text, { deliverAs: "steer" });
+  });
+
   // ==================== 子 Agent 状态面板 Widget ====================
 
   let widgetTui: { requestRender(): void } | null = null;
@@ -472,12 +551,8 @@ export default function (pi: ExtensionAPI) {
                 : inst.detailedStatus === "paused" ? "已暂停"
                 : "运行中";
             const elapsed = ((Date.now() - inst.startedAt) / 1000).toFixed(0);
-            const tokIn = inst.inputTokens > 1000
-              ? `${(inst.inputTokens / 1000).toFixed(1)}k`
-              : String(inst.inputTokens);
-            const tokOut = inst.outputTokens > 1000
-              ? `${(inst.outputTokens / 1000).toFixed(1)}k`
-              : String(inst.outputTokens);
+            const tokIn = fmtNum(inst.inputTokens);
+            const tokOut = fmtNum(inst.outputTokens);
             const title = inst.name.length > 20
               ? inst.name.slice(0, 20) + "…"
               : inst.name;
@@ -486,9 +561,25 @@ export default function (pi: ExtensionAPI) {
               ? modelShort.slice(0, 30) + "…"
               : modelShort;
 
+            // 构建指标段：↑in ↓out [Rcache] [$cost] [ctx%/ctxWin]
+            const metrics: string[] = [];
+            metrics.push(`↑${tokIn}`);
+            metrics.push(`↓${tokOut}`);
+            if (inst.cacheTokens > 0) {
+              metrics.push(`R${fmtNum(inst.cacheTokens)}`);
+            }
+            if (inst.cost > 0) {
+              metrics.push(`$${inst.cost < 0.001 ? inst.cost.toExponential(2) : inst.cost.toFixed(3)}`);
+            }
+            if (inst.contextPercent !== null && inst.contextPercent !== undefined && inst.contextWindow > 0) {
+              metrics.push(`${inst.contextPercent.toFixed(1)}%/${fmtNum(inst.contextWindow)}`);
+            }
+            metrics.push(`${elapsed}s`);
+            metrics.push(statusText);
+
             // 构建完整行，用 visibleWidth 测量后截断
             const fullLine =
-              `  ${statusIcon} ${theme.fg("accent", inst.taskId)} ${theme.fg("muted", title)}  ${theme.fg("dim", modelTag)}  ${theme.fg("dim", `↑${tokIn} ↓${tokOut}  ${elapsed}s  ${statusText}`)}`;
+              `  ${statusIcon} ${theme.fg("accent", inst.taskId)} ${theme.fg("muted", title)}  ${theme.fg("dim", modelTag)}  ${theme.fg("dim", metrics.join(" "))}`;
             lines.push(
               visibleWidth(fullLine) > width
                 ? truncateToWidth(fullLine, width - 1) + "…"
@@ -628,22 +719,26 @@ export default function (pi: ExtensionAPI) {
           const okCount = completedJob.results.filter((r) => r.ok).length;
           const failCount = completedJob.results.filter((r) => !r.ok).length;
 
-          const lines = [
-            `🤖 [子任务完成] Job \`${job.jobId.slice(0, 8)}\` — ✅ ${okCount} / ❌ ${failCount} / 📊 ${total} (${elapsed}s)`,
-            "",
-            ...completedJob.results.map((r) => {
-              const icon = r.ok ? "✅" : "❌";
-              const text = r.ok
-                ? (r.output ?? "").slice(0, 500)
-                : `错误: ${r.error ?? "未知"}`;
-              return `${icon} [${r.order}/${total}] **${r.name}**\n\`\`\`\n${text}\n\`\`\`\n`;
-            }),
-          ];
+          // 单行摘要，避免 UI 展开多行
+          const totalTokens = completedJob.results.reduce((acc, r) => {
+            if (r.tokens) {
+              acc.input += r.tokens.input;
+              acc.output += r.tokens.output;
+              acc.cache += r.tokens.cache;
+              acc.cost += r.tokens.cost;
+              if (r.tokens.contextPercent !== null) {
+                acc.ctxPct = Math.max(acc.ctxPct, r.tokens.contextPercent);
+              }
+              acc.ctxWin = Math.max(acc.ctxWin, r.tokens.contextWindow);
+            }
+            return acc;
+          }, { input: 0, output: 0, cache: 0, cost: 0, ctxPct: 0, ctxWin: 0 });
+          const statsPart = totalTokens.input > 0
+            ? ` | 📊 ↑${fmtNum(totalTokens.input)} ↓${fmtNum(totalTokens.output)} R${fmtNum(totalTokens.cache)} $${totalTokens.cost < 0.001 ? totalTokens.cost.toExponential(2) : totalTokens.cost.toFixed(3)} ${totalTokens.ctxPct > 0 ? totalTokens.ctxPct.toFixed(1) + "%" : "?%"}${totalTokens.ctxWin > 0 ? "/" + fmtNum(totalTokens.ctxWin) : ""}`
+            : "";
+          const line = `🤖 [子任务完成] Job \`${job.jobId.slice(0, 8)}\` — ✅ ${okCount} / ❌ ${failCount} / 📊 ${total} (${elapsed}s)${statsPart}`;
 
-          pi.sendUserMessage(lines.join("\n"), {
-            deliverAs: "steer",
-            triggerTurn: true,
-          });
+          enqueueFrontend("steer", 10, line).catch(() => { /* 队列满/超时，静默丢弃 */ });
         });
       }
 
