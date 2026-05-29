@@ -4,6 +4,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Text, Container } from "@earendil-works/pi-tui";
 import { type WorkMode, type AppState, type StepStatus, type PlanStep, MAX_PLAN_STEPS, DEFAULT_VISIBLE_STEPS } from "./types.js";
 import { parsePlanSteps, renderPlanPanel, nextStepId, resetStepIdCounter } from "./plan-parser.js";
 import { type SecurityFinding, securityReview, formatSecurityReview } from "./security-reviewer.js";
@@ -50,7 +51,7 @@ export function setupPlanFeature(
       return;
     }
     ctx.ui.setWidget("plan-panel", (_tui, theme) => ({
-      render: () => renderPlanPanel(s.planSteps, theme, s.planPanelExpanded),
+      render: (_width: number) => renderPlanPanel(s.planSteps, theme, s.planPanelExpanded),
       invalidate: () => _tui.requestRender?.(),
     }));
   }
@@ -107,6 +108,7 @@ export function setupPlanFeature(
           s.planFullText = fullText;
           s.planSteps = parsed;
           s.appState = "planning";
+          updatePlanPanel(ctx);
           if (s.mode !== "plan") { s.mode = "plan"; cb.persist(ctx); }
 
           // Show confirmation dialog (message_end is async, UI works here)
@@ -199,7 +201,7 @@ export function setupPlanFeature(
     promptSnippet: "Update the plan panel (set steps, advance, mark errors, clear)",
     promptGuidelines: [
       "Use manage_plan to update the execution plan panel during task execution.",
-      "Actions: 'set_steps' (replace all steps), 'set_step_status' (set a step's status), 'insert_step' (insert at position), 'delete_step' (remove by id/index), 'update_step' (edit step text), 'complete' (mark all done + close), 'clear' (remove panel).",
+      "Actions: 'set_steps' (replace all steps), 'set_step_status' (set a step's status), 'insert_step' (insert at position), 'delete_step' (remove by id/index), 'update_step' (edit step text), 'complete' (mark all done + close), 'clear' (remove panel), 'status' (query current plan state).",
       "Step statuses: 'pending' | 'current' | 'done' | 'error' | 'skipped'. Only ONE step should be 'current' at a time.",
       "Use set_step_status to advance: mark current step 'done', mark next step 'current'.",
       "Use set_steps to replace the current plan with a refined one (max 10 steps).",
@@ -208,13 +210,73 @@ export function setupPlanFeature(
       "FORBIDDEN: Do NOT clear the panel when steps remain unfinished, unless the user explicitly says so.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "操作: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear" }),
+      action: Type.String({ description: "操作: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear | status" }),
       steps: Type.Optional(Type.Array(Type.String(), { description: "步骤文本列表 (set_steps 时使用，上限10)" })),
       stepId: Type.Optional(Type.Number({ description: "步骤 id（set_step_status/delete_step/update_step 时使用）" })),
       stepIndex: Type.Optional(Type.Number({ description: "步骤索引（insert_step 时使用，0-based，默认追加到末尾）" })),
       status: Type.Optional(Type.String({ description: "步骤状态: pending | current | done | error | skipped（set_step_status 时使用）" })),
       text: Type.Optional(Type.String({ description: "步骤文本（insert_step/update_step 时使用）" })),
     }),
+
+    renderCall(args, theme, context) {
+      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
+      const action = typeof args.action === "string" ? args.action : "?";
+      let detail = "";
+      switch (action) {
+        case "set_steps":
+          detail = args.steps ? ` ${args.steps.length}步` : "";
+          break;
+        case "set_step_status":
+          detail = ` #${args.stepId} → ${args.status}`;
+          break;
+        case "insert_step":
+          detail = args.text ? ` "${args.text.slice(0, 30)}"` : "";
+          break;
+        case "delete_step":
+          detail = ` #${args.stepId}`;
+          break;
+        case "update_step":
+          detail = ` #${args.stepId}`;
+          break;
+        case "complete":
+          detail = " ✅";
+          break;
+        case "clear":
+          detail = " 🧹";
+          break;
+        case "status":
+          detail = " 🔍";
+          break;
+      }
+      text.setText(theme.fg("toolTitle", theme.bold(`manage_plan: ${action}${detail}`)));
+      return text;
+    },
+
+    renderResult(result, options, theme, context) {
+      const text = result.content
+        ?.filter((c: { type: string; text?: string }) => c.type === "text")
+        .map((c: { type: string; text?: string }) => c.text ?? "")
+        .join("\n")
+        .trim() ?? "";
+      if (!text) return (context.lastComponent as Container) ?? new Container();
+
+      const container = (context.lastComponent as Container) ?? new Container();
+      container.clear();
+
+      if (options.expanded) {
+        // 展开：显示完整输出
+        container.addChild(new Text(text, 0, 0));
+      } else {
+        // 折叠：只显示一行摘要
+        const firstLine = text.split("\n")[0].slice(0, 100);
+        const hint = text.includes("\n") || text.length > 100
+          ? theme.fg("muted", " … (Ctrl+O 展开)")
+          : "";
+        container.addChild(new Text(firstLine + hint, 0, 0));
+      }
+      return container;
+    },
+
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       switch (params.action) {
         case "set_steps": {
@@ -222,6 +284,7 @@ export function setupPlanFeature(
             return { content: [{ type: "text", text: "错误: set_steps 需要 steps 参数" }], details: { error: "missing_steps" } };
           }
           const texts = params.steps.slice(0, MAX_PLAN_STEPS);
+          resetStepIdCounter(0);
           s.planSteps = texts.map((t, i) => ({
             id: nextStepId(),
             text: t,
@@ -288,6 +351,20 @@ export function setupPlanFeature(
           target2.text = params.text;
           updatePlanPanel(ctx);
           return { content: [{ type: "text", text: `✏ 步骤 #${target2.id} 已更新: ${params.text.slice(0, 40)}` }], details: { action: "update_step", stepId: target2.id } };
+        }
+
+        case "status": {
+          if (s.planSteps.length === 0) {
+            return { content: [{ type: "text", text: "当前无计划" }], details: { action: "status", steps: [], count: 0 } };
+          }
+          const summary = s.planSteps.map(st => {
+            const icon = st.status === "current" ? "▶" : st.status === "done" ? "✅" : st.status === "error" ? "❌" : st.status === "skipped" ? "⏭" : "○";
+            return `${icon} [id=${st.id}] ${st.status}: ${st.text}`;
+          }).join("\n");
+          return {
+            content: [{ type: "text", text: `计划面板状态 (${s.planSteps.length} 步):\n${summary}` }],
+            details: { action: "status", steps: s.planSteps.map(st => ({ id: st.id, text: st.text, status: st.status })), count: s.planSteps.length },
+          };
         }
 
         case "complete": {

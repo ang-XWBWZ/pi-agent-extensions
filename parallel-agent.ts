@@ -19,7 +19,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   createAgentSession,
   SessionManager,
@@ -68,6 +68,18 @@ import {
 } from "./lib/agent-bus.js";
 
 // ---- helpers ----
+
+function truncateToWidth(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  // 已 ≤ 目标宽度 → 直接返回
+  if (visibleWidth(text) <= maxWidth) return text;
+  // 从尾部逐字符移除（处理 ANSI 码 + CJK 宽字符）
+  let result = text;
+  while (result.length > 0 && visibleWidth(result) > maxWidth) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
 
 async function loadContext(paths: string[], cwd: string): Promise<string> {
   const chunks: string[] = [];
