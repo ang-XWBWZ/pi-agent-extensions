@@ -141,6 +141,10 @@ export interface AgentInstance {
   outputLength: number;
   /** 子 Agent 使用的模型标识 */
   model?: string;
+  /** 模型层级 (L0/L1/L2) */
+  tier?: string;
+  /** 思考深度 (off/minimal/low/medium/high/xhigh) */
+  thinkingLevel?: string;
   /** 累计输入 token 数 */
   inputTokens: number;
   /** 累计输出 token 数 */

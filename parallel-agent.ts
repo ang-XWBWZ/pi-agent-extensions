@@ -1,5 +1,5 @@
 /**
- * parallel-agent.ts — 子 Agent 系统 v6
+ * parallel-agent.ts — 子 Agent 系统 v9
  *
  * 工具:
  *   spawn_agent          — 并行派发子 Agent，立即返回 jobId，后台运行
@@ -7,15 +7,10 @@
  *   send_agent_message   — Agent 间消息传递
  *   control_agent        — 子 Agent 完整生命周期控制
  *
- * v6 改进:
- *   - 完整生命周期：kill / abort / send / pause / resume / list / status
- *   - 子 Agent 注册到 AgentBus，外部可控制
- *   - session.steer() 实现运行时消息注入
- *   - pause = abort 不 dispose；resume = sendUserMessage("继续")
- *   - kill = abort + dispose + 标记失败
- * v7 改进:
- *   - spawn_agent 支持 autoInject（默认 true）：子任务完成时自动推送结果到主对话
- *   - 主 Agent 不再需要阻塞式 check_agent_results(wait=true)，完成即通知
+ * v9 改进:
+ *   - 模型分级联动：task 支持 tier (L0/L1/L2) 自动选模型 + 思考深度
+ *   - 思考深度传递：task.thinkingLevel 覆盖层级默认值
+ *   - 优先级链：task.model > task.tier + thinkingLevel > 主 Agent 模型
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -29,7 +24,8 @@ import { type Model } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { readFile, access } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve, join } from "node:path";
 import {
   createJob,
   publishTaskResult,
@@ -146,6 +142,9 @@ function runSingleAgent(
   modelRegistry: ModelRegistry,
   deadline: number,
   pi: ExtensionAPI,
+  thinkingLevel?: string,
+  tier?: string,
+  tools?: string[],
 ): Promise<SubResult> {
   const name =
     task.prompt.slice(0, 20).replace(/\n/g, " ").trim() || task.id;
@@ -191,17 +190,22 @@ function runSingleAgent(
       // ---- 串行化 globalThis 写入（Promise 链替代 InitLock） ----
       sessionChain = sessionChain.then(async () => {
         (globalThis as Record<string, unknown>).__pi_default_mode =
-          task.mode || "plan";
+          task.mode || "work";
         (globalThis as Record<string, unknown>).__pi_is_sub_agent = true;
 
         try {
           const sm = SessionManager.inMemory();
-          const created = await createAgentSession({
+          const opts: Record<string, unknown> = {
             sessionManager: sm,
             modelRegistry,
             model: subModel,
             cwd,
-          });
+          };
+          if (thinkingLevel) opts.thinkingLevel = thinkingLevel;
+          if (tools && tools.length > 0) opts.tools = tools;
+          const created = await createAgentSession(
+            opts as Parameters<typeof createAgentSession>[0],
+          );
           return created.session;
         } finally {
           delete (globalThis as Record<string, unknown>).__pi_default_mode;
@@ -230,6 +234,8 @@ function runSingleAgent(
         promptLength: prompt.length,
         outputLength: 0,
         model: `${subModel.provider}/${subModel.id}`,
+        tier: tier ?? (task as Record<string, unknown>).tier as string | undefined,
+        thinkingLevel: thinkingLevel,
         inputTokens: estimateTokens(prompt),
         outputTokens: 0,
         cacheTokens: 0,
@@ -420,6 +426,71 @@ function runSingleAgent(
   });
 }
 
+// ---- 层级解析（从 settings.json 读取 modelTiers） ----
+
+const VALID_THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const;
+
+function settingsPath(): string {
+  return join(
+    process.env.USERPROFILE ?? ".",
+    ".pi",
+    "agent",
+    "settings.json",
+  );
+}
+
+interface TaskResolvedConfig {
+  model: string;
+  thinkingLevel?: string;
+}
+
+/** 从 task.tier 解析模型+思考深度（优先级：task.model > tier > 默认） */
+function resolveTaskConfig(
+  task: SubTask & { tier?: string; thinkingLevel?: string },
+): TaskResolvedConfig | null {
+  const tier = task.tier?.toUpperCase();
+  if (!tier || !["L0", "L1", "L2"].includes(tier)) return null;
+
+  // 无配置则降级（子进程用主模型）
+
+  try {
+    const raw = JSON.parse(readFileSync(settingsPath(), "utf-8"));
+    const tiers = raw.modelTiers as Record<string, unknown> | undefined;
+    if (!tiers || typeof tiers !== "object") return null;
+
+    const cfg = tiers[tier] as Record<string, unknown> | undefined;
+    if (!cfg || !Array.isArray(cfg.models) || cfg.models.length === 0)
+      return null;
+
+    const firstModel = cfg.models[0] as {
+      provider: string;
+      model: string;
+    };
+    const model = `${firstModel.provider}/${firstModel.model}`;
+
+    const rawThink =
+      (task.thinkingLevel as string) ?? (cfg.thinkingLevel as string);
+    if (
+      rawThink &&
+      VALID_THINKING_LEVELS.includes(
+        rawThink as (typeof VALID_THINKING_LEVELS)[number],
+      )
+    ) {
+      return { model, thinkingLevel: rawThink };
+    }
+    return { model };
+  } catch {
+    return null;
+  }
+}
+
 // ---- 后台批量启动（fire-and-forget） ----
 
 function spawnAllBackground(
@@ -430,21 +501,51 @@ function spawnAllBackground(
   modelRegistry: ModelRegistry,
   deadline: number,
   pi: ExtensionAPI,
+  tools: string[],
 ): void {
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
 
-    let subModel: Model<any> | undefined = defaultModel;
+    let subModel: Model<any> | undefined = undefined;
+    let subThinkingLevel: string | undefined = undefined;
+
+    // 优先级 1: task.model 精确指定
     if (task.model) {
       const [p, m] = task.model.split("/");
       const found = modelRegistry.find(p, m);
       if (found) {
         subModel = found;
+        subThinkingLevel = (
+          task as Record<string, unknown>
+        ).thinkingLevel as string | undefined;
       } else {
-        console.warn(`[parallel-agent] 模型 ${task.model} 未找到，降价使用默认模型`);
-        subModel = defaultModel;
+        console.warn(
+          `[parallel-agent] 模型 ${task.model} 未找到，降级`,
+        );
       }
     }
+
+    // 优先级 2: task.tier 层级解析
+    if (!subModel) {
+      const resolved = resolveTaskConfig(
+        task as SubTask & { tier?: string; thinkingLevel?: string },
+      );
+      if (resolved) {
+        const [p, m] = resolved.model.split("/");
+        const found = modelRegistry.find(p, m);
+        if (found) {
+          subModel = found;
+          subThinkingLevel = resolved.thinkingLevel;
+        } else {
+          console.warn(
+            `[parallel-agent] tier=${task.tier} → ${resolved.model} 未找到，降级`,
+          );
+        }
+      }
+    }
+
+    // 优先级 3: 继承主 Agent 模型
+    if (!subModel) subModel = defaultModel;
 
     if (!subModel) {
       publishTaskResult(jobId, {
@@ -469,6 +570,9 @@ function spawnAllBackground(
       modelRegistry,
       deadline,
       pi,
+      subThinkingLevel,
+      (task as Record<string, unknown>).tier as string | undefined,
+      tools,
     )
       .then((result) => {
         publishTaskResult(jobId, result);
@@ -569,9 +673,13 @@ export default function (pi: ExtensionAPI) {
               ? inst.name.slice(0, 20) + "…"
               : inst.name;
             const modelShort = inst.model || "?";
-            const modelTag = modelShort.length > 30
-              ? modelShort.slice(0, 30) + "…"
-              : modelShort;
+            const tierPrefix = inst.tier ? `[${inst.tier}] ` : "";
+            const thinkSuffix = inst.thinkingLevel && inst.thinkingLevel !== "off"
+              ? ` 🧠${inst.thinkingLevel}`
+              : "";
+            const modelTag = (tierPrefix + modelShort + thinkSuffix).length > 35
+              ? (tierPrefix + modelShort + thinkSuffix).slice(0, 35) + "…"
+              : tierPrefix + modelShort + thinkSuffix;
 
             // 构建指标段：↑in ↓out [Rcache] [$cost] [ctx%/ctxWin]
             const metrics: string[] = [];
@@ -616,6 +724,22 @@ export default function (pi: ExtensionAPI) {
 
   // ==================== spawn_agent ====================
 
+  // 子 Agent 禁用的工具（防递归、防模型切换）
+  const SUB_AGENT_BLACKLIST = new Set([
+    "spawn_agent",
+    "check_agent_results",
+    "control_agent",
+    "send_agent_message",
+    "switch_model",
+    "manage_plan",
+  ]);
+
+  function getFilteredTools(): string[] {
+    return (pi.getActiveTools?.() ?? []).filter(
+      (t) => !SUB_AGENT_BLACKLIST.has(t),
+    );
+  }
+
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn Agent",
@@ -631,6 +755,13 @@ export default function (pi: ExtensionAPI) {
       "For multiple independent tasks, spawn them together for parallel execution.",
       "Results are auto-injected into the conversation when complete — you DO NOT need to block-wait. Keep interacting with the user normally.",
       "To resume from a saved state, set resumeFrom on the task to the saveId from control_agent save/list_saves.",
+      // ── 模型分层策略 (v9) ──
+      "Each task supports 'tier' (L0/L1/L2) for automatic model + thinking level selection from modelTiers config.",
+      "Use tier: \"L0\" for cheap/fast tasks: file lookups, code maps, simple queries — saves tokens.",
+      "Use tier: \"L1\" (default if not specified) for coding, refactoring, debugging.",
+      "Use tier: \"L2\" for architecture design, cross-module analysis, security review — deepest reasoning.",
+      "Override thinking level per task with 'thinkingLevel' (off/minimal/low/medium/high/xhigh).",
+      "Task model resolution priority: task.model > task.tier > main agent model.",
       // ── 体验 ──
       "Delegate independent read/search/analysis tasks only. Sub-agents are YOUR workers — dispatch and move on.",
       "FORBIDDEN: Do NOT spawn sub-agents for trivial single-file reads or single kb_search calls. These are faster done directly.",
@@ -644,6 +775,8 @@ export default function (pi: ExtensionAPI) {
           skills: Type.Optional(Type.Array(Type.String())),
           mode: Type.Optional(StringEnum(["plan", "work", "yolo"] as const)),
           model: Type.Optional(Type.String()),
+          tier: Type.Optional(Type.String({ description: "模型层级: L0(快速) | L1(主要) | L2(高级)。自动选模型+思考深度" })),
+          thinkingLevel: Type.Optional(Type.String({ description: "覆盖层级默认思考深度: off | minimal | low | medium | high | xhigh" })),
           resumeFrom: Type.Optional(Type.String({ description: "从存档恢复（saveId），继承历史对话上下文" })),
         }),
       ),
@@ -710,6 +843,8 @@ export default function (pi: ExtensionAPI) {
         });
       } catch { /* */ }
 
+      const filteredTools = getFilteredTools();
+
       spawnAllBackground(
         job.jobId,
         resolvedTasks,
@@ -718,6 +853,7 @@ export default function (pi: ExtensionAPI) {
         ctx.modelRegistry,
         deadline,
         pi,
+        filteredTools,
       );
 
       // ---- 自动结果注入：完成时推送结果到主对话（不阻塞） ----
