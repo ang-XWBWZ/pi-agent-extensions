@@ -24,7 +24,7 @@ import { type Model } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { readFile, access } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import {
   createJob,
@@ -35,6 +35,7 @@ import {
   listInstances,
   waitForJob,
   onJobComplete,
+  onMessage,
   sendMessage,
   registerInstance,
   unregisterInstance,
@@ -62,6 +63,9 @@ import {
   type AgentInstance,
   type AgentSaveState,
 } from "./lib/agent-bus.js";
+
+// ---- sessionManager → taskId 映射，用于 send_agent_message 自动识别发送方 ----
+const subAgentIdentity = new WeakMap<object, string>();
 
 // ---- helpers ----
 
@@ -92,6 +96,93 @@ async function loadContext(paths: string[], cwd: string): Promise<string> {
   return chunks.join("\n");
 }
 
+// ---- skill 前端解析（YAML frontmatter + 异常降级） ----
+
+/** 解析 SKILL.md 的 YAML frontmatter */
+interface SkillFrontmatter {
+  name: string;
+  description: string;
+  /** 原始 frontmatter 块全文（含 --- 包围） */
+  raw: string;
+  /** description 是否完整解析 */
+  complete: boolean;
+}
+
+function parseSkillFrontmatter(content: string): SkillFrontmatter | null {
+  // 匹配文件开头的 --- 包围的 YAML 块
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return null;
+
+  const fmText = match[1];
+  const lines = fmText.split('\n');
+  let name = '';
+  let desc = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const nameMatch = line.match(/^name:\s*(.+)/);
+    if (nameMatch) { name = nameMatch[1].trim(); continue; }
+
+    // description: 单行 或 块语法（> / >- / |）
+    const descStart =
+      line.match(/^description:\s*[>|]\s*/) ||
+      line.match(/^description:\s*(.+)/);
+    if (descStart) {
+      if (descStart[1]) {
+        // 单行: description: xxx
+        desc = descStart[1].trim();
+      } else {
+        // 块: >, >-, |  后续缩进行都属于 description
+        const descLines: string[] = [];
+        for (let j = i + 1; j < lines.length; j++) {
+          const sub = lines[j];
+          if (/^[ \t]/.test(sub)) {
+            descLines.push(sub.trim());
+          } else {
+            break;
+          }
+        }
+        desc = descLines.join(' ');
+        i += descLines.length; // 跳过已处理的行
+      }
+    }
+  }
+
+  // name 为空时无法识别，返回 null 由调用方做长度降级
+  if (!name) return null;
+  return { name, description: desc, raw: match[0], complete: !!desc };
+}
+
+/**
+ * 无 frontmatter 时按文件长度渐变纰漏。
+ *
+ *   <  1KB → 全量
+ *   1-5KB  → 头 2KB
+ *   5-15KB → 头 3KB + 尾 1KB
+ *   > 15KB → 头 1KB + 尾 512B
+ */
+function partialReveal(content: string): string {
+  const len = content.length;
+  const sizeKB = (len / 1024).toFixed(1);
+
+  let partial: string;
+  if (len < 1024) {
+    partial = content;
+  } else if (len < 5120) {
+    partial = content.slice(0, 2048);
+  } else if (len < 15360) {
+    partial = content.slice(0, 3072) + '\n... [截断] ...\n' + content.slice(-1024);
+  } else {
+    partial = content.slice(0, 1024) + '\n... [截断] ...\n' + content.slice(-512);
+  }
+
+  return `\u26a0\ufe0f [partial reveal \u2014 原始文件 ${sizeKB}KB, 未解析到 frontmatter]\n${partial}`;
+}
+
+/**
+ * 加载 skill 文件（全量）。
+ * 搜索失败时返回 [无法加载] 标记，不抛出异常。
+ */
 async function loadSkill(name: string): Promise<string> {
   // 按优先级尝试多个路径：项目 skills → pi agent skills → 全局 .agents/skills
   const searchPaths = [
@@ -99,13 +190,18 @@ async function loadSkill(name: string): Promise<string> {
     resolve(process.env.USERPROFILE ?? ".", ".pi", "agent", "skills", name, "SKILL.md"),
     resolve(process.env.USERPROFILE ?? ".", ".agents", "skills", name, "SKILL.md"),
   ];
+
   for (const skillPath of searchPaths) {
     try {
       await access(skillPath);
       const content = await readFile(skillPath, "utf-8");
       return `\n--- SKILL: ${name} ---\n${content.slice(0, 30_000)}`;
-    } catch { /* try next */ }
+    } catch {
+      // 文件不存在/读取失败，尝试下一个路径
+    }
   }
+
+  // 所有路径均失败
   return `\n[无法加载 skill: ${name}]`;
 }
 
@@ -181,7 +277,13 @@ function runSingleAgent(
       let extra = "";
       if (task.context?.length) extra += await loadContext(task.context, cwd);
       if (task.skills?.length) {
-        for (const s of task.skills) extra += await loadSkill(s);
+        const config = loadSkillConfig();
+        for (const s of task.skills) {
+          // 黑名单检查：黑名单中的 skill 完全不加载
+          if (config.blacklist.includes(s)) continue;
+          // 主动传入 skills → 全量加载
+          extra += await loadSkill(s);
+        }
       }
       const prompt = extra
         ? `${task.prompt}\n\n[注入上下文]\n${extra}`
@@ -195,6 +297,7 @@ function runSingleAgent(
 
         try {
           const sm = SessionManager.inMemory();
+          subAgentIdentity.set(sm, task.id);
           const opts: Record<string, unknown> = {
             sessionManager: sm,
             modelRegistry,
@@ -446,6 +549,43 @@ function settingsPath(): string {
   );
 }
 
+/** skill 按需加载配置（仅黑名单，白名单由 spawn_agent 的 skills 参数决定） */
+interface SkillConfig {
+  blacklist: string[];
+}
+
+/** 从 settings.json 读取 skill 黑名单 */
+function loadSkillConfig(): SkillConfig {
+  try {
+    const raw = JSON.parse(readFileSync(settingsPath(), "utf-8"));
+    const section = raw.skills as Record<string, unknown> | undefined;
+    if (!section || typeof section !== "object") return { blacklist: [] };
+
+    return {
+      blacklist: Array.isArray(section.blacklist)
+        ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
+        : [],
+    };
+  } catch {
+    // settings.json 不存在 / JSON 解析失败
+    return { blacklist: [] };
+  }
+}
+
+/** 从 settings.json 读取 tool 黑名单 */
+function loadToolConfig(): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(settingsPath(), "utf-8"));
+    const section = raw.tools as Record<string, unknown> | undefined;
+    if (!section || typeof section !== "object") return [];
+    const bl = section.blacklist;
+    if (!Array.isArray(bl)) return [];
+    return bl.filter((s): s is string => typeof s === "string");
+  } catch {
+    return [];
+  }
+}
+
 interface TaskResolvedConfig {
   model: string;
   thinkingLevel?: string;
@@ -492,6 +632,41 @@ function resolveTaskConfig(
 }
 
 // ---- 后台批量启动（fire-and-forget） ----
+
+interface JobStats {
+  input: number;
+  output: number;
+  cache: number;
+  cost: number;
+  ctxPct: number;
+  ctxWin: number;
+}
+
+function computeJobStats(results: SubResult[]): JobStats {
+  return results.reduce((acc, r) => {
+    if (r.tokens) {
+      acc.input += r.tokens.input;
+      acc.output += r.tokens.output;
+      acc.cache += r.tokens.cache;
+      acc.cost += r.tokens.cost;
+      if (r.tokens.contextPercent !== null) {
+        acc.ctxPct = Math.max(acc.ctxPct, r.tokens.contextPercent);
+      }
+      acc.ctxWin = Math.max(acc.ctxWin, r.tokens.contextWindow);
+    }
+    return acc;
+  }, { input: 0, output: 0, cache: 0, cost: 0, ctxPct: 0, ctxWin: 0 });
+}
+
+function formatJobNotificationLine(jobId: string, results: SubResult[], total: number, elapsed: string): string {
+  const okCount = results.filter((r) => r.ok).length;
+  const failCount = results.filter((r) => !r.ok).length;
+  const totalTokens = computeJobStats(results);
+  const statsPart = totalTokens.input > 0
+    ? ` | 📊 \u2191${fmtNum(totalTokens.input)} \u2193${fmtNum(totalTokens.output)} R${fmtNum(totalTokens.cache)} $${totalTokens.cost < 0.001 ? totalTokens.cost.toExponential(2) : totalTokens.cost.toFixed(3)} ${totalTokens.ctxPct > 0 ? totalTokens.ctxPct.toFixed(1) + "%" : "?%"}${totalTokens.ctxWin > 0 ? "/" + fmtNum(totalTokens.ctxWin) : ""}`
+    : "";
+  return `\u{1f916} [\u5b50\u4efb\u52a1\u5b8c\u6210] Job \`${jobId.slice(0, 8)}\` \u2014 \u2705 ${okCount} / \u274c ${failCount} / \u{1f4ca} ${total} (${elapsed}s)${statsPart}`;
+}
 
 function spawnAllBackground(
   jobId: string,
@@ -607,10 +782,56 @@ function spawnAllBackground(
 
 export default function (pi: ExtensionAPI) {
 
-  // ---- 注册前端消息处理器（仅一次） ----
-  registerFrontendProcessor("steer", async (data) => {
-    const text = data as string;
-    pi.sendUserMessage(text, { deliverAs: "steer" });
+  // ---- 用 globalThis 收子进程消息 + steer 推送（不依赖 pi 实例，重载后仍有效） ----
+  const STEER_KEY = "__pi_pending_steer_msgs";
+  const PENDING_KEY = "__pi_pending_agent_msgs";
+  if (!(globalThis as Record<string, unknown>)[PENDING_KEY]) {
+    (globalThis as Record<string, unknown>)[PENDING_KEY] = [];
+    (globalThis as Record<string, unknown>)[STEER_KEY] = [];
+    onMessage("main", (msg) => {
+      ((globalThis as Record<string, unknown>)[PENDING_KEY] as Array<any>).push({
+        from: msg.from,
+        type: msg.type,
+        payload: msg.payload,
+      });
+    });
+    // steer 队列由 FrontendQueue 的 "steer" 处理器投递
+    // 不用 pi.sendUserMessage（避免闭包持有 stale pi 引用）
+    registerFrontendProcessor("steer", async (data) => {
+      const text = data as string;
+      const q = (globalThis as Record<string, unknown>)[STEER_KEY] as string[];
+      q.push(text);
+    });
+  }
+  const pendingMsgs = (globalThis as Record<string, unknown>)[PENDING_KEY] as Array<{
+    from: string;
+    type: string;
+    payload: string;
+  }>;
+
+  // ---- context 事件注入待收消息 + steer 消息（每次拉取，不缓存 pi 引用） ----
+  pi.on("context", (_event, _ctx) => {
+    // 注入 steer 消息
+    const steerQ = (globalThis as Record<string, unknown>)[STEER_KEY] as string[];
+    const hasSteer = steerQ && steerQ.length > 0;
+    // 注入子进程消息
+    const hasMsgs = pendingMsgs.length > 0;
+    if (!hasSteer && !hasMsgs) return;
+    const parts: string[] = [];
+    if (hasSteer) {
+      const batch = steerQ.splice(0);
+      parts.push(batch.join("\n"));
+    }
+    if (hasMsgs) {
+      const batch = pendingMsgs.splice(0);
+      const lines = batch.map((m) => `[${m.from}] ${m.payload}`);
+      parts.push(`[agent-message]\n${lines.join("\n")}`);
+    }
+    _event.messages.push({
+      role: "user",
+      content: parts.join("\n"),
+    } as any);
+    // 只修改 event.messages 原地，不返回 { messages }，避免与 attention-buffer 冲突
   });
 
   // ==================== 子 Agent 状态面板 Widget ====================
@@ -633,6 +854,20 @@ export default function (pi: ExtensionAPI) {
     bus.on(Events.AGENT_RESUMED, onEvent);
     bus.on(Events.TASK_RESULT, onEvent);
     bus.on(Events.STATUS_CHANGED, onEvent);
+
+    // JOB_COMPLETE：前台通知 + 触发 LLM + 刷新 widget
+    bus.on(Events.JOB_COMPLETE, (data: { jobId: string; job: AgentJob }) => {
+      const completedJob = data.job;
+      const elapsed = completedJob.finishedAt
+        ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
+        : "?";
+      const line = formatJobNotificationLine(completedJob.jobId, completedJob.results, completedJob.total, elapsed);
+      // 通过 sendUserMessage 触发 LLM 下一轮调用（消息固化 + AI 主动处理）
+      try {
+        pi.sendUserMessage(line, { deliverAs: "steer", triggerTurn: true });
+      } catch { /* 非主 session 或已关闭时忽略 */ }
+      refreshWidget();
+    });
 
     // 定时刷新（兜底 outputLength 更新）
     if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
@@ -724,20 +959,20 @@ export default function (pi: ExtensionAPI) {
 
   // ==================== spawn_agent ====================
 
-  // 子 Agent 禁用的工具（防递归、防模型切换）
-  const SUB_AGENT_BLACKLIST = new Set([
+  // 硬编码安全网——这些工具始终不传入子进程（防递归/生命周期冲突）
+  const TOOL_SAFETY_NET: ReadonlySet<string> = new Set([
     "spawn_agent",
     "check_agent_results",
     "control_agent",
-    "send_agent_message",
-    "switch_model",
-    "manage_plan",
   ]);
 
   function getFilteredTools(): string[] {
-    return (pi.getActiveTools?.() ?? []).filter(
-      (t) => !SUB_AGENT_BLACKLIST.has(t),
-    );
+    const configBlacklist = new Set(loadToolConfig());
+    return (pi.getActiveTools?.() ?? []).filter((t) => {
+      if (TOOL_SAFETY_NET.has(t)) return false;
+      if (configBlacklist.has(t)) return false;
+      return true;
+    });
   }
 
   pi.registerTool({
@@ -762,6 +997,9 @@ export default function (pi: ExtensionAPI) {
       "Use tier: \"L2\" for architecture design, cross-module analysis, security review — deepest reasoning.",
       "Override thinking level per task with 'thinkingLevel' (off/minimal/low/medium/high/xhigh).",
       "Task model resolution priority: task.model > task.tier > main agent model.",
+      // ── Skill 按需加载 (v10) ──
+      "Skills passed in spawn_agent are loaded in FULL.",
+      "Skills in the global settings.json skills.blacklist are never loaded.",
       // ── 体验 ──
       "Delegate independent read/search/analysis tasks only. Sub-agents are YOUR workers — dispatch and move on.",
       "FORBIDDEN: Do NOT spawn sub-agents for trivial single-file reads or single kb_search calls. These are faster done directly.",
@@ -856,37 +1094,11 @@ export default function (pi: ExtensionAPI) {
         filteredTools,
       );
 
-      // ---- 自动结果注入：完成时推送结果到主对话（不阻塞） ----
+      // ---- 自动结果注入标记（实际推送由 session_start 的 JOB_COMPLETE 监听负责） ----
       if (autoInject) {
-        onJobComplete(job.jobId, (completedJob) => {
+        onJobComplete(job.jobId, async (completedJob) => {
           if (completedJob._autoInjected) return;
           completedJob._autoInjected = true;
-          const elapsed = completedJob.finishedAt
-            ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
-            : "?";
-          const okCount = completedJob.results.filter((r) => r.ok).length;
-          const failCount = completedJob.results.filter((r) => !r.ok).length;
-
-          // 单行摘要，避免 UI 展开多行
-          const totalTokens = completedJob.results.reduce((acc, r) => {
-            if (r.tokens) {
-              acc.input += r.tokens.input;
-              acc.output += r.tokens.output;
-              acc.cache += r.tokens.cache;
-              acc.cost += r.tokens.cost;
-              if (r.tokens.contextPercent !== null) {
-                acc.ctxPct = Math.max(acc.ctxPct, r.tokens.contextPercent);
-              }
-              acc.ctxWin = Math.max(acc.ctxWin, r.tokens.contextWindow);
-            }
-            return acc;
-          }, { input: 0, output: 0, cache: 0, cost: 0, ctxPct: 0, ctxWin: 0 });
-          const statsPart = totalTokens.input > 0
-            ? ` | 📊 ↑${fmtNum(totalTokens.input)} ↓${fmtNum(totalTokens.output)} R${fmtNum(totalTokens.cache)} $${totalTokens.cost < 0.001 ? totalTokens.cost.toExponential(2) : totalTokens.cost.toFixed(3)} ${totalTokens.ctxPct > 0 ? totalTokens.ctxPct.toFixed(1) + "%" : "?%"}${totalTokens.ctxWin > 0 ? "/" + fmtNum(totalTokens.ctxWin) : ""}`
-            : "";
-          const line = `🤖 [子任务完成] Job \`${job.jobId.slice(0, 8)}\` — ✅ ${okCount} / ❌ ${failCount} / 📊 ${total} (${elapsed}s)${statsPart}`;
-
-          enqueueFrontend("steer", 10, line).catch(() => { /* 队列满/超时，静默丢弃 */ });
         });
       }
 
@@ -1059,10 +1271,16 @@ export default function (pi: ExtensionAPI) {
       type: Type.Optional(StringEnum(["info", "request", "response", "error"] as const)),
       payload: Type.String({ description: "消息内容" }),
     }),
-    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       // AbortSignal: 操作前检查
       if (signal?.aborted) throw new Error("操作已取消");
-      const msgId = sendMessage("main", params.to, params.type ?? "info", params.payload);
+      // 识别消息来源：子 Agent 调用时用 taskId，主 Agent 调用时用 "main"
+      let fromId = "main";
+      if (ctx?.sessionManager) {
+        const id = subAgentIdentity.get(ctx.sessionManager);
+        if (id) fromId = id;
+      }
+      const msgId = sendMessage(fromId, params.to, params.type ?? "info", params.payload);
       return {
         content: [{ type: "text", text: `📨 消息已发送 → ${params.to} (id: ${msgId.slice(0, 8)})` }],
         details: { msgId, to: params.to, type: params.type ?? "info" },
@@ -1281,6 +1499,280 @@ export default function (pi: ExtensionAPI) {
         default:
           return {
             content: [{ type: "text", text: `未知操作: ${action}\n支持: list | status | send | abort | pause | resume | kill | kill_job | save | list_saves | delete_save` }],
+            details: { error: "unknown_action" },
+          };
+      }
+    },
+  });
+
+  // ==================== manage_skills ====================
+
+  pi.registerTool({
+    name: "manage_skills",
+    label: "Manage Skills",
+    description:
+      "管理 skill 黑名单。黑名单中的 skill 完全不会注入子进程。" +
+      "支持添加/移除/列出/覆盖黑名单。修改立即生效，无需 /reload。",
+    promptSnippet: "Manage skill blacklist (add/remove/list/set)",
+    promptGuidelines: [
+      "Use manage_skills to control which skills are banned from sub-agent injection.",
+      "Blacklisted skills are completely hidden — no content injected, not even description.",
+      "Changes take effect immediately, no /reload needed.",
+      "Use 'list' to see current blacklist. Use 'add'/'remove' for incremental changes.",
+      "Use 'set' to replace the entire blacklist at once.",
+      // ── 体验 ──
+      "Prefer 'add'/'remove' for individual changes. Use 'set' only when redefining from a known baseline.",
+    ],
+    parameters: Type.Object({
+      action: Type.String({
+        description: "操作: blacklist_add | blacklist_remove | blacklist_list | blacklist_set",
+      }),
+      skills: Type.Optional(Type.Array(Type.String(), {
+        description: "skill 名称列表（blacklist_add/remove/set 时必填）",
+      })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      // AbortSignal: 操作前检查
+      if (signal?.aborted) throw new Error("操作已取消");
+
+      const { action, skills } = params;
+
+      // 读取当前配置
+      const settingsPath_ = settingsPath();
+      let raw: Record<string, unknown> = {};
+      try {
+        raw = JSON.parse(readFileSync(settingsPath_, "utf-8"));
+      } catch {
+        // settings.json 可能不存在或空，用空对象
+      }
+
+      // 确保 skills 段存在
+      const section = (raw.skills || {}) as Record<string, unknown>;
+      const currentList: string[] = Array.isArray(section.blacklist)
+        ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
+        : [];
+
+      switch (action) {
+        case "blacklist_list": {
+          if (currentList.length === 0) {
+            ctx.ui.notify("📋 黑名单为空，所有 skill 可正常注入", "info");
+            return {
+              content: [{ type: "text", text: "📋 当前 blacklist 为空。" }],
+              details: { action, blacklist: [] },
+            };
+          }
+          const lines = currentList.map((s) => `  🔴 ${s}`);
+          ctx.ui.notify(`📋 黑名单共 ${currentList.length} 条`, "info");
+          return {
+            content: [{ type: "text", text: `📋 当前 blacklist (${currentList.length}):\n${lines.join("\n")}` }],
+            details: { action, blacklist: currentList },
+          };
+        }
+
+        case "blacklist_add": {
+          if (!skills || skills.length === 0) {
+            return { content: [{ type: "text", text: "blacklist_add 需要 skills 参数" }], details: { error: "missing_skills" } };
+          }
+          const toAdd = skills.filter((s) => typeof s === "string" && !currentList.includes(s));
+          if (toAdd.length === 0) {
+            ctx.ui.notify("⚠️ 所有 skill 已在黑名单中", "warning");
+            return {
+              content: [{ type: "text", text: "⚠️ 指定 skill 已在黑名单中，无需重复添加。" }],
+              details: { action, added: [], blacklist: currentList },
+            };
+          }
+          const newList = [...currentList, ...toAdd];
+          raw.skills = { blacklist: newList };
+          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 skill 到黑名单`, "warn");
+          return {
+            content: [{
+              type: "text",
+              text: `🔴 已添加 ${toAdd.length} 个 skill 到黑名单:\n${toAdd.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.map((s) => `  🔴 ${s}`).join("\n")}`,
+            }],
+            details: { action, added: toAdd, blacklist: newList },
+          };
+        }
+
+        case "blacklist_remove": {
+          if (!skills || skills.length === 0) {
+            return { content: [{ type: "text", text: "blacklist_remove 需要 skills 参数" }], details: { error: "missing_skills" } };
+          }
+          const toRemove = skills.filter((s) => currentList.includes(s));
+          if (toRemove.length === 0) {
+            ctx.ui.notify("⚠️ 指定 skill 不在黑名单中", "warning");
+            return {
+              content: [{ type: "text", text: "⚠️ 指定 skill 不在黑名单中，无需移除。" }],
+              details: { action, removed: [], blacklist: currentList },
+            };
+          }
+          const newList = currentList.filter((s) => !toRemove.includes(s));
+          raw.skills = { blacklist: newList };
+          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          ctx.ui.notify(`🟢 已从黑名单移除 ${toRemove.length} 个 skill`, "info");
+          return {
+            content: [{
+              type: "text",
+              text: `🟢 已从黑名单移除 ${toRemove.length} 个 skill:\n${toRemove.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.length > 0 ? newList.map((s) => `  🔴 ${s}`).join("\n") : "  (空)"}`,
+            }],
+            details: { action, removed: toRemove, blacklist: newList },
+          };
+        }
+
+        case "blacklist_set": {
+          if (!skills) {
+            return { content: [{ type: "text", text: "blacklist_set 需要 skills 参数（传空数组 = 清空）" }], details: { error: "missing_skills" } };
+          }
+          const newList = skills.filter((s) => typeof s === "string");
+          raw.skills = { blacklist: newList };
+          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖黑名单: ${newList.length} 条` : "🟢 已清空黑名单", newList.length > 0 ? "warn" : "info");
+          return {
+            content: [{
+              type: "text",
+              text: newList.length > 0
+                ? `🔴 已覆盖黑名单 (${newList.length}):\n${newList.map((s) => `  • ${s}`).join("\n")}`
+                : "🟢 黑名单已清空，所有 skill 可正常注入。",
+            }],
+            details: { action, blacklist: newList },
+          };
+        }
+
+        default:
+          return {
+            content: [{ type: "text", text: `未知操作: ${action}\n支持: blacklist_add | blacklist_remove | blacklist_list | blacklist_set` }],
+            details: { error: "unknown_action" },
+          };
+      }
+    },
+  });
+
+  // ==================== manage_tools ====================
+
+  pi.registerTool({
+    name: "manage_tools",
+    label: "Manage Tools",
+    description:
+      "管理 tool 黑名单。黑名单中的 tool 不会注册到子进程会话，" +
+      "子进程完全不知道该 tool 的存在（无注册指令、无说明内容）。" +
+      "修改立即生效，无需 /reload。\n\n",
+    promptSnippet: "Manage tool blacklist for sub-agents (add/remove/list/set)",
+    promptGuidelines: [
+      "Use manage_tools to control which tools are banned from sub-agent sessions.",
+      "Blacklisted tools are completely hidden from sub-agents:",
+      "  1) Not registered in sub-agent session → cannot be called",
+      "  2) No description/promptGuidelines injected → agent doesn't know it exists",
+      
+      "Changes take effect immediately, no /reload needed.",
+      "Use 'list' to see current config blacklist. Use 'add'/'remove' for incremental changes.",
+      // ── 体验 ──
+      "Recommended defaults: switch_model, manage_plan, manage_skills, manage_tools",
+      "These are management tools that sub-agents should not have access to.",
+    ],
+    parameters: Type.Object({
+      action: Type.String({
+        description: "操作: blacklist_add | blacklist_remove | blacklist_list | blacklist_set",
+      }),
+      tools: Type.Optional(Type.Array(Type.String(), {
+        description: "tool 名称列表（blacklist_add/remove/set 时必填）",
+      })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (signal?.aborted) throw new Error("操作已取消");
+
+      const { action, tools } = params;
+
+      const settingsPath_ = settingsPath();
+      let raw: Record<string, unknown> = {};
+      try {
+        raw = JSON.parse(readFileSync(settingsPath_, "utf-8"));
+      } catch { /* 空对象兜底 */ }
+
+      const section = (raw.tools || {}) as Record<string, unknown>;
+      const currentList: string[] = Array.isArray(section.blacklist)
+        ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
+        : [];
+
+      switch (action) {
+        case "blacklist_list": {
+          if (currentList.length === 0) {
+            ctx.ui.notify("📋 tool 黑名单为空（安全网仍生效）", "info");
+            return {
+              content: [{ type: "text", text: "📋 当前 tool blacklist 为空。\n安全网（始终阻塞）: spawn_agent, check_agent_results, control_agent" }],
+              details: { action, blacklist: [], safetyNet: ["spawn_agent", "check_agent_results", "control_agent"] },
+            };
+          }
+          const lines = currentList.map((s) => `  🔴 ${s}`);
+          ctx.ui.notify(`📋 tool 黑名单共 ${currentList.length} 条`, "info");
+          return {
+            content: [{ type: "text", text: `📋 当前 tool blacklist (${currentList.length}):\n${lines.join("\n")}\n\n安全网（始终阻塞）: spawn_agent, check_agent_results, control_agent` }],
+            details: { action, blacklist: currentList, safetyNet: ["spawn_agent", "check_agent_results", "control_agent"] },
+          };
+        }
+
+        case "blacklist_add": {
+          if (!tools || tools.length === 0) {
+            return { content: [{ type: "text", text: "blacklist_add 需要 tools 参数" }], details: { error: "missing_tools" } };
+          }
+          const toAdd = tools.filter((s) => typeof s === "string" && !currentList.includes(s));
+          if (toAdd.length === 0) {
+            ctx.ui.notify("⚠️ 所有 tool 已在黑名单中", "warning");
+            return {
+              content: [{ type: "text", text: "⚠️ 指定 tool 已在黑名单中，无需重复添加。" }],
+              details: { action, added: [], blacklist: currentList },
+            };
+          }
+          const newList = [...currentList, ...toAdd];
+          raw.tools = { blacklist: newList };
+          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 tool 到黑名单`, "warn");
+          return {
+            content: [{ type: "text", text: `🔴 已添加 ${toAdd.length} 个 tool 到黑名单:\n${toAdd.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.map((s) => `  🔴 ${s}`).join("\n")}` }],
+            details: { action, added: toAdd, blacklist: newList },
+          };
+        }
+
+        case "blacklist_remove": {
+          if (!tools || tools.length === 0) {
+            return { content: [{ type: "text", text: "blacklist_remove 需要 tools 参数" }], details: { error: "missing_tools" } };
+          }
+          const toRemove = tools.filter((s) => currentList.includes(s));
+          if (toRemove.length === 0) {
+            ctx.ui.notify("⚠️ 指定 tool 不在黑名单中", "warning");
+            return {
+              content: [{ type: "text", text: "⚠️ 指定 tool 不在黑名单中，无需移除。" }],
+              details: { action, removed: [], blacklist: currentList },
+            };
+          }
+          const newList = currentList.filter((s) => !toRemove.includes(s));
+          raw.tools = { blacklist: newList };
+          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          ctx.ui.notify(`🟢 已从黑名单移除 ${toRemove.length} 个 tool`, "info");
+          return {
+            content: [{ type: "text", text: `🟢 已从黑名单移除 ${toRemove.length} 个 tool:\n${toRemove.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.length > 0 ? newList.map((s) => `  🔴 ${s}`).join("\n") : "  (空)"}` }],
+            details: { action, removed: toRemove, blacklist: newList },
+          };
+        }
+
+        case "blacklist_set": {
+          if (!tools) {
+            return { content: [{ type: "text", text: "blacklist_set 需要 tools 参数（传空数组 = 清空）" }], details: { error: "missing_tools" } };
+          }
+          const newList = tools.filter((s) => typeof s === "string");
+          raw.tools = { blacklist: newList };
+          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖 tool 黑名单: ${newList.length} 条` : "🟢 已清空 tool 黑名单", newList.length > 0 ? "warn" : "info");
+          return {
+            content: [{ type: "text", text: newList.length > 0
+              ? `🔴 已覆盖 tool 黑名单 (${newList.length}):\n${newList.map((s) => `  • ${s}`).join("\n")}`
+              : "🟢 tool 黑名单已清空（安全网仍生效）。" }],
+            details: { action, blacklist: newList },
+          };
+        }
+
+        default:
+          return {
+            content: [{ type: "text", text: `未知操作: ${action}\n支持: blacklist_add | blacklist_remove | blacklist_list | blacklist_set` }],
             details: { error: "unknown_action" },
           };
       }

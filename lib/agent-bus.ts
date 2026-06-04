@@ -29,29 +29,6 @@ const globalBus: EventEmitter =
     return bus;
   })();
 
-/** 跨 reload 共享状态（globalThis 承载，不随模块重载丢失） */
-interface AgentBusState {
-  jobs: Map<string, AgentJob>;
-  instances: Map<string, AgentInstance>;
-  frontendQueue: FrontendMsg[];
-  frontendProcessors: Map<string, (data: unknown) => Promise<unknown>>;
-  frontendProcessing: boolean;
-}
-
-const state: AgentBusState =
-  ((globalThis as Record<string, unknown>).__pi_agent_state as AgentBusState) ||
-  (() => {
-    const s: AgentBusState = {
-      jobs: new Map(),
-      instances: new Map(),
-      frontendQueue: [],
-      frontendProcessors: new Map(),
-      frontendProcessing: false,
-    };
-    (globalThis as Record<string, unknown>).__pi_agent_state = s;
-    return s;
-  })();
-
 // ---- types ----
 
 export interface SubTask {
@@ -70,15 +47,6 @@ export interface SubResult {
   ok: boolean;
   output?: string;
   error?: string;
-  /** 原生 token 统计（agent_end 时填充） */
-  tokens?: {
-    input: number;
-    output: number;
-    cache: number;
-    cost: number;
-    contextPercent: number | null;
-    contextWindow: number;
-  };
 }
 
 export interface AgentJob {
@@ -141,22 +109,10 @@ export interface AgentInstance {
   outputLength: number;
   /** 子 Agent 使用的模型标识 */
   model?: string;
-  /** 模型层级 (L0/L1/L2) */
-  tier?: string;
-  /** 思考深度 (off/minimal/low/medium/high/xhigh) */
-  thinkingLevel?: string;
   /** 累计输入 token 数 */
   inputTokens: number;
   /** 累计输出 token 数 */
   outputTokens: number;
-  /** 缓存 token（cacheRead + cacheWrite，agent_end 时提取） */
-  cacheTokens: number;
-  /** 费用（美元，agent_end 时提取） */
-  cost: number;
-  /** 上下文占用百分比（agent_end 时快照） */
-  contextPercent: number | null;
-  /** 上下文窗口上限 */
-  contextWindow: number;
   /** 内部：标记外部触发的 abort，阻止 agent_end 自动 finish */
   _abortExternally?: () => void;
   /** 内部：重置超时计时器 */
@@ -165,10 +121,6 @@ export interface AgentInstance {
   _idleTimer?: ReturnType<typeof setTimeout>;
   /** 内部：agent_end 时捕获的消息快照（session dispose 后仍可用） */
   _savedMessages?: AgentMessage[];
-  /** 内部：是否已完成（防重复终止） */
-  _settled?: boolean;
-  /** 内部：统一清理函数（abort + dispose + unregister） */
-  _dispose?: () => Promise<void>;
 }
 
 export interface AgentMessage {
@@ -194,7 +146,10 @@ export const Events = {
   STATUS_CHANGED: "instance:status_changed",
 } as const;
 
-// ---- 存储（通过 globalThis 跨 reload 共享） ----
+// ---- 存储 ----
+
+const jobs = new Map<string, AgentJob>();
+const instances = new Map<string, AgentInstance>(); // key = `${jobId}:${taskId}`
 
 /** 获取全局 EventEmitter（供外部监听） */
 export function getAgentBus(): EventEmitter {
@@ -313,20 +268,20 @@ export function createJob(tasks: SubTask[]): AgentJob {
     status: "dispatched",
     createdAt: Date.now(),
   };
-  state.jobs.set(jobId, job);
+  jobs.set(jobId, job);
   return job;
 }
 
 export function getJob(jobId: string): AgentJob | undefined {
-  return state.jobs.get(jobId);
+  return jobs.get(jobId);
 }
 
 export function listJobs(): AgentJob[] {
-  return Array.from(state.jobs.values());
+  return Array.from(jobs.values());
 }
 
 export function publishTaskResult(jobId: string, result: SubResult): void {
-  const job = state.jobs.get(jobId);
+  const job = jobs.get(jobId);
   if (!job) return;
 
   job.results.push(result);
@@ -346,7 +301,7 @@ export function publishTaskResult(jobId: string, result: SubResult): void {
 }
 
 export function publishJobError(jobId: string, error: string): void {
-  const job = state.jobs.get(jobId);
+  const job = jobs.get(jobId);
   if (!job) return;
   job.status = "error";
   job.finishedAt = Date.now();
@@ -361,34 +316,34 @@ function instanceKey(jobId: string, taskId: string): string {
 
 export function registerInstance(inst: AgentInstance): void {
   const key = instanceKey(inst.jobId, inst.taskId);
-  state.instances.set(key, inst);
+  instances.set(key, inst);
   globalBus.emit(Events.INSTANCE_REGISTERED, { jobId: inst.jobId, taskId: inst.taskId, name: inst.name });
 }
 
 export function unregisterInstance(jobId: string, taskId: string): void {
   const key = instanceKey(jobId, taskId);
-  const inst = state.instances.get(key);
+  const inst = instances.get(key);
   if (inst?._idleTimer) clearTimeout(inst._idleTimer);
-  state.instances.delete(key);
+  instances.delete(key);
   if (inst) {
     globalBus.emit(Events.INSTANCE_UNREGISTERED, { jobId, taskId, name: inst.name });
   }
 }
 
 export function getInstance(jobId: string, taskId: string): AgentInstance | undefined {
-  return state.instances.get(instanceKey(jobId, taskId));
+  return instances.get(instanceKey(jobId, taskId));
 }
 
 export function getJobInstances(jobId: string): AgentInstance[] {
   const prefix = `${jobId}:`;
-  return Array.from(state.instances.entries())
+  return Array.from(instances.entries())
     .filter(([k]) => k.startsWith(prefix))
     .map(([, v]) => v);
 }
 
 /** 列出所有 Agent 实例 */
 export function listInstances(): AgentInstance[] {
-  return Array.from(state.instances.values());
+  return Array.from(instances.values());
 }
 
 /**
@@ -405,14 +360,10 @@ export function updateInstanceStatus(
     outputLength?: number;
     inputTokens?: number;
     outputTokens?: number;
-    cacheTokens?: number;
-    cost?: number;
-    contextPercent?: number | null;
-    contextWindow?: number;
   },
 ): void {
   const key = instanceKey(jobId, taskId);
-  const inst = state.instances.get(key);
+  const inst = instances.get(key);
   if (!inst) return;
 
   if (update.detailedStatus !== undefined) {
@@ -442,18 +393,6 @@ export function updateInstanceStatus(
   if (update.outputTokens !== undefined) {
     inst.outputTokens = update.outputTokens;
   }
-  if (update.cacheTokens !== undefined) {
-    inst.cacheTokens = update.cacheTokens;
-  }
-  if (update.cost !== undefined) {
-    inst.cost = update.cost;
-  }
-  if (update.contextPercent !== undefined) {
-    inst.contextPercent = update.contextPercent;
-  }
-  if (update.contextWindow !== undefined) {
-    inst.contextWindow = update.contextWindow;
-  }
   inst.lastActivityAt = Date.now();
 
   globalBus.emit(Events.STATUS_CHANGED, {
@@ -467,29 +406,26 @@ export function updateInstanceStatus(
 
 // ---- Agent 控制操作 ----
 
-/** 杀死子 Agent（统一走 _dispose 生命周期清理，兜底处理旧版 buggy _dispose） */
+/** 杀死子 Agent（abort + dispose + unregister + 标记失败） */
 export async function killAgent(jobId: string, taskId: string): Promise<boolean> {
   const inst = getInstance(jobId, taskId);
   if (!inst) return false;
 
-  // 尝试新版 _dispose（内部调用 finish → unregisterInstance）
-  if (inst._dispose) {
-    try { await inst._dispose(); } catch { /* */ }
-  }
+  try {
+    await inst.session.abort();
+  } catch (e) { console.warn("[agent-bus] killAgent abort 失败:", e); }
+  try {
+    inst.session.dispose();
+  } catch (e) { console.warn("[agent-bus] killAgent dispose 失败:", e); }
 
-  // 兜底：如果 _dispose 没有清理掉实例（旧版 bug），手动清理
-  if (getInstance(jobId, taskId)) {
-    try { await inst.session.abort(); } catch { /* */ }
-    try { inst.session.dispose(); } catch { /* */ }
-    unregisterInstance(jobId, taskId);
-    publishTaskResult(jobId, {
-      id: taskId,
-      name: inst.name,
-      order: 0,
-      ok: false,
-      error: "killed by main agent",
-    });
-  }
+  unregisterInstance(jobId, taskId);
+  publishTaskResult(jobId, {
+    id: taskId,
+    name: inst.name,
+    order: 0,
+    ok: false,
+    error: "killed by main agent",
+  });
   return true;
 }
 
@@ -501,7 +437,7 @@ export async function killJob(jobId: string): Promise<number> {
     if (await killAgent(jobId, inst.taskId)) count++;
   }
   // 标记 job 为 killed
-  const job = state.jobs.get(jobId);
+  const job = jobs.get(jobId);
   if (job) {
     job.status = "killed";
     job.finishedAt = Date.now();
@@ -614,7 +550,7 @@ export function onJobComplete(
   jobId: string,
   callback: (job: AgentJob) => void,
 ): () => void {
-  const existing = state.jobs.get(jobId);
+  const existing = jobs.get(jobId);
   if (
     existing &&
     (existing.status === "complete" ||
@@ -629,7 +565,7 @@ export function onJobComplete(
     if (data.jobId !== jobId) return;
     globalBus.off(Events.JOB_COMPLETE, handler);
     globalBus.off(Events.JOB_ERROR, errorHandler);
-    const job = state.jobs.get(jobId);
+    const job = jobs.get(jobId);
     if (job) callback(job);
   };
 
@@ -637,7 +573,7 @@ export function onJobComplete(
     if (data.jobId !== jobId) return;
     globalBus.off(Events.JOB_COMPLETE, handler);
     globalBus.off(Events.JOB_ERROR, errorHandler);
-    const job = state.jobs.get(jobId);
+    const job = jobs.get(jobId);
     if (job) callback(job);
   };
 
@@ -652,7 +588,7 @@ export function onJobComplete(
 // ---- 等待（阻塞式，仅用于 check_agent_results 兼容） ----
 
 export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: AbortSignal): Promise<AgentJob> {
-  const job = state.jobs.get(jobId);
+  const job = jobs.get(jobId);
   if (job && (job.status === "complete" || job.status === "error" || job.status === "killed")) {
     return Promise.resolve(job);
   }
@@ -660,7 +596,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
   return new Promise((resolve) => {
     // AbortSignal 支持
     if (signal?.aborted) {
-      const j = state.jobs.get(jobId);
+      const j = jobs.get(jobId);
       resolve(j ?? { jobId, tasks: [], total: 0, completed: 0, results: [], status: "error", createdAt: 0, finishedAt: Date.now() });
       return;
     }
@@ -668,7 +604,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
       clearTimeout(timer);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
-      const j = state.jobs.get(jobId);
+      const j = jobs.get(jobId);
       resolve(j ?? { jobId, tasks: [], total: 0, completed: 0, results: [], status: "error", createdAt: 0, finishedAt: Date.now() });
     };
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -677,7 +613,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
       signal?.removeEventListener("abort", onAbort);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
-      const j = state.jobs.get(jobId);
+      const j = jobs.get(jobId);
       resolve(
         j ?? {
           jobId,
@@ -698,7 +634,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
       signal?.removeEventListener("abort", onAbort);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
-      resolve(state.jobs.get(jobId)!);
+      resolve(jobs.get(jobId)!);
     };
 
     const onError = (data: { jobId: string }) => {
@@ -707,7 +643,7 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
       signal?.removeEventListener("abort", onAbort);
       globalBus.off(Events.JOB_COMPLETE, onComplete);
       globalBus.off(Events.JOB_ERROR, onError);
-      resolve(state.jobs.get(jobId)!);
+      resolve(jobs.get(jobId)!);
     };
 
     globalBus.once(Events.JOB_COMPLETE, onComplete);
@@ -719,135 +655,20 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
 
 export function cleanupJobs(maxAge: number = 600_000): void {
   const now = Date.now();
-  for (const [id, job] of state.jobs) {
+  for (const [id, job] of jobs) {
     if (
       (job.status === "complete" || job.status === "error" || job.status === "killed") &&
       job.finishedAt &&
       now - job.finishedAt > maxAge
     ) {
-      state.jobs.delete(id);
+      jobs.delete(id);
     }
   }
   // 清理僵尸实例（关联 job 已不存在的）
-  for (const [key, inst] of state.instances) {
-    if (!state.jobs.has(inst.jobId)) {
+  for (const [key, inst] of instances) {
+    if (!jobs.has(inst.jobId)) {
       try { inst.session.dispose(); } catch (e) { console.warn("[agent-bus] cleanupJobs dispose 失败:", e); }
-      state.instances.delete(key);
+      instances.delete(key);
     }
   }
-}
-
-// ============================================================================
-// FrontendQueue — 统一前端消息队列（游标式串行处理）
-// ============================================================================
-
-interface FrontendMsg {
-  id: string;
-  type: "confirm" | "steer";
-  priority: number; // 越小越优先
-  data: unknown;
-  status: "pending" | "processing" | "done" | "timeout";
-  createdAt: number;
-  timeoutMs: number;
-  resolve: (value: unknown) => void;
-  reject: (err: Error) => void;
-  timer?: ReturnType<typeof setTimeout>;
-}
-
-const FRONTEND_MAX_QUEUE = 20;
-
-// state.frontendQueue, state.frontendProcessors, state.frontendProcessing 已在顶部 state 对象中
-
-/** 注册消息处理器（confirm / steer 各注册一次） */
-export function registerFrontendProcessor(
-  type: string,
-  processor: (data: unknown) => Promise<unknown>,
-): void {
-  state.frontendProcessors.set(type, processor);
-}
-
-/** 入队：返回 Promise，溢出/超时时 reject */
-export function enqueueFrontend(
-  type: "confirm" | "steer",
-  priority: number,
-  data: unknown,
-  timeoutMs: number = 60_000,
-): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    // 容量检查：快速失败
-    if (state.frontendQueue.length >= FRONTEND_MAX_QUEUE) {
-      reject(new Error(`FrontendQueue overflow (${FRONTEND_MAX_QUEUE} max)`));
-      return;
-    }
-
-    const msg: FrontendMsg = {
-      id: randomUUID(),
-      type,
-      priority,
-      data,
-      status: "pending",
-      createdAt: Date.now(),
-      timeoutMs,
-      resolve,
-      reject,
-    };
-
-    // 超时定时器
-    msg.timer = setTimeout(() => {
-      if (msg.status === "pending") {
-        msg.status = "timeout";
-        reject(new Error(`FrontendQueue timeout (${timeoutMs}ms)`));
-        // 从队列移除
-        const idx = state.frontendQueue.findIndex((m) => m.id === msg.id);
-        if (idx !== -1) state.frontendQueue.splice(idx, 1);
-      }
-    }, timeoutMs);
-
-    state.frontendQueue.push(msg);
-    // 按优先级排序（越小越前）
-    state.frontendQueue.sort((a, b) => a.priority - b.priority);
-
-    // 事件驱动：尝试推进（不在处理中则立即开始）
-    processFrontendNext();
-  });
-}
-
-/** 完成当前消息，游标推进 */
-function completeFrontendMsg(msgId: string, result?: unknown): void {
-  const idx = state.frontendQueue.findIndex((m) => m.id === msgId);
-  if (idx === -1) return;
-  const msg = state.frontendQueue[idx];
-  if (msg.timer) clearTimeout(msg.timer);
-  state.frontendQueue.splice(idx, 1);
-  state.frontendProcessing = false;
-  msg.resolve(result);
-  processFrontendNext();
-}
-
-/** 处理下一个 pending 消息 */
-function processFrontendNext(): void {
-  if (state.frontendProcessing) return;
-  const next = state.frontendQueue.find((m) => m.status === "pending");
-  if (!next) return;
-
-  const processor = state.frontendProcessors.get(next.type);
-  if (!processor) {
-    // 无处理器 → 跳过
-    completeFrontendMsg(next.id);
-    return;
-  }
-
-  state.frontendProcessing = true;
-  next.status = "processing";
-
-  processor(next.data)
-    .then((result) => completeFrontendMsg(next.id, result))
-    .catch((err) => {
-      // 处理器失败也继续推进
-      if (next.timer) clearTimeout(next.timer);
-      state.frontendQueue.splice(state.frontendQueue.indexOf(next), 1);
-      state.frontendProcessing = false;
-      next.reject(err);
-      processFrontendNext();
-    });
 }

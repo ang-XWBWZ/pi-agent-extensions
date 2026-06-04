@@ -1,4 +1,4 @@
-/**
+﻿/**
  * model-switch.ts — 模型切换 + 模型分级系统 v4.0
  *
  * 从零配置: 无配置=无分级，通过命令/工具动态搭建 L0/L1/L2。
@@ -214,6 +214,7 @@ export default function (pi: ExtensionAPI) {
   // ---- session_start ----
   pi.on("session_start", async (_e, ctx) => {
     refreshConfig();
+
     if (ctx.sessionManager.getBranch().some((e: { type: string }) => e.type === "model_change")) return;
 
     const s = readSettings();
@@ -221,15 +222,40 @@ export default function (pi: ExtensionAPI) {
     const m = s[KEY_MODEL] as string | undefined;
     const tk = s[KEY_TIER] as string | undefined;
 
-    if (p && m) {
-      const t = ctx.modelRegistry.find(p, m);
-      if (t) { defaultRef = { provider: p, model: m }; await pi.setModel(t); currentTier = getCurrentTier(p, m, tierConfig); statusLine(ctx); return; }
-    }
-    if (tk && ["L0", "L1", "L2"].includes(tk)) {
-      const r = resolveTierModel(tk as TierKey, tierConfig, ctx.modelRegistry);
-      if (r) {
-        const t = ctx.modelRegistry.find(r.provider, r.model);
-        if (t) { await pi.setModel(t); currentTier = tk as TierKey; applyThinking(currentTier); statusLine(ctx); }
+    const restoreConfiguredModel = async (): Promise<boolean> => {
+      if (p && m) {
+        const t = ctx.modelRegistry.find(p, m);
+        if (t) {
+          defaultRef = { provider: p, model: m };
+          await pi.setModel(t);
+          currentTier = getCurrentTier(p, m, tierConfig);
+          if (currentTier) applyThinking(currentTier);
+          statusLine(ctx);
+          return true;
+        }
+      }
+      if (tk && ["L0", "L1", "L2"].includes(tk)) {
+        const r = resolveTierModel(tk as TierKey, tierConfig, ctx.modelRegistry);
+        if (r) {
+          const t = ctx.modelRegistry.find(r.provider, r.model);
+          if (t) {
+            await pi.setModel(t);
+            currentTier = tk as TierKey;
+            applyThinking(currentTier);
+            statusLine(ctx);
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    if (!(await restoreConfiguredModel())) {
+      // Custom provider models may not be registered yet (provider-manager
+      // runs session_start in parallel). Retry with backoff.
+      for (const delay of [200, 500, 1000]) {
+        await new Promise((r) => setTimeout(r, delay));
+        if (await restoreConfiguredModel()) break;
       }
     }
   });
@@ -475,19 +501,21 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "switch_model",
     label: "Switch Model",
-    description: "切换模型/查看列表/tier管理/思考深度。",
+    description: "切换模型、查看模型列表、管理模型层级和思考深度。",
     promptSnippet: "List/switch models; manage tier config; set thinking level",
     promptGuidelines: [
       "Without args: list models grouped by configured tiers.",
       "With provider+model: switch to that model.",
       "With tier: switch to tier's model + thinking level.",
-      "With action: manage tier config (add_to_tier/remove_from_tier/set_tier_thinking/show_tier_config).",
+      "With action: manage tier config.",
+      "  add_to_tier / remove_from_tier / set_tier_thinking / show_tier_config: manage model tiers.",
       "With thinkingLevel alone: set main thinking level.",
       "Tiers must be configured first via action=add_to_tier.",
+      "Use manage_providers for custom provider registration/removal/listing.",
     ],
     parameters: Type.Object({
-      provider: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String()),
+      provider: Type.Optional(Type.String({ description: "模型 provider" })),
+      model: Type.Optional(Type.String({ description: "模型 ID" })),
       tier: Type.Optional(Type.String({ description: "L0|L1|L2" })),
       action: Type.Optional(Type.String({ description: "add_to_tier|remove_from_tier|set_tier_thinking|show_tier_config" })),
       thinkingLevel: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh" })),
@@ -576,7 +604,11 @@ export default function (pi: ExtensionAPI) {
         const t = ctx.modelRegistry.find(params.provider, params.model);
         if (!t) return { content: [{ type: "text", text: `Model not found` }], details: {} };
         const ok = await pi.setModel(t);
-        if (ok) { currentTier = getCurrentTier(params.provider, params.model, tierConfig); }
+        if (ok) {
+          currentTier = getCurrentTier(params.provider, params.model, tierConfig);
+          // 自动应用层级默认思考深度
+          if (currentTier) applyThinking(currentTier);
+        }
         return { content: [{ type: "text", text: ok ? `Switched to ${params.provider}/${params.model}` : "Failed" }], details: {} };
       }
 
