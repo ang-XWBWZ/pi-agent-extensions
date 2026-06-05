@@ -229,6 +229,85 @@ function createOpenAITolerantStream() {
         const toolCallBlocksByIndex = new Map<number, any>();
 
         const getIdx = (b: any) => output.content.indexOf(b);
+        const ensureTextBlock = () => {
+          if (!textBlock) {
+            textBlock = { type: "text", text: "" };
+            output.content.push(textBlock);
+            outer.push({ type: "text_start", contentIndex: getIdx(textBlock), partial: output });
+          }
+          return textBlock;
+        };
+        const ensureThinkingBlock = (signature: string) => {
+          if (!thinkingBlock) {
+            thinkingBlock = { type: "thinking", thinking: "", thinkingSignature: signature };
+            output.content.push(thinkingBlock);
+            outer.push({ type: "thinking_start", contentIndex: getIdx(thinkingBlock), partial: output });
+          }
+          return thinkingBlock;
+        };
+        const emitNonStreamingFallback = async (): Promise<string | null> => {
+          const fallbackBody = { ...reqBody, stream: false };
+          delete fallbackBody.stream_options;
+          const fallbackHeaders = { ...reqHeaders, Accept: "application/json" };
+          const fallbackResponse = await fetch(url, {
+            method: "POST",
+            headers: fallbackHeaders,
+            body: JSON.stringify(fallbackBody),
+            signal: controller.signal,
+          });
+          if (!fallbackResponse.ok) {
+            const errText = await fallbackResponse.text().catch(() => "Unknown error");
+            throw new Error(`API request failed: ${fallbackResponse.status} - ${errText.slice(0, 500)}`);
+          }
+
+          const data: any = await fallbackResponse.json();
+          if (data.usage) {
+            output.usage = {
+              input: data.usage.prompt_tokens ?? 0,
+              output: data.usage.completion_tokens ?? 0,
+              cacheRead: data.usage.prompt_tokens_details?.cached_tokens ?? 0,
+              cacheWrite: data.usage.prompt_tokens_details?.cache_write_tokens ?? 0,
+              totalTokens: data.usage.total_tokens ?? 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            };
+          }
+
+          const choice = data.choices?.[0];
+          const message = choice?.message;
+          if (!message) return choice?.finish_reason ?? null;
+
+          for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+            const val = message[field];
+            if (typeof val === "string" && val.length > 0) {
+              const block = ensureThinkingBlock(field);
+              block.thinking += val;
+              outer.push({ type: "thinking_delta", contentIndex: getIdx(block), delta: val, partial: output });
+              break;
+            }
+          }
+
+          if (typeof message.content === "string" && message.content.length > 0) {
+            const block = ensureTextBlock();
+            block.text += message.content;
+            outer.push({ type: "text_delta", contentIndex: getIdx(block), delta: message.content, partial: output });
+          }
+
+          if (Array.isArray(message.tool_calls)) {
+            for (const tc of message.tool_calls) {
+              const block = {
+                type: "toolCall",
+                id: tc.id || ensureToolCallId(tc),
+                name: tc.function?.name || "",
+                arguments: parseToolArguments(tc.function?.arguments),
+              };
+              toolCallBlocks.push(block);
+              output.content.push(block);
+              outer.push({ type: "toolcall_start", contentIndex: getIdx(block), partial: output });
+            }
+          }
+
+          return choice?.finish_reason ?? (output.content.length > 0 ? "stop" : null);
+        };
 
         outer.push({ type: "start", partial: output });
 
@@ -272,13 +351,9 @@ function createOpenAITolerantStream() {
             for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
               const val = delta[field];
               if (typeof val === "string" && val.length > 0) {
-                if (!thinkingBlock) {
-                  thinkingBlock = { type: "thinking", thinking: "", thinkingSignature: field };
-                  output.content.push(thinkingBlock);
-                  outer.push({ type: "thinking_start", contentIndex: getIdx(thinkingBlock), partial: output });
-                }
-                thinkingBlock.thinking += val;
-                outer.push({ type: "thinking_delta", contentIndex: getIdx(thinkingBlock), delta: val, partial: output });
+                const block = ensureThinkingBlock(field);
+                block.thinking += val;
+                outer.push({ type: "thinking_delta", contentIndex: getIdx(block), delta: val, partial: output });
                 break;
               }
             }
@@ -286,13 +361,9 @@ function createOpenAITolerantStream() {
             // content → text block
             const content = delta.content;
             if (typeof content === "string" && content.length > 0) {
-              if (!textBlock) {
-                textBlock = { type: "text", text: "" };
-                output.content.push(textBlock);
-                outer.push({ type: "text_start", contentIndex: getIdx(textBlock), partial: output });
-              }
-              textBlock.text += content;
-              outer.push({ type: "text_delta", contentIndex: getIdx(textBlock), delta: content, partial: output });
+              const block = ensureTextBlock();
+              block.text += content;
+              outer.push({ type: "text_delta", contentIndex: getIdx(block), delta: content, partial: output });
             }
 
             // tool_calls
@@ -322,6 +393,20 @@ function createOpenAITolerantStream() {
         // 收尾
         clearTimeout(timeoutId);
 
+        const hasOutput = !!thinkingBlock || !!textBlock || toolCallBlocks.length > 0;
+
+        // 补 finish_reason
+        if (!hasFinishReason) {
+          if (hasOutput) {
+            finishReason = "stop";
+          } else {
+            finishReason = await emitNonStreamingFallback();
+            if (!finishReason && output.content.length === 0) {
+              throw new Error("Stream ended without finish_reason and no content");
+            }
+          }
+        }
+
         if (thinkingBlock) {
           outer.push({ type: "thinking_end", contentIndex: getIdx(thinkingBlock), content: thinkingBlock.thinking, partial: output });
         }
@@ -331,17 +416,6 @@ function createOpenAITolerantStream() {
         for (const b of toolCallBlocks) {
           delete (b as any).partialArgs;
           outer.push({ type: "toolcall_end", contentIndex: getIdx(b), toolCall: b, partial: output });
-        }
-
-        const hasOutput = !!thinkingBlock || !!textBlock || toolCallBlocks.length > 0;
-
-        // 补 finish_reason
-        if (!hasFinishReason) {
-          if (hasOutput) {
-            finishReason = "stop";
-          } else {
-            throw new Error("Stream ended without finish_reason and no content");
-          }
         }
 
         let mapped: string = "stop";
@@ -374,8 +448,10 @@ function createOpenAITolerantStream() {
  */
 function convertMessagesForUpstream(messages: any[], _model: any): any[] {
   const result: any[] = [];
+  const normalizedMessages = normalizeMessagesForUpstream(messages);
+  const requiresReasoningContent = !!_model?.reasoning && /deepseek/i.test(`${_model?.provider || ""}/${_model?.id || ""}/${_model?.baseUrl || ""}`);
 
-  for (const msg of messages) {
+  for (const msg of normalizedMessages) {
     if (!msg || !msg.role) continue;
 
     if (msg.role === "user") {
@@ -401,13 +477,16 @@ function convertMessagesForUpstream(messages: any[], _model: any): any[] {
       const thinkingParts = (msg.content || [])
         .filter((b: any) => b?.type === "thinking" && b.thinking?.trim()?.length > 0);
 
-      const assistantMsg: any = { role: "assistant" };
+      const assistantMsg: any = {
+        role: "assistant",
+        ...(requiresReasoningContent ? { id: messageIdForUpstream(msg, result.length) } : {}),
+      };
 
       if (toolCalls.length > 0) {
         assistantMsg.tool_calls = toolCalls.map((tc: any) => ({
-          id: (tc.id && String(tc.id)) || `call_${tc.name || "fn"}_${Math.random().toString(36).slice(2, 8)}`,
+          id: ensureToolCallId(tc),
           type: "function",
-          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+          function: { name: tc.name || "tool", arguments: JSON.stringify(tc.arguments ?? {}) },
         }));
         assistantMsg.content = textParts.length > 0 ? textParts.join("\n") : null;
       } else if (textParts.length > 0) {
@@ -416,6 +495,10 @@ function convertMessagesForUpstream(messages: any[], _model: any): any[] {
         assistantMsg.content = thinkingParts.map((b: any) => b.thinking).join("\n");
       } else {
         continue; // empty
+      }
+
+      if (requiresReasoningContent && assistantMsg.reasoning_content === undefined) {
+        assistantMsg.reasoning_content = "";
       }
 
       result.push(assistantMsg);
@@ -435,6 +518,7 @@ function convertMessagesForUpstream(messages: any[], _model: any): any[] {
       }
       result.push({
         role: "tool",
+        ...(requiresReasoningContent ? { id: String(toolCallId) } : {}),
         content: content || "(no result)",
         tool_call_id: toolCallId,
         ...(msg.toolName ? { name: msg.toolName } : {}),
@@ -453,6 +537,102 @@ function convertMessagesForUpstream(messages: any[], _model: any): any[] {
   }
 
   return result;
+}
+
+function normalizeMessagesForUpstream(messages: any[]): any[] {
+  const result: any[] = [];
+  let pendingToolCalls: any[] = [];
+  let existingToolResultIds = new Set<string>();
+
+  const insertSyntheticToolResults = () => {
+    if (pendingToolCalls.length === 0) return;
+    for (const tc of pendingToolCalls) {
+      const id = ensureToolCallId(tc);
+      if (!existingToolResultIds.has(id)) {
+        result.push({
+          role: "toolResult",
+          toolCallId: id,
+          toolName: tc.name,
+          content: [{ type: "text", text: "No result provided" }],
+          isError: true,
+          timestamp: Date.now(),
+        });
+      }
+    }
+    pendingToolCalls = [];
+    existingToolResultIds = new Set();
+  };
+
+  for (const msg of messages || []) {
+    if (!msg || !msg.role) continue;
+
+    if (msg.role === "assistant") {
+      insertSyntheticToolResults();
+      if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
+
+      const content = Array.isArray(msg.content) ? msg.content : [];
+      const toolCalls = content
+        .filter((b: any) => b?.type === "toolCall")
+        .map((tc: any, idx: number) => ({ ...tc, id: ensureToolCallId(tc, idx) }));
+      const normalizedContent = content.map((b: any) => {
+        if (b?.type !== "toolCall") return b;
+        const matched = toolCalls.shift();
+        return matched ?? b;
+      });
+      const normalizedMsg = { ...msg, content: normalizedContent };
+      const normalizedToolCalls = normalizedContent.filter((b: any) => b?.type === "toolCall");
+      if (normalizedToolCalls.length > 0) {
+        pendingToolCalls = normalizedToolCalls;
+        existingToolResultIds = new Set();
+      }
+      result.push(normalizedMsg);
+      continue;
+    }
+
+    if (msg.role === "toolResult") {
+      const toolCallId = msg.toolCallId || msg.tool_call_id;
+      if (toolCallId) existingToolResultIds.add(String(toolCallId));
+      result.push(msg);
+      continue;
+    }
+
+    if (msg.role === "user") {
+      insertSyntheticToolResults();
+      result.push(msg);
+      continue;
+    }
+
+    result.push(msg);
+  }
+
+  insertSyntheticToolResults();
+  return result;
+}
+
+function ensureToolCallId(tc: any, index: number = 0): string {
+  if (tc?.id) return String(tc.id);
+  const rawName = String(tc?.name || tc?.function?.name || "tool").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `call_${rawName || "tool"}_${index}`;
+}
+
+function messageIdForUpstream(msg: any, index: number): string {
+  if (msg?.id) return String(msg.id);
+  if (typeof msg?.timestamp === "number") return `msg_${msg.timestamp}`;
+  const role = String(msg?.role || "message").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `msg_${role}_${index}`;
+}
+
+function parseToolArguments(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 async function testProviderConnection(
@@ -681,8 +861,7 @@ function registerCustomProvider(
   });
 }
 
-export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async () => {
+function restoreCustomProviders(pi: ExtensionAPI): void {
     const customProviders = readCustomProviders();
     for (const [name, cfg] of Object.entries(customProviders)) {
       try {
@@ -699,6 +878,13 @@ export default function (pi: ExtensionAPI) {
         // Skip failed re-registrations; the manage_providers tool can report persisted entries.
       }
     }
+}
+
+export default function (pi: ExtensionAPI) {
+  restoreCustomProviders(pi);
+
+  pi.on("session_start", async () => {
+    restoreCustomProviders(pi);
   });
 
   pi.registerTool({

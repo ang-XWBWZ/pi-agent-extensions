@@ -4,7 +4,7 @@
 
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { getSemanticEnabled, getEmbeddings, setEmbeddings, getChunkInfo, setChunkInfo } from "./store.js";
+import { getSemanticEnabled, getEmbeddings, setEmbeddings, getChunkInfo, setChunkInfo, setCentroid } from "./store.js";
 import { getCurrentModel } from "./model-registry.js";
 import { initialize, isAvailable, embed } from "./embedder.js";
 import { extractChunksAST } from "./ast-chunker.js";
@@ -211,6 +211,8 @@ export async function generateEmbeddings(
     setChunkInfo(chunkInfo);
   }
 
+  recomputeCentroid();
+
   // v5.4: 为所有文件补充 manifest（未重新 embed 的无记录文件也补上）
   for (const entry of entries) {
     if (!getFileState(entry.relPath)) {
@@ -269,9 +271,24 @@ export async function embedSingleFile(
       const model = getCurrentModel();
       setEmbeddings(existing, model.hfRepo, model.dim);
       setChunkInfo(chunkInfo);
+      recomputeCentroid();
     }
     return ok;
   } catch {
     return false;
   }
+}
+
+/** 计算全部向量的均值（噪声基底），供语义搜索降噪 */
+export function recomputeCentroid(): void {
+  const embeddings = getEmbeddings();
+  const vectors = Object.values(embeddings);
+  if (vectors.length === 0) return;
+  const dim = vectors[0].length;
+  const centroid = new Array(dim).fill(0);
+  for (const vec of vectors) {
+    for (let i = 0; i < dim; i++) centroid[i] += vec[i];
+  }
+  for (let i = 0; i < dim; i++) centroid[i] /= vectors.length;
+  setCentroid(centroid);
 }
