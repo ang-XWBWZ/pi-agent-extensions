@@ -7,6 +7,7 @@
  */
 
 import {
+  calculateCost,
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import type {
@@ -26,7 +27,7 @@ interface CustomProviderEntry {
   baseUrl: string;
   apiKey: string;
   apiStyle: "openai" | "anthropic";
-  models: Array<{ id: string; name: string }>;
+  models: DiscoveredModel[];
   createdAt: number;
   /** 旧字段兼容：customStream 被 streamCompatMode 替代 */
   customStream?: boolean;
@@ -38,6 +39,7 @@ interface CustomProviderEntry {
 interface DiscoveredModel {
   id: string;
   name: string;
+  reasoning?: boolean;
 }
 
 interface TestResult {
@@ -48,6 +50,7 @@ interface TestResult {
 }
 
 const CUSTOM_PROVIDERS_KEY = "customProviders";
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 
 function sp(): string {
   return path.join(process.env.USERPROFILE ?? ".", ".pi", "agent", "settings.json");
@@ -78,7 +81,7 @@ function readCustomProviders(): Record<string, CustomProviderEntry> {
         baseUrl: v.baseUrl,
         apiKey: v.apiKey,
         apiStyle: (v.apiStyle as "openai" | "anthropic") || "openai",
-        models: Array.isArray(v.models) ? (v.models as Array<{ id: string; name: string }>) : [],
+        models: Array.isArray(v.models) ? (v.models as DiscoveredModel[]) : [],
         createdAt: (v.createdAt as number) || Date.now(),
         customStream: v.customStream === true,
         customStreamExplicit: v.customStreamExplicit === true,
@@ -103,6 +106,31 @@ function normalizeBaseUrl(url: string): string {
   let u = url.replace(/\/+$/, "");
   u = u.replace(/\/v1$/, "");
   return u;
+}
+
+function clampOpenAIPromptCacheKey(key: string | undefined): string | undefined {
+  if (key === undefined) return undefined;
+  const chars = Array.from(key);
+  if (chars.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) return key;
+  return chars.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).join("");
+}
+
+function parseOpenAIUsage(rawUsage: any, model: Model<Api>): AssistantMessage["usage"] {
+  const promptTokens = rawUsage?.prompt_tokens ?? 0;
+  const outputTokens = rawUsage?.completion_tokens ?? 0;
+  const cacheReadTokens = rawUsage?.prompt_tokens_details?.cached_tokens ?? rawUsage?.prompt_cache_hit_tokens ?? 0;
+  const cacheWriteTokens = rawUsage?.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+  const usage: AssistantMessage["usage"] = {
+    input,
+    output: outputTokens,
+    cacheRead: cacheReadTokens,
+    cacheWrite: cacheWriteTokens,
+    totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  calculateCost(model, usage);
+  return usage;
 }
 
 /**
@@ -156,6 +184,16 @@ function createOpenAITolerantStream() {
           max_tokens: options?.maxTokens || model.maxTokens || 4096,
         };
 
+        const cacheRetention = options?.cacheRetention || "short";
+        const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
+        const promptCacheKey = clampOpenAIPromptCacheKey(cacheSessionId);
+        if (promptCacheKey) {
+          reqBody.prompt_cache_key = promptCacheKey;
+        }
+        if (cacheRetention === "long") {
+          reqBody.prompt_cache_retention = "24h";
+        }
+
         if (options?.temperature !== undefined) {
           reqBody.temperature = options.temperature;
         }
@@ -203,6 +241,11 @@ function createOpenAITolerantStream() {
           Accept: "text/event-stream",
           ...(options?.headers || {}),
         };
+        if (cacheSessionId) {
+          reqHeaders.session_id = reqHeaders.session_id ?? cacheSessionId;
+          reqHeaders["x-client-request-id"] = reqHeaders["x-client-request-id"] ?? cacheSessionId;
+          reqHeaders["x-session-affinity"] = reqHeaders["x-session-affinity"] ?? cacheSessionId;
+        }
 
         const response = await fetch(url, {
           method: "POST",
@@ -262,14 +305,7 @@ function createOpenAITolerantStream() {
 
           const data: any = await fallbackResponse.json();
           if (data.usage) {
-            output.usage = {
-              input: data.usage.prompt_tokens ?? 0,
-              output: data.usage.completion_tokens ?? 0,
-              cacheRead: data.usage.prompt_tokens_details?.cached_tokens ?? 0,
-              cacheWrite: data.usage.prompt_tokens_details?.cache_write_tokens ?? 0,
-              totalTokens: data.usage.total_tokens ?? 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            };
+            output.usage = parseOpenAIUsage(data.usage, model);
           }
 
           const choice = data.choices?.[0];
@@ -326,14 +362,7 @@ function createOpenAITolerantStream() {
             try { data = JSON.parse(trimmed.slice(6)); } catch { continue; }
 
             if (data.usage) {
-              output.usage = {
-                input: data.usage.prompt_tokens ?? 0,
-                output: data.usage.completion_tokens ?? 0,
-                cacheRead: data.usage.prompt_tokens_details?.cached_tokens ?? 0,
-                cacheWrite: data.usage.prompt_tokens_details?.cache_write_tokens ?? 0,
-                totalTokens: data.usage.total_tokens ?? 0,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-              };
+              output.usage = parseOpenAIUsage(data.usage, model);
             }
 
             if (!data.choices?.length) continue;
@@ -791,6 +820,10 @@ function detectContextWindow(modelId: string): number {
   return 256000;
 }
 
+function inferReasoningModel(modelId: string): boolean {
+  return /reason|think|r1|deepseek|gpt-5\.|mimo/i.test(modelId) && !/image|vision/i.test(modelId);
+}
+
 function buildModelConfigs(
   models: DiscoveredModel[],
   contextWindow?: number,
@@ -798,7 +831,7 @@ function buildModelConfigs(
   compat?: Record<string, unknown>,
 ) {
   return models.map((m) => {
-    const isReasoning = /reason|think|r1|deepseek|gpt-5\.|mimo/i.test(m.id) && !/image|vision/i.test(m.id);
+    const isReasoning = typeof m.reasoning === "boolean" ? m.reasoning : inferReasoningModel(m.id);
     return {
       id: m.id,
       name: m.name || m.id,
@@ -896,11 +929,13 @@ export default function (pi: ExtensionAPI) {
       "Use action=register with baseUrl+apiKey to add a custom provider.",
       "apiStyle can be auto, openai, or anthropic; auto tests OpenAI-compatible first.",
       "Provider names are suffixed with detected API style: {name}-{openai|anthropic}.",
+      "Use reasoningModels to manually enable thinking/reasoning for model IDs that do not match the built-in name heuristic.",
+      "Use action=set_reasoning_models with provider+reasoningModels to update an existing custom provider.",
       "Use action=list to inspect persisted custom providers.",
       "Use action=remove with provider=<name> to unregister and remove a custom provider.",
     ],
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ description: "register|remove|list" })),
+      action: Type.Optional(Type.String({ description: "register|remove|list|set_reasoning_models" })),
       provider: Type.Optional(Type.String({ description: "供应商名称" })),
       baseUrl: Type.Optional(Type.String({ description: "API 基础地址 (register 必填)" })),
       apiKey: Type.Optional(Type.String({ description: "API 密钥 (register 必填)" })),
@@ -908,6 +943,7 @@ export default function (pi: ExtensionAPI) {
       testModel: Type.Optional(Type.String({ description: "测试用模型 ID" })),
       contextWindow: Type.Optional(Type.Number({ description: "上下文窗口大小，可选" })),
       maxTokens: Type.Optional(Type.Number({ description: "最大输出 token，可选" })),
+      reasoningModels: Type.Optional(Type.Array(Type.String({ description: "Model IDs that should enable thinking/reasoning" }))),
       supportsUsageInStreaming: Type.Optional(Type.Boolean({ description: "OpenAI 流式响应是否支持 usage 尾包，默认 true；异常时可设 false" })),
       streamCompatMode: Type.Optional(Type.String({ description: "流兼容模式: builtin(默认) | finish-reason-fallback(上游缺少finish_reason时用)" })),
     }),
@@ -942,8 +978,37 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `✅ 已移除自定义供应商: ${providerName}` }], details: { provider: providerName } };
       }
 
+      if (action === "set_reasoning_models") {
+        const providerName = params.provider?.trim();
+        if (!providerName) return { content: [{ type: "text", text: "需要 provider" }], details: {} };
+        if (!Array.isArray(params.reasoningModels)) return { content: [{ type: "text", text: "需要 reasoningModels" }], details: {} };
+        const customProviders = readCustomProviders();
+        const cfg = customProviders[providerName];
+        if (!cfg) {
+          const keys = Object.keys(customProviders);
+          return { content: [{ type: "text", text: `provider 不存在: ${providerName}。已注册: ${keys.join(", ") || "(无)"}` }], details: {} };
+        }
+
+        const reasoningModelIds = new Set((params.reasoningModels as string[]).map((id) => id.trim()).filter(Boolean));
+        cfg.models = cfg.models.map((m) => ({ ...m, reasoning: reasoningModelIds.has(m.id) }));
+        customProviders[providerName] = cfg;
+        writeCustomProviders(customProviders);
+
+        const compat = cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
+          ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
+          : undefined;
+        const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
+        try { pi.unregisterProvider(providerName); } catch {}
+        registerCustomProvider(pi, providerName, cfg.baseUrl, cfg.apiKey, cfg.apiStyle, modelConfigs, cfg.streamCompatMode ?? "builtin");
+
+        return {
+          content: [{ type: "text", text: `✅ 已更新 ${providerName} reasoning models: ${[...reasoningModelIds].join(", ") || "(none)"}` }],
+          details: { provider: providerName, reasoningModels: [...reasoningModelIds] },
+        };
+      }
+
       if (action !== "register") {
-        return { content: [{ type: "text", text: `未知 action: ${action}。支持: register|remove|list` }], details: {} };
+        return { content: [{ type: "text", text: `未知 action: ${action}。支持: register|remove|list|set_reasoning_models` }], details: {} };
       }
 
       const baseUrl = params.baseUrl?.trim();
@@ -976,6 +1041,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       const discoveredModels = await discoverModelsFromProvider(baseUrl, apiKey, detectedApi);
+      const reasoningModelIds = Array.isArray(params.reasoningModels)
+        ? new Set((params.reasoningModels as string[]).map((id) => id.trim()).filter(Boolean))
+        : undefined;
+      const persistedModels = reasoningModelIds
+        ? discoveredModels.map((m) => ({ ...m, reasoning: reasoningModelIds.has(m.id) }))
+        : discoveredModels;
       const supportsUsageInStreaming = typeof params.supportsUsageInStreaming === "boolean"
         ? params.supportsUsageInStreaming
         : undefined;
@@ -983,7 +1054,7 @@ export default function (pi: ExtensionAPI) {
         ? { supportsUsageInStreaming }
         : undefined;
       const modelConfigs = buildModelConfigs(
-        discoveredModels,
+        persistedModels,
         params.contextWindow ? Number(params.contextWindow) : undefined,
         params.maxTokens ? Number(params.maxTokens) : undefined,
         compat,
@@ -1005,7 +1076,7 @@ export default function (pi: ExtensionAPI) {
         baseUrl: normalizeBaseUrl(baseUrl),
         apiKey,
         apiStyle: detectedApi,
-        models: discoveredModels,
+        models: persistedModels,
         createdAt: Date.now(),
         streamCompatMode,
         ...(typeof supportsUsageInStreaming === "boolean" ? { supportsUsageInStreaming } : {}),
@@ -1016,7 +1087,8 @@ export default function (pi: ExtensionAPI) {
         const cfg = modelConfigs.find((c) => c.id === m.id);
         const cw = cfg?.contextWindow ?? 0;
         const ctxLabel = cw >= 1000000 ? `${(cw / 1000000).toFixed(0)}M` : `${(cw / 1000).toFixed(0)}k`;
-        return `  - ${m.id} (上下文: ${ctxLabel})`;
+        const reasoningLabel = cfg?.reasoning ? ", reasoning" : "";
+        return `  - ${m.id} (上下文: ${ctxLabel}${reasoningLabel})`;
       }).join("\n");
       const more = discoveredModels.length > 10 ? `\n  ... 以及 ${discoveredModels.length - 10} 个其他模型` : "";
 
@@ -1048,6 +1120,7 @@ export default function (pi: ExtensionAPI) {
           api: detectedApi,
           streamCompatMode,
           supportsUsageInStreaming,
+          reasoningModels: persistedModels.filter((m) => m.reasoning).map((m) => m.id),
           baseUrl: normalizeBaseUrl(baseUrl),
           modelsCount: discoveredModels.length,
           models: discoveredModels.map((m) => m.id),

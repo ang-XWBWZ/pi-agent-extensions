@@ -721,6 +721,7 @@ function spawnAllBackground(
 
     // 优先级 3: 继承主 Agent 模型
     if (!subModel) subModel = defaultModel;
+    if (!subThinkingLevel) subThinkingLevel = pi.getThinkingLevel();
 
     if (!subModel) {
       publishTaskResult(jobId, {
