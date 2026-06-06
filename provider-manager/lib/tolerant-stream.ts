@@ -85,9 +85,6 @@ export function createOpenAITolerantStream() {
 
         const reasoning = options?.reasoning;
         if (reasoning && reasoning !== "off" && model.reasoning) {
-          if (/deepseek/i.test(model.id)) {
-            reqBody.thinking = { type: "enabled" };
-          }
           reqBody.reasoning_effort = reasoning;
         }
 
@@ -149,6 +146,8 @@ export function createOpenAITolerantStream() {
         let finishReason: string | null = null;
         let textBlock: any = null;
         let thinkingBlock: any = null;
+        let pendingTextPrefix = "";
+        let seenMeaningfulText = false;
         const toolCallBlocks: any[] = [];
         const toolCallBlocksById = new Map<string, any>();
         const toolCallBlocksByIndex = new Map<number, any>();
@@ -201,6 +200,25 @@ export function createOpenAITolerantStream() {
           if (!block.name && tc.function?.name) block.name = tc.function.name;
           return block;
         };
+        const emitTextDelta = (deltaText: string) => {
+          if (deltaText.length === 0) return;
+
+          if (!seenMeaningfulText && deltaText.trim().length === 0) {
+            pendingTextPrefix += deltaText;
+            return;
+          }
+
+          const text = !seenMeaningfulText ? pendingTextPrefix + deltaText : deltaText;
+          pendingTextPrefix = "";
+
+          if (text.trim().length > 0) {
+            seenMeaningfulText = true;
+          }
+
+          const block = ensureTextBlock();
+          block.text += text;
+          outer.push({ type: "text_delta", contentIndex: getIdx(block), delta: text, partial: output });
+        };
         const emitNonStreamingFallback = async (): Promise<string | null> => {
           const fallbackBody = { ...reqBody, stream: false };
           delete fallbackBody.stream_options;
@@ -236,19 +254,27 @@ export function createOpenAITolerantStream() {
           }
 
           if (typeof message.content === "string" && message.content.length > 0) {
-            const block = ensureTextBlock();
-            block.text += message.content;
-            outer.push({ type: "text_delta", contentIndex: getIdx(block), delta: message.content, partial: output });
+            emitTextDelta(message.content);
           }
 
           if (Array.isArray(message.tool_calls)) {
             for (const [idx, tc] of message.tool_calls.entries()) {
               const block = upsertToolCallBlock(tc, idx, false);
+              delete (block as any).partialArgs;
               block.arguments = parseToolArguments(tc.function?.arguments);
             }
           }
 
-          return choice?.finish_reason ?? (output.content.length > 0 ? "stop" : null);
+          const fallbackToolCalls = toolCallBlocks.filter(finalizeToolCallBlock);
+          const hasMeaningfulFallbackText = !!textBlock?.text?.trim();
+          const hasMeaningfulFallbackThinking = !!thinkingBlock?.thinking?.trim();
+
+          return choice?.finish_reason
+            ?? (fallbackToolCalls.length > 0
+              ? "tool_calls"
+              : hasMeaningfulFallbackText || hasMeaningfulFallbackThinking
+                ? "stop"
+                : null);
         };
 
         outer.push({ type: "start", partial: output });
@@ -296,9 +322,7 @@ export function createOpenAITolerantStream() {
             // content → text block
             const content = delta.content;
             if (typeof content === "string" && content.length > 0) {
-              const block = ensureTextBlock();
-              block.text += content;
-              outer.push({ type: "text_delta", contentIndex: getIdx(block), delta: content, partial: output });
+              emitTextDelta(content);
             }
 
             // tool_calls
@@ -318,19 +342,26 @@ export function createOpenAITolerantStream() {
         // 收尾
         clearTimeout(timeoutId);
 
-        const hasTextOrThinking = !!thinkingBlock || !!textBlock;
+        const hasMeaningfulText = !!textBlock?.text?.trim();
+        const hasMeaningfulThinking = !!thinkingBlock?.thinking?.trim();
+        const hasTextOrThinking = hasMeaningfulText || hasMeaningfulThinking;
         const completeToolCalls = toolCallBlocks.filter(finalizeToolCallBlock);
         const hasIncompleteToolCalls = completeToolCalls.length !== toolCallBlocks.length;
 
         if (!hasFinishReason) {
           if (completeToolCalls.length > 0 && !hasIncompleteToolCalls) {
             finishReason = "tool_calls";
-          } else if (hasTextOrThinking || hasIncompleteToolCalls) {
+          } else if (hasIncompleteToolCalls) {
+            finishReason = await emitNonStreamingFallback();
+            if (!finishReason) {
+              throw new Error("Stream ended with incomplete tool_calls and no finish_reason");
+            }
+          } else if (hasTextOrThinking) {
             finishReason = "stop";
           } else {
             finishReason = await emitNonStreamingFallback();
-            if (!finishReason && output.content.length === 0) {
-              throw new Error("Stream ended without finish_reason and no content");
+            if (!finishReason) {
+              throw new Error("Stream ended without finish_reason and meaningful content");
             }
           }
         }

@@ -59,14 +59,13 @@ export function forceThinkingSupport(model: unknown): void {
     reasoning?: boolean;
     thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
   };
-  m.reasoning = true;
+  const hasReasoning = m.reasoning === true;
   m.thinkingLevelMap = {
-    ...m.thinkingLevelMap,
-    off: m.thinkingLevelMap?.off ?? undefined,
-    minimal: m.thinkingLevelMap?.minimal ?? "minimal",
-    low: m.thinkingLevelMap?.low ?? "low",
-    medium: m.thinkingLevelMap?.medium ?? "medium",
-    high: m.thinkingLevelMap?.high ?? "high",
-    xhigh: m.thinkingLevelMap?.xhigh ?? "xhigh",
+    off: undefined,
+    minimal: hasReasoning ? (m.thinkingLevelMap?.minimal ?? "minimal") : undefined,
+    low: hasReasoning ? (m.thinkingLevelMap?.low ?? "low") : undefined,
+    medium: hasReasoning ? (m.thinkingLevelMap?.medium ?? "medium") : undefined,
+    high: hasReasoning ? (m.thinkingLevelMap?.high ?? "high") : undefined,
+    xhigh: hasReasoning ? (m.thinkingLevelMap?.xhigh ?? "xhigh") : undefined,
   };
 }

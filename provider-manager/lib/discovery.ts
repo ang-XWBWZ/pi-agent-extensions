@@ -5,6 +5,71 @@
 import type { DiscoveredModel, TestResult } from "./config.js";
 import { normalizeBaseUrl } from "./config.js";
 
+/** 从 /v1/models 获取任意可用的模型 ID */
+async function pickModel(
+  clean: string, apiKey: string, authStyle: "bearer" | "anthropic",
+): Promise<string | undefined> {
+  const headers: Record<string, string> = authStyle === "bearer"
+    ? { Authorization: `Bearer ${apiKey}` }
+    : { "x-api-key": apiKey, "anthropic-version": "2023-06-01" };
+  try {
+    const resp = await fetch(`${clean}/v1/models`, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!resp.ok) return undefined;
+    const data = (await resp.json()) as { data?: Array<{ id?: string }> };
+    return data.data?.find((m) => m.id && !m.id.startsWith("ft:"))?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+/** OpenAI chat 流检测结果 */
+type ChatStreamResult =
+  | { kind: "hasFinishReason" }
+  | { kind: "noFinishReason" }
+  | { kind: "endpointError"; status: number };
+
+async function testOpenAIChatStream(clean: string, apiKey: string, model: string): Promise<ChatStreamResult> {
+  try {
+    const resp = await fetch(`${clean}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 8,
+        stream: true,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) return { kind: "endpointError", status: resp.status };
+    if (!resp.body) return { kind: "endpointError", status: 0 };
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        if (/"finish_reason"\s*:\s*"(?!null)[^"]+"/.test(buf)) return { kind: "hasFinishReason" };
+        if (buf.includes("[DONE]") || buf.length > 16_000) return { kind: "noFinishReason" };
+      }
+    } finally {
+      try { await reader.cancel(); } catch {}
+    }
+    return { kind: "noFinishReason" };
+  } catch {
+    return { kind: "endpointError", status: 0 };
+  }
+}
+
 export async function testProviderConnection(
   baseUrl: string,
   apiKey: string,
@@ -13,79 +78,43 @@ export async function testProviderConnection(
 ): Promise<TestResult> {
   const clean = normalizeBaseUrl(baseUrl);
 
-  async function pickOpenAIModel(): Promise<string | undefined> {
-    if (testModel) return testModel;
-    try {
-      const resp = await fetch(`${clean}/v1/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!resp.ok) return undefined;
-      const data = (await resp.json()) as { data?: Array<{ id?: string }> };
-      return data.data?.find((m) => m.id && !m.id.startsWith("ft:"))?.id;
-    } catch {
-      return undefined;
-    }
-  }
-
-  async function openAIChatHasFinishReason(model: string): Promise<boolean> {
-    try {
-      const resp = await fetch(`${clean}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: "hi" }],
-          max_tokens: 8,
-          stream: true,
-        }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!resp.ok || !resp.body) return false;
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          if (/"finish_reason"\s*:\s*"(?!null)[^"]+"/.test(buf)) return true;
-          if (buf.includes("[DONE]") || buf.length > 16_000) return false;
-        }
-      } finally {
-        try { await reader.cancel(); } catch {}
-      }
-    } catch {
-      return false;
-    }
-    return false;
-  }
-
+  // ---- OpenAI 检测 ----
   if (apiStyle === "openai" || apiStyle === "auto") {
     try {
-      const resp = await fetch(`${clean}/v1/models`, {
+      const modelsResp = await fetch(`${clean}/v1/models`, {
         headers: { Authorization: `Bearer ${apiKey}` },
         signal: AbortSignal.timeout(15_000),
       });
-      if (resp.ok) {
-        const model = await pickOpenAIModel();
-        const hasFinishReason = model ? await openAIChatHasFinishReason(model) : false;
-        return { ok: true, detectedApi: "openai", needsFinishReasonFallback: !hasFinishReason };
-      }
-      if (apiStyle === "openai") {
-        const body = await resp.text().catch(() => "");
-        return { ok: false, error: `OpenAI 测试失败 (HTTP ${resp.status}): ${body.slice(0, 200)}` };
+      if (modelsResp.ok) {
+        const model = testModel || await pickModel(clean, apiKey, "bearer");
+        if (!model) {
+          // /v1/models 可访问但没有模型，无法确认 chat 能力
+          if (apiStyle === "openai") return { ok: false, error: `/v1/models 返回空模型列表` };
+          // auto 模式继续尝试 anthropic
+        } else {
+          const chatResult = await testOpenAIChatStream(clean, apiKey, model);
+          if (chatResult.kind === "hasFinishReason" || chatResult.kind === "noFinishReason") {
+            return { ok: true, detectedApi: "openai", needsFinishReasonFallback: chatResult.kind === "noFinishReason" };
+          }
+          // chatResult.kind === "endpointError" → chat 不通，这不是真正的 OpenAI API
+          if (apiStyle === "openai") {
+            return { ok: false, error: `/v1/chat/completions 不可用 (HTTP ${chatResult.status}): 尝试 anthropic 风格或检查 API 风格` };
+          }
+          // auto 模式：chat 不通，继续尝试 anthropic
+        }
+      } else if (apiStyle === "openai") {
+        const body = await modelsResp.text().catch(() => "");
+        return { ok: false, error: `OpenAI 测试失败 (HTTP ${modelsResp.status}): ${body.slice(0, 200)}` };
       }
     } catch (e: unknown) {
       if (apiStyle === "openai") return { ok: false, error: `OpenAI 连接失败: ${(e as Error).message}` };
     }
   }
 
+  // ---- Anthropic 检测 ----
   if (apiStyle === "anthropic" || apiStyle === "auto") {
+    // 先用 /v1/models 获取有效的模型 ID
+    const model = testModel || await pickModel(clean, apiKey, "anthropic");
     try {
       const resp = await fetch(`${clean}/v1/messages`, {
         method: "POST",
@@ -95,7 +124,7 @@ export async function testProviderConnection(
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify({
-          model: testModel || "claude-sonnet-4-20250514",
+          model: model || "claude-sonnet-4-20250514",
           max_tokens: 10,
           messages: [{ role: "user", content: "hi" }],
         }),

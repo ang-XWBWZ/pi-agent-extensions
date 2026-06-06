@@ -15,6 +15,8 @@ import { formatJobNotificationLine } from "./spawner.js";
 
 let widgetTui: { requestRender(): void } | null = null;
 let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
+/** 已通知过的 Job ID，防止重复 */
+const notifiedJobs = new Set<string>();
 
 export function refreshWidget(): void {
   try { widgetTui?.requestRender(); } catch { /* */ }
@@ -29,31 +31,35 @@ export function clearWidget(): void {
 }
 
 export function setupWidget(pi: ExtensionAPI): void {
+  // ---- Bus 监听器：扩展加载时注册一次，不随 session 重复 ----
+  const bus = getAgentBus();
+
+  const onEvent = () => refreshWidget();
+  bus.on(Events.INSTANCE_REGISTERED, onEvent);
+  bus.on(Events.INSTANCE_UNREGISTERED, onEvent);
+  bus.on(Events.AGENT_PAUSED, onEvent);
+  bus.on(Events.AGENT_RESUMED, onEvent);
+  bus.on(Events.TASK_RESULT, onEvent);
+  bus.on(Events.STATUS_CHANGED, onEvent);
+
+  bus.on(Events.JOB_COMPLETE, (data: { jobId: string; job: AgentJob }) => {
+    // 去重：同一 Job 只通知一次（防止 session_start 级联导致重复）
+    if (notifiedJobs.has(data.jobId)) return;
+    notifiedJobs.add(data.jobId);
+
+    const completedJob = data.job;
+    const elapsed = completedJob.finishedAt
+      ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
+      : "?";
+    const line = formatJobNotificationLine(completedJob.jobId, completedJob.results, completedJob.total, elapsed);
+    try {
+      pi.sendUserMessage(line, { deliverAs: "steer", triggerTurn: true });
+    } catch { /* */ }
+    refreshWidget();
+  });
+
+  // ---- Widget：每次 session_start 更新 TUI 引用 ----
   pi.on("session_start", async (_event, ctx) => {
-    const bus = getAgentBus();
-
-    const onEvent = () => refreshWidget();
-    bus.on(Events.INSTANCE_REGISTERED, onEvent);
-    bus.on(Events.INSTANCE_UNREGISTERED, onEvent);
-    bus.on(Events.AGENT_PAUSED, onEvent);
-    bus.on(Events.AGENT_RESUMED, onEvent);
-    bus.on(Events.TASK_RESULT, onEvent);
-    bus.on(Events.STATUS_CHANGED, onEvent);
-
-    // JOB_COMPLETE：前台通知 + 触发 LLM + 刷新 widget
-    bus.on(Events.JOB_COMPLETE, (data: { jobId: string; job: AgentJob }) => {
-      const completedJob = data.job;
-      const elapsed = completedJob.finishedAt
-        ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
-        : "?";
-      const line = formatJobNotificationLine(completedJob.jobId, completedJob.results, completedJob.total, elapsed);
-      try {
-        pi.sendUserMessage(line, { deliverAs: "steer", triggerTurn: true });
-      } catch { /* */ }
-      refreshWidget();
-    });
-
-    // 定时刷新（兜底 outputLength 更新）
     if (widgetRefreshTimer) clearInterval(widgetRefreshTimer);
     widgetRefreshTimer = setInterval(refreshWidget, 1500);
 
@@ -102,15 +108,10 @@ export function setupWidget(pi: ExtensionAPI): void {
             const metrics: string[] = [];
             metrics.push(`↑${tokIn}`);
             metrics.push(`↓${tokOut}`);
-            if (inst.cacheTokens > 0) {
-              metrics.push(`R${fmtNum(inst.cacheTokens)}`);
-            }
-            if (inst.cost > 0) {
-              metrics.push(`$${inst.cost < 0.001 ? inst.cost.toExponential(2) : inst.cost.toFixed(3)}`);
-            }
-            if (inst.contextPercent !== null && inst.contextPercent !== undefined && inst.contextWindow > 0) {
+            if (inst.cacheTokens > 0) metrics.push(`R${fmtNum(inst.cacheTokens)}`);
+            if (inst.cost > 0) metrics.push(`$${inst.cost < 0.001 ? inst.cost.toExponential(2) : inst.cost.toFixed(3)}`);
+            if (inst.contextPercent !== null && inst.contextPercent !== undefined && inst.contextWindow > 0)
               metrics.push(`${inst.contextPercent.toFixed(1)}%/${fmtNum(inst.contextWindow)}`);
-            }
             metrics.push(`${elapsed}s`);
             metrics.push(statusText);
 
