@@ -198,15 +198,39 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("default-model", ctx.ui.theme.fg("muted", `\u{1F539}${tierPart}${ctx.model.provider}/${ctx.model.id}${thinkPart}`));
   }
 
-  function applyThinking(tier: TierKey): ThinkingLevel | undefined {
+  function applyThinking(tier: TierKey, model?: unknown): ThinkingLevel | undefined {
     const lvl = tierConfig[tier]?.thinkingLevel;
-    if (lvl) { pi.setThinkingLevel(lvl); currentThinking = lvl; return lvl; }
+    if (lvl) {
+      forceThinkingSupport(model);
+      pi.setThinkingLevel(lvl as any);
+      currentThinking = lvl;
+      return lvl;
+    }
     return undefined;
   }
 
-  function setThinking(level: string): void {
+  function forceThinkingSupport(model: unknown): void {
+    if (!model || typeof model !== "object") return;
+    const m = model as {
+      reasoning?: boolean;
+      thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+    };
+    m.reasoning = true;
+    m.thinkingLevelMap = {
+      ...m.thinkingLevelMap,
+      off: m.thinkingLevelMap?.off ?? undefined,
+      minimal: m.thinkingLevelMap?.minimal ?? "minimal",
+      low: m.thinkingLevelMap?.low ?? "low",
+      medium: m.thinkingLevelMap?.medium ?? "medium",
+      high: m.thinkingLevelMap?.high ?? "high",
+      xhigh: m.thinkingLevelMap?.xhigh ?? "xhigh",
+    };
+  }
+
+  function setThinking(level: string, model?: unknown): void {
     if (isValidThinkingLevel(level)) {
-      pi.setThinkingLevel(level as ThinkingLevel);
+      forceThinkingSupport(model);
+      pi.setThinkingLevel(level as any);
       currentThinking = level;
     }
   }
@@ -229,7 +253,7 @@ export default function (pi: ExtensionAPI) {
           defaultRef = { provider: p, model: m };
           await pi.setModel(t);
           currentTier = getCurrentTier(p, m, tierConfig);
-          if (currentTier) applyThinking(currentTier);
+          if (currentTier) applyThinking(currentTier, t);
           statusLine(ctx);
           return true;
         }
@@ -241,7 +265,7 @@ export default function (pi: ExtensionAPI) {
           if (t) {
             await pi.setModel(t);
             currentTier = tk as TierKey;
-            applyThinking(currentTier);
+            applyThinking(currentTier, t);
             statusLine(ctx);
             return true;
           }
@@ -291,7 +315,7 @@ export default function (pi: ExtensionAPI) {
       const t = ctx.modelRegistry.find(r.provider, r.model);
       if (!t) { ctx.ui.notify(`${r.provider}/${r.model} 不存在`, "error"); return; }
       const ok = await pi.setModel(t);
-      if (ok) { currentTier = tier; tierConfig = config; applyThinking(tier); statusLine(ctx); }
+      if (ok) { currentTier = tier; tierConfig = config; applyThinking(tier, t); statusLine(ctx); }
       const think = config[tier]?.thinkingLevel;
       ctx.ui.notify(ok ? `\u2705 ${tier} · ${config[tier].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "切换失败", ok ? "info" : "warning");
     },
@@ -432,7 +456,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`无效。支持: ${VALID_THINKING_LEVELS.join(" | ")}`, "error");
         return;
       }
-      setThinking(input);
+      setThinking(input, ctx.model);
       statusLine(ctx);
       ctx.ui.notify(`\u2705 思考深度: ${input}(${thinkingLabel(input)})`, "info");
     },
@@ -450,7 +474,7 @@ export default function (pi: ExtensionAPI) {
         defaultRef = null;
         const config = readAllTiers();
         const r = resolveTierModel(tier as TierKey, config, ctx.modelRegistry, ctx.model?.provider);
-        if (r) { const t = ctx.modelRegistry.find(r.provider, r.model); if (t) { await pi.setModel(t); currentTier = tier as TierKey; tierConfig = config; applyThinking(currentTier); } }
+        if (r) { const t = ctx.modelRegistry.find(r.provider, r.model); if (t) { await pi.setModel(t); currentTier = tier as TierKey; tierConfig = config; applyThinking(currentTier, t); } }
         statusLine(ctx);
         ctx.ui.notify(`\u2705 默认层级: ${tier}`, "info");
         return;
@@ -579,7 +603,7 @@ export default function (pi: ExtensionAPI) {
       // standalone thinking
       if (params.thinkingLevel && !params.tier && !params.provider) {
         if (!isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: `无效` }], details: {} };
-        setThinking(params.thinkingLevel);
+        setThinking(params.thinkingLevel, ctx.model);
         return { content: [{ type: "text", text: `\u2705 \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` }], details: {} };
       }
 
@@ -598,8 +622,8 @@ export default function (pi: ExtensionAPI) {
         if (ok) {
           currentTier = tier as TierKey;
           tierConfig = config;
-          if (params.thinkingLevel) setThinking(params.thinkingLevel);
-          else applyThinking(currentTier);
+          if (params.thinkingLevel) setThinking(params.thinkingLevel, t);
+          else applyThinking(currentTier, t);
         }
         const think = params.thinkingLevel ?? config[tier as TierKey]?.thinkingLevel;
         return { content: [{ type: "text", text: ok ? `\u2705 ${tier} · ${config[tier as TierKey].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "失败" }], details: {} };
@@ -613,8 +637,8 @@ export default function (pi: ExtensionAPI) {
         const ok = await pi.setModel(t);
         if (ok) {
           currentTier = getCurrentTier(params.provider, params.model, tierConfig);
-          if (params.thinkingLevel) setThinking(params.thinkingLevel);
-          else if (currentTier) applyThinking(currentTier);
+          if (params.thinkingLevel) setThinking(params.thinkingLevel, t);
+          else if (currentTier) applyThinking(currentTier, t);
         }
         return { content: [{ type: "text", text: ok ? `Switched to ${params.provider}/${params.model}${params.thinkingLevel ? ` | \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` : ""}` : "Failed" }], details: {} };
       }

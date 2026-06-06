@@ -540,6 +540,24 @@ const VALID_THINKING_LEVELS = [
   "xhigh",
 ] as const;
 
+function forceThinkingSupport(model: unknown): void {
+  if (!model || typeof model !== "object") return;
+  const m = model as {
+    reasoning?: boolean;
+    thinkingLevelMap?: Record<string, string | null | undefined>;
+  };
+  m.reasoning = true;
+  m.thinkingLevelMap = {
+    ...m.thinkingLevelMap,
+    off: m.thinkingLevelMap?.off ?? undefined,
+    minimal: m.thinkingLevelMap?.minimal ?? "minimal",
+    low: m.thinkingLevelMap?.low ?? "low",
+    medium: m.thinkingLevelMap?.medium ?? "medium",
+    high: m.thinkingLevelMap?.high ?? "high",
+    xhigh: m.thinkingLevelMap?.xhigh ?? "xhigh",
+  };
+}
+
 function settingsPath(): string {
   return join(
     process.env.USERPROFILE ?? ".",
@@ -733,6 +751,8 @@ function spawnAllBackground(
       });
       continue;
     }
+
+    forceThinkingSupport(subModel);
 
     const name =
       task.prompt.slice(0, 20).replace(/\n/g, " ").trim() || task.id;

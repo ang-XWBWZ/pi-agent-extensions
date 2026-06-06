@@ -40,6 +40,8 @@ interface DiscoveredModel {
   id: string;
   name: string;
   reasoning?: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
 }
 
 interface TestResult {
@@ -820,10 +822,6 @@ function detectContextWindow(modelId: string): number {
   return 256000;
 }
 
-function inferReasoningModel(modelId: string): boolean {
-  return /reason|think|r1|deepseek|gpt-5\.|mimo/i.test(modelId) && !/image|vision/i.test(modelId);
-}
-
 function buildModelConfigs(
   models: DiscoveredModel[],
   contextWindow?: number,
@@ -831,18 +829,18 @@ function buildModelConfigs(
   compat?: Record<string, unknown>,
 ) {
   return models.map((m) => {
-    const isReasoning = typeof m.reasoning === "boolean" ? m.reasoning : inferReasoningModel(m.id);
+    const isReasoning = m.reasoning !== false;
     return {
       id: m.id,
       name: m.name || m.id,
       reasoning: isReasoning,
       thinkingLevelMap: isReasoning
-        ? { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh" }
+        ? { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh" }
         : undefined,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      contextWindow: contextWindow ?? detectContextWindow(m.id),
-      maxTokens: maxTokens ?? (isReasoning ? 16384 : 4096),
+      contextWindow: m.contextWindow ?? contextWindow ?? detectContextWindow(m.id),
+      maxTokens: m.maxTokens ?? maxTokens ?? (isReasoning ? 16384 : 4096),
       ...(compat && Object.keys(compat).length > 0 ? { compat } : {}),
     };
   });
@@ -929,21 +927,23 @@ export default function (pi: ExtensionAPI) {
       "Use action=register with baseUrl+apiKey to add a custom provider.",
       "apiStyle can be auto, openai, or anthropic; auto tests OpenAI-compatible first.",
       "Provider names are suffixed with detected API style: {name}-{openai|anthropic}.",
-      "Use reasoningModels to manually enable thinking/reasoning for model IDs that do not match the built-in name heuristic.",
-      "Use action=set_reasoning_models with provider+reasoningModels to update an existing custom provider.",
+      "All custom provider models support every standard thinking level by default.",
+      "Use action=set_reasoning_models with provider+reasoningModels only when you want to restrict reasoning models.",
+      "Use action=set_model_limits with provider+model+contextWindow/maxTokens to edit one model's limits.",
       "Use action=list to inspect persisted custom providers.",
       "Use action=remove with provider=<name> to unregister and remove a custom provider.",
     ],
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ description: "register|remove|list|set_reasoning_models" })),
+      action: Type.Optional(Type.String({ description: "register|remove|list|set_reasoning_models|set_model_limits" })),
       provider: Type.Optional(Type.String({ description: "供应商名称" })),
+      model: Type.Optional(Type.String({ description: "模型 ID (set_model_limits 使用)" })),
       baseUrl: Type.Optional(Type.String({ description: "API 基础地址 (register 必填)" })),
       apiKey: Type.Optional(Type.String({ description: "API 密钥 (register 必填)" })),
       apiStyle: Type.Optional(Type.String({ description: "openai|anthropic|auto，默认 auto" })),
       testModel: Type.Optional(Type.String({ description: "测试用模型 ID" })),
       contextWindow: Type.Optional(Type.Number({ description: "上下文窗口大小，可选" })),
       maxTokens: Type.Optional(Type.Number({ description: "最大输出 token，可选" })),
-      reasoningModels: Type.Optional(Type.Array(Type.String({ description: "Model IDs that should enable thinking/reasoning" }))),
+      reasoningModels: Type.Optional(Type.Array(Type.String({ description: "Model IDs that should keep thinking/reasoning when restricting manually" }))),
       supportsUsageInStreaming: Type.Optional(Type.Boolean({ description: "OpenAI 流式响应是否支持 usage 尾包，默认 true；异常时可设 false" })),
       streamCompatMode: Type.Optional(Type.String({ description: "流兼容模式: builtin(默认) | finish-reason-fallback(上游缺少finish_reason时用)" })),
     }),
@@ -1007,8 +1007,63 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      if (action === "set_model_limits") {
+        const providerName = params.provider?.trim();
+        const modelId = params.model?.trim();
+        if (!providerName) return { content: [{ type: "text", text: "需要 provider" }], details: {} };
+        if (!modelId) return { content: [{ type: "text", text: "需要 model" }], details: {} };
+        const contextWindow = params.contextWindow !== undefined ? Number(params.contextWindow) : undefined;
+        const maxTokens = params.maxTokens !== undefined ? Number(params.maxTokens) : undefined;
+        if (contextWindow !== undefined && (!Number.isFinite(contextWindow) || contextWindow <= 0)) {
+          return { content: [{ type: "text", text: "contextWindow 必须是正数" }], details: {} };
+        }
+        if (maxTokens !== undefined && (!Number.isFinite(maxTokens) || maxTokens <= 0)) {
+          return { content: [{ type: "text", text: "maxTokens 必须是正数" }], details: {} };
+        }
+        if (contextWindow === undefined && maxTokens === undefined) {
+          return { content: [{ type: "text", text: "需要 contextWindow 或 maxTokens" }], details: {} };
+        }
+
+        const customProviders = readCustomProviders();
+        const cfg = customProviders[providerName];
+        if (!cfg) {
+          const keys = Object.keys(customProviders);
+          return { content: [{ type: "text", text: `provider 不存在: ${providerName}。已注册: ${keys.join(", ") || "(无)"}` }], details: {} };
+        }
+
+        let found = false;
+        cfg.models = cfg.models.map((m) => {
+          if (m.id !== modelId) return m;
+          found = true;
+          return {
+            ...m,
+            ...(contextWindow !== undefined ? { contextWindow } : {}),
+            ...(maxTokens !== undefined ? { maxTokens } : {}),
+          };
+        });
+        if (!found) {
+          return { content: [{ type: "text", text: `模型不存在: ${providerName}/${modelId}` }], details: {} };
+        }
+
+        customProviders[providerName] = cfg;
+        writeCustomProviders(customProviders);
+
+        const compat = cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
+          ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
+          : undefined;
+        const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
+        try { pi.unregisterProvider(providerName); } catch {}
+        registerCustomProvider(pi, providerName, cfg.baseUrl, cfg.apiKey, cfg.apiStyle, modelConfigs, cfg.streamCompatMode ?? "builtin");
+
+        const updated = modelConfigs.find((m) => m.id === modelId);
+        return {
+          content: [{ type: "text", text: `✅ 已更新 ${providerName}/${modelId}: contextWindow=${updated?.contextWindow}, maxTokens=${updated?.maxTokens}` }],
+          details: { provider: providerName, model: modelId, contextWindow: updated?.contextWindow, maxTokens: updated?.maxTokens },
+        };
+      }
+
       if (action !== "register") {
-        return { content: [{ type: "text", text: `未知 action: ${action}。支持: register|remove|list|set_reasoning_models` }], details: {} };
+        return { content: [{ type: "text", text: `未知 action: ${action}。支持: register|remove|list|set_reasoning_models|set_model_limits` }], details: {} };
       }
 
       const baseUrl = params.baseUrl?.trim();
@@ -1120,7 +1175,7 @@ export default function (pi: ExtensionAPI) {
           api: detectedApi,
           streamCompatMode,
           supportsUsageInStreaming,
-          reasoningModels: persistedModels.filter((m) => m.reasoning).map((m) => m.id),
+          reasoningModels: modelConfigs.filter((m) => m.reasoning).map((m) => m.id),
           baseUrl: normalizeBaseUrl(baseUrl),
           modelsCount: discoveredModels.length,
           models: discoveredModels.map((m) => m.id),
