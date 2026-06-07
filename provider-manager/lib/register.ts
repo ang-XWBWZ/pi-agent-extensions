@@ -47,7 +47,7 @@ export function registerCustomProvider(
   modelConfigs: ReturnType<typeof buildModelConfigs>,
   streamCompatMode: "builtin" | "finish-reason-fallback",
   openaiApiMode: "chat-completions" | "responses" = "chat-completions",
-  anthropicThinkingMode: AnthropicThinkingMode = "builtin",
+  anthropicThinkingMode: AnthropicThinkingMode = "adaptive_effort",
 ): void {
   const hdrs: Record<string, string> = {};
   let authHeader = false;
@@ -59,8 +59,9 @@ export function registerCustomProvider(
   }
 
   // Anthropic 风格：
-  //   builtin → 走内核 anthropic-messages（兼容旧行为）
-  //   adaptive_effort → 走自定义 stream，发送新版 adaptive thinking 协议
+  // Anthropic 风格：
+  //   builtin → 内核 anthropic-messages（兼容模式，手动切换）
+  //   adaptive_effort → 自定义 stream，新版 adaptive thinking 协议（默认）
   if (apiStyle === "anthropic") {
     if (anthropicThinkingMode === "builtin") {
       for (const m of modelConfigs) (m as any).api = "anthropic-messages";
