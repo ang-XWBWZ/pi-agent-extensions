@@ -3,9 +3,10 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { DiscoveredModel } from "./config.js";
+import type { AnthropicThinkingMode, DiscoveredModel } from "./config.js";
 import { normalizeBaseUrl, readCustomProviders } from "./config.js";
 import { createOpenAITolerantStream } from "./tolerant-stream.js";
+import { createAnthropicStream } from "./anthropic-stream.js";
 import { detectContextWindow } from "./discovery.js";
 
 export function buildModelConfigs(
@@ -46,6 +47,7 @@ export function registerCustomProvider(
   modelConfigs: ReturnType<typeof buildModelConfigs>,
   streamCompatMode: "builtin" | "finish-reason-fallback",
   openaiApiMode: "chat-completions" | "responses" = "chat-completions",
+  anthropicThinkingMode: AnthropicThinkingMode = "builtin",
 ): void {
   const hdrs: Record<string, string> = {};
   let authHeader = false;
@@ -56,18 +58,35 @@ export function registerCustomProvider(
     authHeader = true;
   }
 
-  // Anthropic 风格默认走 Pi 内核 anthropic-messages stream。
-  // provider-manager 只负责供应商注册、key/baseUrl、模型配置和持久化。
+  // Anthropic 风格：
+  //   builtin → 走内核 anthropic-messages（兼容旧行为）
+  //   adaptive_effort → 走自定义 stream，发送新版 adaptive thinking 协议
   if (apiStyle === "anthropic") {
-    for (const m of modelConfigs) (m as any).api = "anthropic-messages";
+    if (anthropicThinkingMode === "builtin") {
+      for (const m of modelConfigs) (m as any).api = "anthropic-messages";
+      pi.registerProvider(providerName, {
+        name: providerName,
+        baseUrl: normalizeBaseUrl(baseUrl),
+        apiKey,
+        api: "anthropic-messages",
+        headers: Object.keys(hdrs).length > 0 ? hdrs : undefined,
+        authHeader: undefined,
+        models: modelConfigs,
+      });
+      return;
+    }
+
+    const customApi = `${providerName}-anthropic-custom`;
+    for (const m of modelConfigs) (m as any).api = customApi;
     pi.registerProvider(providerName, {
       name: providerName,
       baseUrl: normalizeBaseUrl(baseUrl),
       apiKey,
-      api: "anthropic-messages",
+      api: customApi,
       headers: Object.keys(hdrs).length > 0 ? hdrs : undefined,
       authHeader: undefined,
       models: modelConfigs,
+      streamSimple: createAnthropicStream(),
     });
     return;
   }
@@ -129,6 +148,7 @@ export function restoreCustomProviders(pi: ExtensionAPI): void {
         modelConfigs,
         streamCompatMode,
         cfg.openaiApiMode ?? "chat-completions",
+        cfg.anthropicThinkingMode ?? "builtin",
       );
     } catch {
       // Skip failed re-registrations

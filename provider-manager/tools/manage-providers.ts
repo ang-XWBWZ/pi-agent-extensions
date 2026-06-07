@@ -9,6 +9,7 @@ import {
   writeCustomProviders,
   normalizeBaseUrl,
 } from "../lib/config.js";
+import type { AnthropicThinkingMode } from "../lib/config.js";
 import {
   testProviderConnection,
   discoverModelsFromProvider,
@@ -25,6 +26,10 @@ function isOpenAIApiMode(value: unknown): value is OpenAIApiMode {
 
 function isStreamCompatMode(value: unknown): value is StreamCompatMode {
   return value === "builtin" || value === "finish-reason-fallback";
+}
+
+function isAnthropicThinkingMode(value: unknown): value is AnthropicThinkingMode {
+  return value === "builtin" || value === "adaptive_effort";
 }
 
 export function registerManageProviders(pi: ExtensionAPI): void {
@@ -45,6 +50,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       "Use action=set_model_limits with provider+model+contextWindow/maxTokens to edit one model's limits.",
       "Use action=refresh_models with provider=<name> to rediscover and persist models for an existing provider.",
       "Use action=set_stream_compat_mode with provider+streamCompatMode to switch an OpenAI Chat Completions provider between builtin and finish-reason-fallback.",
+      "For Anthropic providers, use anthropicThinkingMode=adaptive_effort (recommended) to send thinking:{type:adaptive}+output_config:{effort:low|medium|high|xhigh|max}. Use builtin to fall back to Pi kernel.",
       "Use action=list to inspect persisted custom providers.",
       "Use action=remove with provider=<name> to unregister and remove a custom provider.",
     ],
@@ -62,6 +68,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       reasoningModels: Type.Optional(Type.Array(Type.String({ description: "Model IDs that should keep thinking/reasoning when restricting manually" }))),
       supportsUsageInStreaming: Type.Optional(Type.Boolean({ description: "Whether OpenAI streaming supports usage tail chunks" })),
       streamCompatMode: Type.Optional(Type.String({ description: "builtin | finish-reason-fallback" })),
+      anthropicThinkingMode: Type.Optional(Type.String({ description: "Claude thinking mode: builtin | adaptive_effort (recommended)" })),
     }),
     async execute(_id, params, _sig, _up, ctx) {
       const action = params.action || "list";
@@ -125,6 +132,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           modelConfigs,
           cfg.streamCompatMode ?? "builtin",
           cfg.openaiApiMode ?? "chat-completions",
+          cfg.anthropicThinkingMode ?? "builtin",
         );
 
         return {
@@ -188,6 +196,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           modelConfigs,
           cfg.streamCompatMode ?? "builtin",
           cfg.openaiApiMode ?? "chat-completions",
+          cfg.anthropicThinkingMode ?? "builtin",
         );
 
         const updated = modelConfigs.find((m) => m.id === modelId);
@@ -238,6 +247,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           modelConfigs,
           cfg.streamCompatMode,
           openaiApiMode,
+          cfg.anthropicThinkingMode ?? "builtin",
         );
 
         const piApi = streamCompatModeRaw === "finish-reason-fallback"
@@ -297,6 +307,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           modelConfigs,
           cfg.streamCompatMode ?? "builtin",
           cfg.openaiApiMode ?? "chat-completions",
+          cfg.anthropicThinkingMode ?? "builtin",
         );
 
         return {
@@ -402,8 +413,25 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `Invalid resolved OpenAI API mode: ${openaiApiMode}` }], details: {} };
       }
 
+      const anthropicThinkingModeRaw = params.anthropicThinkingMode ??
+        (detectedApi === "anthropic" ? "adaptive_effort" : undefined);
+      const anthropicThinkingMode: AnthropicThinkingMode | undefined =
+        isAnthropicThinkingMode(anthropicThinkingModeRaw)
+          ? anthropicThinkingModeRaw
+          : undefined;
+
       try {
-        registerCustomProvider(pi, providerName, baseUrl, apiKey, detectedApi, modelConfigs, streamCompatMode, openaiApiMode);
+        registerCustomProvider(
+          pi,
+          providerName,
+          baseUrl,
+          apiKey,
+          detectedApi,
+          modelConfigs,
+          streamCompatMode,
+          openaiApiMode,
+          anthropicThinkingMode ?? "builtin",
+        );
       } catch (e: unknown) {
         return { content: [{ type: "text", text: `Registration failed: ${(e as Error).message}` }], details: {} };
       }
@@ -414,6 +442,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         apiKey,
         apiStyle: detectedApi,
         ...(openaiApiMode ? { openaiApiMode } : {}),
+        ...(anthropicThinkingMode && anthropicThinkingMode !== "builtin" ? { anthropicThinkingMode } : {}),
         models: persistedModels,
         createdAt: Date.now(),
         streamCompatMode,

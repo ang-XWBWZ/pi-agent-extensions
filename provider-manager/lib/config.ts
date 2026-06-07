@@ -7,6 +7,10 @@ import * as path from "node:path";
 
 // ---- 类型 ----
 
+export type AnthropicThinkingMode =
+  | "builtin"
+  | "adaptive_effort";
+
 export interface DiscoveredModel {
   id: string;
   name: string;
@@ -20,6 +24,7 @@ export interface CustomProviderEntry {
   apiKey: string;
   apiStyle: "openai" | "anthropic";
   openaiApiMode?: "chat-completions" | "responses";
+  anthropicThinkingMode?: AnthropicThinkingMode;
   models: DiscoveredModel[];
   createdAt: number;
   customStream?: boolean;
@@ -77,6 +82,12 @@ export function readCustomProviders(): Record<string, CustomProviderEntry> {
         openaiApiModeVal === "chat-completions" || openaiApiModeVal === "responses"
           ? openaiApiModeVal
           : undefined;
+      const anthropicThinkingModeVal = v.anthropicThinkingMode;
+      const anthropicThinkingMode: AnthropicThinkingMode | undefined =
+        anthropicThinkingModeVal === "builtin" ||
+        anthropicThinkingModeVal === "adaptive_effort"
+          ? anthropicThinkingModeVal
+          : undefined;
       result[key] = {
         baseUrl: v.baseUrl,
         apiKey: v.apiKey,
@@ -87,6 +98,7 @@ export function readCustomProviders(): Record<string, CustomProviderEntry> {
         customStream: v.customStream === true,
         customStreamExplicit: v.customStreamExplicit === true,
         streamCompatMode,
+        anthropicThinkingMode,
         supportsUsageInStreaming: typeof v.supportsUsageInStreaming === "boolean"
           ? v.supportsUsageInStreaming
           : undefined,
