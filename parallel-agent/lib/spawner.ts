@@ -71,19 +71,24 @@ export function spawnAllBackground(
     let subModel: Model<any> | undefined = undefined;
     let subThinkingLevel: string | undefined = undefined;
 
-    // 优先级 1: task.model 精确指定
-    if (task.model) {
-      const [p, m] = task.model.split("/");
-      const found = modelRegistry.find(p, m);
-      if (found) {
-        subModel = found;
-        subThinkingLevel = (
-          task as Record<string, unknown>
-        ).thinkingLevel as string | undefined;
-      } else {
-        console.warn(
-          `[parallel-agent] 模型 ${task.model} 未找到，降级`,
-        );
+    // 优先级 1: task.provider + task.model 或 task.model 精确指定
+    const taskRecord = task as SubTask & { provider?: string };
+    const explicitProvider = taskRecord.provider;
+    if (explicitProvider || task.model) {
+      const p = explicitProvider ?? task.model!.split("/")[0];
+      const m = explicitProvider ? task.model! : task.model!.split("/").slice(1).join("/") || task.model!;
+      if (p && m) {
+        const found = modelRegistry.find(p, m);
+        if (found) {
+          subModel = found;
+          subThinkingLevel = (
+            task as Record<string, unknown>
+          ).thinkingLevel as string | undefined;
+        } else {
+          console.warn(
+            `[parallel-agent] 模型 ${p}/${m} 未找到，降级`,
+          );
+        }
       }
     }
 

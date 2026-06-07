@@ -6,7 +6,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { DiscoveredModel } from "./config.js";
 import { normalizeBaseUrl, readCustomProviders } from "./config.js";
 import { createOpenAITolerantStream } from "./tolerant-stream.js";
-import { createAnthropicStream } from "./anthropic-stream.js";
 import { detectContextWindow } from "./discovery.js";
 
 export function buildModelConfigs(
@@ -46,6 +45,7 @@ export function registerCustomProvider(
   apiStyle: "openai" | "anthropic",
   modelConfigs: ReturnType<typeof buildModelConfigs>,
   streamCompatMode: "builtin" | "finish-reason-fallback",
+  openaiApiMode: "chat-completions" | "responses" = "chat-completions",
 ): void {
   const hdrs: Record<string, string> = {};
   let authHeader = false;
@@ -56,26 +56,26 @@ export function registerCustomProvider(
     authHeader = true;
   }
 
-  // Anthropic 风格始终注入我们自己的一处流处理器，不走内核
-  // 1) 思考等级 → budget_tokens 正确映射
-  // 2) 工具调用 Anthropic 语义正确解析
+  // Anthropic 风格默认走 Pi 内核 anthropic-messages stream。
+  // provider-manager 只负责供应商注册、key/baseUrl、模型配置和持久化。
   if (apiStyle === "anthropic") {
-    const apiName = `${providerName}-anthropic-custom`;
-    for (const m of modelConfigs) (m as any).api = apiName;
+    for (const m of modelConfigs) (m as any).api = "anthropic-messages";
     pi.registerProvider(providerName, {
       name: providerName,
       baseUrl: normalizeBaseUrl(baseUrl),
       apiKey,
-      api: apiName,
+      api: "anthropic-messages",
       headers: Object.keys(hdrs).length > 0 ? hdrs : undefined,
       authHeader: undefined,
       models: modelConfigs,
-      streamSimple: createAnthropicStream(),
     });
     return;
   }
 
   if (streamCompatMode === "finish-reason-fallback") {
+    if (openaiApiMode !== "chat-completions") {
+      throw new Error("finish-reason-fallback only supports OpenAI Chat Completions mode");
+    }
     if (apiStyle !== "openai") {
       throw new Error(`finish-reason-fallback 仅支持 OpenAI 风格，当前: ${apiStyle}`);
     }
@@ -98,7 +98,11 @@ export function registerCustomProvider(
     name: providerName,
     baseUrl: normalizeBaseUrl(baseUrl),
     apiKey,
-    api: apiStyle === "anthropic" ? "anthropic-messages" : "openai-completions",
+    api: apiStyle === "anthropic"
+      ? "anthropic-messages"
+      : openaiApiMode === "responses"
+        ? "openai-responses"
+        : "openai-completions",
     headers: Object.keys(hdrs).length > 0 ? hdrs : undefined,
     authHeader: authHeader || undefined,
     models: modelConfigs,
@@ -116,7 +120,16 @@ export function restoreCustomProviders(pi: ExtensionAPI): void {
       const legacyCustomStream = cfg.customStream === true && cfg.customStreamExplicit === true;
       const streamCompatMode = cfg.streamCompatMode
         ?? (legacyCustomStream ? "finish-reason-fallback" : "builtin");
-      registerCustomProvider(pi, name, cfg.baseUrl, cfg.apiKey, cfg.apiStyle, modelConfigs, streamCompatMode);
+      registerCustomProvider(
+        pi,
+        name,
+        cfg.baseUrl,
+        cfg.apiKey,
+        cfg.apiStyle,
+        modelConfigs,
+        streamCompatMode,
+        cfg.openaiApiMode ?? "chat-completions",
+      );
     } catch {
       // Skip failed re-registrations
     }

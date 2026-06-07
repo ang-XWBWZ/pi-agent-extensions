@@ -19,6 +19,7 @@ export interface CustomProviderEntry {
   baseUrl: string;
   apiKey: string;
   apiStyle: "openai" | "anthropic";
+  openaiApiMode?: "chat-completions" | "responses";
   models: DiscoveredModel[];
   createdAt: number;
   customStream?: boolean;
@@ -31,7 +32,10 @@ export interface TestResult {
   ok: boolean;
   error?: string;
   detectedApi?: "openai" | "anthropic";
+  openaiApiMode?: "chat-completions" | "responses";
+  supportsOpenAIResponses?: boolean;
   needsFinishReasonFallback?: boolean;
+  discoveredModels?: DiscoveredModel[];
 }
 
 // ---- 常量 ----
@@ -68,10 +72,16 @@ export function readCustomProviders(): Record<string, CustomProviderEntry> {
         streamCompatVal === "builtin" || streamCompatVal === "finish-reason-fallback"
           ? streamCompatVal
           : undefined;
+      const openaiApiModeVal = v.openaiApiMode;
+      const openaiApiMode: "chat-completions" | "responses" | undefined =
+        openaiApiModeVal === "chat-completions" || openaiApiModeVal === "responses"
+          ? openaiApiModeVal
+          : undefined;
       result[key] = {
         baseUrl: v.baseUrl,
         apiKey: v.apiKey,
         apiStyle: (v.apiStyle as "openai" | "anthropic") || "openai",
+        openaiApiMode,
         models: Array.isArray(v.models) ? (v.models as DiscoveredModel[]) : [],
         createdAt: (v.createdAt as number) || Date.now(),
         customStream: v.customStream === true,

@@ -60,7 +60,11 @@ export interface SubTask {
   context?: string[];
   skills?: string[];
   mode?: "plan" | "work" | "yolo";
+  provider?: string;
   model?: string;
+  tier?: string;
+  thinkingLevel?: string;
+  resumeFrom?: string;
 }
 
 export interface SubResult {
