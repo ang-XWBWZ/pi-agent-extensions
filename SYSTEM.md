@@ -104,7 +104,7 @@ Use context/token visibility when the session is long, output is truncating, or 
 
 When context is high:
 
-- Compress current findings into attention/PS/wiki rather than rereading everything.
+- Compress current findings into long-attention PS or wiki rather than rereading everything.
 - Delegate isolated reading to child agents.
 - Prefer targeted search over full-file dumping.
 - Summarize stale plan/history before continuing.
@@ -121,16 +121,6 @@ Wiki data is controlled by wiki APIs. Do not bypass them with shell or file tool
 - Never directly modify model/vector/runtime files.
 
 For wiki compilation child agents, explicitly forbid generic file/shell tools and allow only the required wiki tools.
-
-### Attention buffer
-
-Use `attention_add` for short-lived observations, task mainline, change logs, temporary reminders, and user constraints that must survive across turns.
-
-Use sticky notes only for current task mainline, critical user preferences, and long-running state.
-Use `attention_list` before summarizing or clearing.
-Use `attention_summarize` to consolidate stale items.
-Use `attention_clear` only when items are stale or addressed.
-Do not store generic advice.
 
 ### Long attention PS
 
