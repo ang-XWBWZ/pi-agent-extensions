@@ -320,8 +320,21 @@ export default function (pi: ExtensionAPI) {
           }
         };
 
+        // stderr 独立解码，用 [stderr] 行前缀标记
+        // 不进入 byteCount/lineCount 截断计数（stderr 通常较短）
+        // 使用独立 TextDecoder 避免干扰 stdout 的流式解码状态
+        const stderrDecoder = new TextDecoder(codepageToEncoding(codepage), { fatal: false });
+        child.stderr?.on("data", (chunk: Buffer) => {
+          const text = stderrDecoder.decode(chunk, { stream: true });
+          // 每行首加 [stderr] 前缀，但第一块的第一行不加（可能是 continuation）
+          const prefixed = text
+            .split("\n")
+            .map((l, idx) => (idx > 0 && l.trim() ? "[stderr] " + l : l))
+            .join("\n");
+          output += prefixed;
+          lineCount += (text.match(/\n/g) || []).length;
+        });
         child.stdout?.on("data", onOutputData);
-        child.stderr?.on("data", onOutputData);
 
         child.on("error", (err) => {
           cleanupAbort();

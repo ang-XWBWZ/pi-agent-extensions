@@ -99,15 +99,23 @@ export function setupPlanFeature(
     const fullText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
 
     // Detect explicit ## Execution Plan — works in ANY mode
+    //
+    // ⚠️ 竞态保护：ctx.ui.select 是异步的，在等待用户响应期间
+    // 下一轮 Agent 循环可能已经重置了 planProduced/planSteps。
+    // 使用 generation 计数器标识一次原子操作：
+    //   - 修改 planSteps 时递增 gen
+    //   - await 后检查 gen 未变才执行后续逻辑
     if (!s.planProduced && s.planSteps.length === 0) {
       const hasExplicitPlan = /(?:^|\n)#{2,}\s*Execution\s+Plan\s*\n/i.test(fullText);
       if (hasExplicitPlan) {
         const parsed = parsePlanSteps(fullText);
         if (parsed.length > 0) {
+          const _gen = (s as any)._planGen ?? 0;
           s.planProduced = true;
           s.planFullText = fullText;
           s.planSteps = parsed;
           s.appState = "planning";
+          (s as any)._planGen = _gen + 1;
           updatePlanPanel(ctx);
           if (s.mode !== "plan") { s.mode = "plan"; cb.persist(ctx); }
 
@@ -116,6 +124,15 @@ export function setupPlanFeature(
             "是否接受此计划？",
             ["是，开始执行", "修改计划"],
           );
+
+          // 竞态检测：await 期间如果 _planGen 已变（被重置），放弃执行
+          if ((s as any)._planGen !== _gen + 1) {
+            if (choice === "是，开始执行") {
+              ctx.ui.notify("计划状态已变更，无法自动接受。请重新输出计划。", "warning");
+            }
+            return;
+          }
+
           if (choice === "是，开始执行") {
             acceptPlan(ctx);
             setTimeout(() => {

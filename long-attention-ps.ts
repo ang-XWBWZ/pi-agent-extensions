@@ -175,8 +175,14 @@ function clearExpiredTurnItems(st: PsState): void {
   st.items = st.items.filter((it) => it.expires !== "turn");
 }
 
+// critical 优先级的 PS 每轮最多注入 4 轮（防止永生占据对话上下文）
+const MAX_CRITICAL_INJECTIONS = 4;
+
 function isCoolingDown(st: PsState, it: PsItem): boolean {
-  if (it.priority === "critical") return false;
+  if (it.priority === "critical") {
+    // critical 永不冷却，但有限注入次数上限
+    return it.usedCount >= MAX_CRITICAL_INJECTIONS;
+  }
   return st.sessionRounds - it.lastInjectedAt < st.config.cooldownRounds;
 }
 
@@ -190,7 +196,12 @@ function scoreItem(st: PsState, it: PsItem): number {
   score += TYPE_WEIGHT[it.type] * 3;
   if (it.expires === "project" || it.expires === "persistent") score += 5;
   if (it.expires === "turn") score += 8;
-  score -= Math.min(it.usedCount, 6) * 2;
+  // critical 额外衰减：注入次数越多分越低
+  if (it.priority === "critical") {
+    score -= Math.min(it.usedCount, MAX_CRITICAL_INJECTIONS) * 4;
+  } else {
+    score -= Math.min(it.usedCount, 6) * 2;
+  }
   return score;
 }
 

@@ -206,8 +206,15 @@ export function runSingleAgent(
               output += event.assistantMessageEvent.delta;
               instRef.outputLength = output.length;
               instRef.outputTokens += estimateTokens(event.assistantMessageEvent.delta);
-              if (output.length > 10_000)
-                output = output.slice(0, 10_000) + "\n...";
+              // 输出截断策略：保留头和尾，丢弃中间
+          // 避免大输出（代码审查、文件分析）丢尾导致关键结论丢失
+          const MAX_OUTPUT_CHARS = 10_000;
+          const TAIL_RESERVE = 2_000;
+          if (output.length > MAX_OUTPUT_CHARS) {
+            const head = output.slice(0, MAX_OUTPUT_CHARS - TAIL_RESERVE);
+            const tail = output.slice(-TAIL_RESERVE);
+            output = head + "\n\n... [中间截断 " + (output.length - MAX_OUTPUT_CHARS + TAIL_RESERVE) + " 字符] ...\n\n" + tail;
+          }
               updateInstanceStatus(jobId, task.id, {
                 detailedStatus: "thinking",
                 outputLength: instRef.outputLength,

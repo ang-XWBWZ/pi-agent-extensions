@@ -91,22 +91,34 @@ function convertToAnthropicMessages(messages: any[]): any[] {
     if (msg.role === "assistant") {
       if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
       const textParts = (msg.content || []).filter((b: any) => b?.type === "text" && b.text?.trim());
+      const thinkingParts = (msg.content || []).filter((b: any) => b?.type === "thinking" && b.thinking?.trim());
       const toolUses = (msg.content || []).filter((b: any) => b?.type === "toolCall");
-      if (toolUses.length > 0) {
-        result.push({
-          role: "assistant",
-          content: toolUses.map((tc: any) => ({
-            type: "tool_use",
-            id: tc.id || `toolu_${Date.now()}`,
-            name: tc.name || "",
-            input: tc.arguments || {},
-          })),
+
+      const content: any[] = [];
+
+      // 保留思考块：将 thinking 块序列化为 <thinking> 注释前缀
+      // 这样后续 API 调用时模型仍能看到自己的推理链
+      for (const tp of thinkingParts) {
+        content.push({ type: "text", text: `<thinking>\n${tp.thinking}\n</thinking>` });
+      }
+
+      // 正常文本
+      for (const tp of textParts) {
+        content.push({ type: "text", text: tp.text });
+      }
+
+      // 工具调用
+      for (const tc of toolUses) {
+        content.push({
+          type: "tool_use",
+          id: tc.id || `toolu_${Date.now()}`,
+          name: tc.name || "",
+          input: tc.arguments || {},
         });
-      } else if (textParts.length > 0) {
-        result.push({
-          role: "assistant",
-          content: textParts.map((b: any) => ({ type: "text", text: b.text })),
-        });
+      }
+
+      if (content.length > 0) {
+        result.push({ role: "assistant", content });
       }
       continue;
     }

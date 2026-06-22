@@ -1,9 +1,9 @@
 /**
  * config.ts — 类型定义 + settings 读写
+ *
+ * 自 v2.1 使用共享 settings-io 单例，不再直接读写磁盘。
+ * 避免与 model-switch 的 settings 写入冲突。
  */
-
-import * as fs from "node:fs";
-import * as path from "node:path";
 
 // ---- 类型 ----
 
@@ -48,24 +48,12 @@ export interface TestResult {
 export const CUSTOM_PROVIDERS_KEY = "customProviders";
 export const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 
-// ---- settings 路径 ----
+// ---- 自定义供应商持久化（通过共享 settings-io） ----
 
-export function sp(): string {
-  return path.join(process.env.USERPROFILE ?? ".", ".pi", "agent", "settings.json");
-}
-
-export function readSettings(): Record<string, unknown> {
-  try { return JSON.parse(fs.readFileSync(sp(), "utf-8")); } catch { return {}; }
-}
-
-export function writeSettingsRaw(data: Record<string, unknown>): void {
-  fs.writeFileSync(sp(), JSON.stringify(data, null, 2) + "\n", "utf-8");
-}
-
-// ---- 自定义供应商持久化 ----
+import { getSettings, updateSettings } from "../../lib/settings-io.js";
 
 export function readCustomProviders(): Record<string, CustomProviderEntry> {
-  const s = readSettings();
+  const s = getSettings();
   const providers = s[CUSTOM_PROVIDERS_KEY] as Record<string, unknown> | undefined;
   if (!providers || typeof providers !== "object") return {};
   const result: Record<string, CustomProviderEntry> = {};
@@ -109,10 +97,11 @@ export function readCustomProviders(): Record<string, CustomProviderEntry> {
 }
 
 export function writeCustomProviders(providers: Record<string, CustomProviderEntry>): void {
-  const s = readSettings();
-  if (Object.keys(providers).length > 0) s[CUSTOM_PROVIDERS_KEY] = providers;
-  else delete s[CUSTOM_PROVIDERS_KEY];
-  writeSettingsRaw(s);
+  updateSettings((s) => {
+    if (Object.keys(providers).length > 0) s[CUSTOM_PROVIDERS_KEY] = providers;
+    else delete s[CUSTOM_PROVIDERS_KEY];
+    return s;
+  });
 }
 
 // ---- 工具函数 ----

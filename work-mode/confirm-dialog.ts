@@ -6,16 +6,6 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { requestConfirm, requestInput } from "../lib/confirm-bus.js";
 import { wildcardMatch, guessPathPattern, guessCmdPattern } from "./path-guard.js";
 
-export async function showConfirm(
-  ctx: ExtensionContext,
-  label: string,
-  options: string[],
-  isSubAgent: boolean,
-): Promise<string | undefined> {
-  if (isSubAgent) return requestConfirm("path", label, "", options);
-  return ctx.ui.select(label, options);
-}
-
 export async function showBashConfirm(
   ctx: ExtensionContext,
   modeLabel: string,

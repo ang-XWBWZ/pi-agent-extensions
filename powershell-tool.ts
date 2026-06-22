@@ -46,11 +46,21 @@ function killProcessTree(pid: number): void {
   }
 }
 
-/** PowerShell 进程可能残留（Start-Process 等场景），兜底清理 */
-function killResidualPowerShell(): void {
+/**
+ * 安全地清理特定 PowerShell 进程树。
+ *
+ * 使用 taskkill /PID <pid> 按进程 ID 精确杀进程，
+ * 绝不会错杀用户的独立 PowerShell 窗口。
+ *
+ * 兜底链路：
+ *   1. 先 taskkill /T /PID childPid 杀进程树
+ *   2. 子进程可能已经变成了孤儿（Start-Process 场景），
+ *      但我们有 child.pid 就不应该出现其他同名进程被误杀。
+ */
+function killSpecificPowerShell(pid: number): void {
   if (process.platform === "win32") {
     try {
-      spawn("taskkill", ["/F", "/IM", "powershell.exe"], {
+      spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
         stdio: "ignore",
         detached: true,
       });
@@ -355,9 +365,10 @@ export default function (pi: ExtensionAPI) {
         // ── 超时定时器 ──
         const timer = setTimeout(() => {
           killed = true;
-          if (child.pid) killProcessTree(child.pid);
-          // 兜底：powershell.exe 可能残留
-          killResidualPowerShell();
+          if (child.pid) {
+            killProcessTree(child.pid);
+            killSpecificPowerShell(child.pid);
+          }
         }, timeoutSec * 1000);
 
         const finish = (result: Parameters<typeof resolve>[0]) => {
@@ -372,8 +383,10 @@ export default function (pi: ExtensionAPI) {
         // ========================================================
 
         if (signal?.aborted) {
-          if (child.pid) killProcessTree(child.pid);
-          killResidualPowerShell();
+          if (child.pid) {
+            killProcessTree(child.pid);
+            killSpecificPowerShell(child.pid);
+          }
           child.stdout?.destroy();
           child.stderr?.destroy();
           child.stdin?.destroy();
@@ -410,8 +423,10 @@ export default function (pi: ExtensionAPI) {
           }
 
           // 杀进程树
-          if (child.pid) killProcessTree(child.pid);
-          killResidualPowerShell();
+          if (child.pid) {
+            killProcessTree(child.pid);
+            killSpecificPowerShell(child.pid);
+          }
 
           // ★ 强制摧毁管道：Windows 上 child.kill() 只杀主进程，
           // 孙进程可能继续持有 stdout pipe，导致 close 事件永不触发
@@ -480,8 +495,18 @@ export default function (pi: ExtensionAPI) {
           }
         };
 
+        // stderr 独立解码，用 [stderr] 行前缀标记
+        // 不进入 byteCount/lineCount 截断计数（stderr 通常较短）
+        const stderrDecoder = new TextDecoder("utf-8", { fatal: false });
+        child.stderr?.on("data", (chunk: Buffer) => {
+          const text = stderrDecoder.decode(chunk, { stream: true });
+          const prefixed = text
+            .split("\n")
+            .map((l, idx) => (idx > 0 && l.trim() ? "[stderr] " + l : l))
+            .join("\n");
+          output += prefixed;
+        });
         child.stdout?.on("data", onOutputData);
-        child.stderr?.on("data", onOutputData);
 
         // ========================================================
         // spawn 错误

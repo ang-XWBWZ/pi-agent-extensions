@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage as SessionMessage } from "@earendil-works/pi-agent-core";
 
 // ---- 全局单例 ----
 
@@ -168,14 +168,15 @@ export interface AgentInstance {
   /** 内部：空闲检测定时器 */
   _idleTimer?: ReturnType<typeof setTimeout>;
   /** 内部：agent_end 时捕获的消息快照（session dispose 后仍可用） */
-  _savedMessages?: AgentMessage[];
+  _savedMessages?: SessionMessage[];
   /** 内部：是否已完成（防重复终止） */
   _settled?: boolean;
   /** 内部：统一清理函数（abort + dispose + unregister） */
   _dispose?: () => Promise<void>;
 }
 
-export interface AgentMessage {
+// Agent 间通信消息（区别于 pi-agent-core 的 SessionMessage / LLM 对话消息）
+export interface BusAgentMessage {
   msgId: string;
   from: string;
   to: string;
@@ -212,12 +213,13 @@ export interface AgentSaveState {
   taskId: string;
   name: string;
   model: string;
-  messages: AgentMessage[];
+  messages: SessionMessage[];
   savedAt: number;
 }
 
 function saveDir(): string {
-  const dir = join(process.env.USERPROFILE ?? ".", ".pi", "agent", "sub-agent-saves");
+  const home = process.env.HOME || process.env.USERPROFILE || ".";
+  const dir = join(home, ".pi", "agent", "sub-agent-saves");
   try { mkdirSync(dir, { recursive: true }); } catch { /* */ }
   return dir;
 }
@@ -227,7 +229,7 @@ export function saveAgentState(jobId: string, taskId: string): AgentSaveState | 
   if (!inst) return null;
 
   // 优先使用 session 实时消息，session dispose 后用快照
-  let messages: AgentMessage[];
+  let messages: SessionMessage[];
   try {
     messages = inst.session.state.messages;
   } catch {
@@ -585,20 +587,20 @@ export async function sendAgentInput(
 export function sendMessage(
   from: string,
   to: string,
-  type: AgentMessage["type"],
+  type: BusAgentMessage["type"],
   payload: string,
 ): string {
   const msgId = randomUUID();
-  const msg: AgentMessage = { msgId, from, to, type, payload, timestamp: Date.now() };
+  const msg: BusAgentMessage = { msgId, from, to, type, payload, timestamp: Date.now() };
   globalBus.emit(Events.AGENT_MESSAGE, msg);
   return msgId;
 }
 
 export function onMessage(
   target: string,
-  handler: (msg: AgentMessage) => void,
+  handler: (msg: BusAgentMessage) => void,
 ): () => void {
-  const wrapper = (msg: AgentMessage) => {
+  const wrapper = (msg: BusAgentMessage) => {
     if (msg.to === target || msg.to === "broadcast") {
       handler(msg);
     }

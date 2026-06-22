@@ -5,8 +5,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel, TierKey, TierConfig } from "../lib/types.js";
 import { isValidThinkingLevel, VALID_THINKING_LEVELS, TIER_DEFAULTS, thinkingLabel } from "../lib/types.js";
-import { readAllTiers, writeAllTiers, resolveTierModel, getCurrentTier, readSettings, writeSettingsRaw } from "../lib/tier-config.js";
+import { readAllTiers, writeAllTiers, resolveTierModel, getCurrentTier } from "../lib/tier-config.js";
 import { KEY_PROVIDER, KEY_MODEL, KEY_TIER } from "../lib/types.js";
+import { getSettings, updateSettings } from "../../lib/settings-io.js";
 
 export function registerTierCmds(
   pi: ExtensionAPI,
@@ -52,11 +53,12 @@ export function registerTierCmds(
         applyThinking(tier, t);
         statusLine(ctx);
         // 持久化
-        const s = readSettings();
-        s[KEY_PROVIDER] = r.provider;
-        s[KEY_MODEL] = r.model;
-        s[KEY_TIER] = tier;
-        writeSettingsRaw(s);
+        updateSettings((s) => {
+          s[KEY_PROVIDER] = r.provider;
+          s[KEY_MODEL] = r.model;
+          s[KEY_TIER] = tier;
+          return s;
+        });
       }
       const think = config[tier]?.thinkingLevel;
       ctx.ui.notify(ok ? `\u2705 ${tier} · ${config[tier].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "切换失败", ok ? "info" : "warning");

@@ -1,11 +1,15 @@
 /**
  * manage-skills.ts — manage_skills 工具注册
+ *
+ * 使用共享 settings-io 单例，避免直接读写磁盘冲突。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync, writeFileSync } from "node:fs";
-import { settingsPath } from "../lib/tier-resolver.js";
+import {
+  getSettings,
+  updateSettings,
+} from "../../lib/settings-io.js";
 
 export function registerManageSkills(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -36,14 +40,9 @@ export function registerManageSkills(pi: ExtensionAPI): void {
 
       const { action, skills } = params;
 
-      const settingsPath_ = settingsPath();
-      let raw: Record<string, unknown> = {};
-      try {
-        raw = JSON.parse(readFileSync(settingsPath_, "utf-8"));
-      } catch { /* 空对象兜底 */ }
-
-      const section = (raw.skills || {}) as Record<string, unknown>;
-      const currentList: string[] = Array.isArray(section.blacklist)
+      // 通过共享缓存读取 skills 配置，不从磁盘直接读取
+      const section = getSettings().skills as Record<string, unknown> | undefined;
+      const currentList: string[] = section && Array.isArray(section.blacklist)
         ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
         : [];
 
@@ -77,8 +76,10 @@ export function registerManageSkills(pi: ExtensionAPI): void {
             };
           }
           const newList = [...currentList, ...toAdd];
-          raw.skills = { blacklist: newList };
-          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          updateSettings((s) => {
+            s.skills = { blacklist: newList };
+            return s;
+          });
           ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 skill 到黑名单`, "warn");
           return {
             content: [{
@@ -102,8 +103,10 @@ export function registerManageSkills(pi: ExtensionAPI): void {
             };
           }
           const newList = currentList.filter((s) => !toRemove.includes(s));
-          raw.skills = { blacklist: newList };
-          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          updateSettings((s) => {
+            s.skills = { blacklist: newList };
+            return s;
+          });
           ctx.ui.notify(`🟢 已从黑名单移除 ${toRemove.length} 个 skill`, "info");
           return {
             content: [{
@@ -119,8 +122,10 @@ export function registerManageSkills(pi: ExtensionAPI): void {
             return { content: [{ type: "text", text: "blacklist_set 需要 skills 参数（传空数组 = 清空）" }], details: { error: "missing_skills" } };
           }
           const newList = skills.filter((s) => typeof s === "string");
-          raw.skills = { blacklist: newList };
-          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          updateSettings((s) => {
+            s.skills = { blacklist: newList };
+            return s;
+          });
           ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖黑名单: ${newList.length} 条` : "🟢 已清空黑名单", newList.length > 0 ? "warn" : "info");
           return {
             content: [{

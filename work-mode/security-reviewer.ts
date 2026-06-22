@@ -23,7 +23,7 @@ export interface SecurityFinding {
 // ============================================================
 
 /** 对计划文本执行安全审查 */
-export function securityReview(text: string, steps: string[]): SecurityFinding[] {
+export function securityReview(text: string, steps: Array<string | { text?: string }>): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
   const fullText = text.toLowerCase();
 

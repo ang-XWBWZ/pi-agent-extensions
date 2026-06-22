@@ -59,7 +59,6 @@ export function registerCustomProvider(
   }
 
   // Anthropic 风格：
-  // Anthropic 风格：
   //   builtin → 内核 anthropic-messages（兼容模式，手动切换）
   //   adaptive_effort → 自定义 stream，新版 adaptive thinking 协议（默认）
   if (apiStyle === "anthropic") {

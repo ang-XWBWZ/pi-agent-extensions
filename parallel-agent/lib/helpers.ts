@@ -107,8 +107,8 @@ export function partialReveal(content: string): string {
 export async function loadSkill(name: string): Promise<string> {
   const searchPaths = [
     resolve(process.cwd(), "skills", name, "SKILL.md"),
-    resolve(process.env.USERPROFILE ?? ".", ".pi", "agent", "skills", name, "SKILL.md"),
-    resolve(process.env.USERPROFILE ?? ".", ".agents", "skills", name, "SKILL.md"),
+    resolve(process.env.HOME || process.env.USERPROFILE || ".", ".pi", "agent", "skills", name, "SKILL.md"),
+    resolve(process.env.HOME || process.env.USERPROFILE || ".", ".agents", "skills", name, "SKILL.md"),
   ];
 
   for (const skillPath of searchPaths) {
