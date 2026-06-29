@@ -237,6 +237,12 @@ export default function (pi: ExtensionAPI) {
     description: "添加一条长程注意力 PS。用于保存主 agent 后续需要被短提醒的约束、决策、风险或未闭环事项。",
     promptSnippet: "Add a Runtime PS reminder for the main agent",
     promptGuidelines: [
+      "Use when: a stable constraint, user preference, prior decision, rejected option, risk, or open loop must survive future turns.",
+      "Do not use when: the information is just a current execution step, temporary search result, or generic advice.",
+      "Phase policy: Plan may store confirmed decisions or unresolved blockers; Work may store durable risks or handoff state.",
+      "Workflow: write one short actionable reminder with type, priority, and expiration; prefer expires=task/phase unless the decision is truly stable.",
+      "Conflict policy: use manage_requirements for active requirement questions; use manage_plan for execution steps; use PS only for cross-turn reminders.",
+      "Failure / fallback: if the reminder would be vague, do not store it.",
       "Use for compact, actionable reminders that should reappear across turns.",
       "Prefer high/critical only for explicit constraints, safety risks, or important prior decisions.",
       "Do not store generic advice. Each PS must be directly useful later.",

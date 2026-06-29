@@ -17,6 +17,10 @@ import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 
 import { join } from "node:path";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage as SessionMessage } from "@earendil-works/pi-agent-core";
+import type {
+  ConversationPhase,
+  ExecutionContext,
+} from "./workflow-types.js";
 
 // ---- 全局单例 ----
 
@@ -55,11 +59,13 @@ const state: AgentBusState =
 // ---- types ----
 
 export interface SubTask {
+  [key: string]: unknown;
   id: string;
   prompt: string;
   context?: string[];
   skills?: string[];
-  mode?: "plan" | "work" | "yolo";
+  phase?: ConversationPhase;
+  parentExecutionContext?: ExecutionContext;
   provider?: string;
   model?: string;
   tier?: string;

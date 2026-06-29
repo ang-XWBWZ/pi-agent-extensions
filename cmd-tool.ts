@@ -11,6 +11,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getExecutionContext, withPiExecutionEnv } from "./lib/execution-context.js";
+import { afterCommand, beforeCommand } from "./lib/work-goal-recorder.js";
 
 /** 跨平台进程树清理（与 pi 内核 shell.ts 的 killProcessTree 等价）*/
 function killProcessTree(pid: number): void {
@@ -56,6 +58,26 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+function resultText(result: unknown): string | undefined {
+  const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
+  const text = content
+    ?.filter((c) => c.type === "text")
+    .map((c) => c.text ?? "")
+    .join("\n");
+  return text || undefined;
+}
+
+function resultExitCode(result: unknown): number | null | undefined {
+  const details = (result as { details?: Record<string, unknown> }).details;
+  const exitCode = details?.exitCode;
+  return typeof exitCode === "number" ? exitCode : undefined;
+}
+
+function resultError(result: unknown): unknown {
+  const details = (result as { details?: Record<string, unknown> }).details;
+  return details?.error;
+}
+
 function codepageToEncoding(codepage: number): string {
   return ENCODING_LABELS[codepage] ?? "utf-8";
 }
@@ -77,6 +99,12 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Execute a command via cmd.exe and return its output",
 
     promptGuidelines: [
+      "Use when: you need fast Windows shell builtins, simple directory listing, process checks, or command-line verification.",
+      "Do not use when: a structured tool can do the job, the task needs JSON/CSV/object processing, or PowerShell is required for encoding-safe pipelines.",
+      "Phase policy: in Plan, only use read-only diagnostic commands; in Work, use for build/test/search commands; destructive, install, git push, or production commands require the active authorization policy.",
+      "Workflow: inspect with read/rg first when possible, then run the narrowest command that verifies the current hypothesis.",
+      "Conflict policy: prefer read/rg for file inspection, powershell for complex pipelines, and project-specific tools when available.",
+      "Failure / fallback: if output is garbled, retry with codepage=65001 or 936; if command output is truncated, read the temp file path from the result.",
       "Use cmd to run Windows shell commands (dir, findstr, where, type, etc.) instead of bash commands (ls, grep, find, cat).",
       "For path listing use 'dir /b' or 'dir' instead of 'ls'.",
       "For text search use 'findstr /s /i pattern *' instead of 'grep -r'.",
@@ -204,6 +232,11 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const command = String(params.command ?? "");
+      const cwd = ctx?.cwd ?? process.cwd();
+      const execCtx = getExecutionContext();
+      const started = await beforeCommand({ command, cwd });
+
       return new Promise((resolve) => {
         // 默认 30s 超时；AI 可传正数覆盖，无硬上限。非法值（0/负数/非数字）兜底到 30s
         const timeoutSec = (params.timeout != null && Number.isFinite(params.timeout) && params.timeout > 0)
@@ -218,9 +251,10 @@ export default function (pi: ExtensionAPI) {
         const decoder = new TextDecoder(encodingLabel, { fatal: false });
 
         // 强制 cmd.exe 输出编码与 TextDecoder 保持一致，消除 GBK/UTF-8 乱码
-        const safeCommand = `chcp ${codepage} >nul & ${params.command}`;
+        const safeCommand = `chcp ${codepage} >nul & ${command}`;
         const child = spawn("cmd.exe", ["/c", safeCommand], {
-          cwd: ctx?.cwd ?? process.cwd(),
+          cwd,
+          env: withPiExecutionEnv(process.env, execCtx),
           windowsHide: true,
           windowsVerbatimArguments: true,
           stdio: ["ignore", "pipe", "pipe"],
@@ -243,7 +277,14 @@ export default function (pi: ExtensionAPI) {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          resolve(result);
+          void afterCommand({
+            command,
+            cwd,
+            startedAt: started.startedAt,
+            exitCode: resultExitCode(result),
+            stdout: resultText(result),
+            error: resultError(result),
+          }).finally(() => resolve(result));
         };
 
         // === 可打断机制 ===
@@ -253,7 +294,7 @@ export default function (pi: ExtensionAPI) {
           if (child.pid) killProcessTree(child.pid);
           finish({
             content: [{ type: "text", text: "Cancelled (signal already aborted before execution)" }],
-            details: { command: params.command, exitCode: -1, cancelled: true },
+            details: { command, exitCode: -1, cancelled: true },
           });
           return;
         }
@@ -346,7 +387,7 @@ export default function (pi: ExtensionAPI) {
               },
             ],
             details: {
-              command: params.command,
+              command,
               exitCode: -1,
               error: err.message,
             },
@@ -360,7 +401,7 @@ export default function (pi: ExtensionAPI) {
 
           if (killed) {
             const killedDetails: Record<string, unknown> = {
-              command: params.command,
+              command,
               exitCode: signal?.aborted ? -1 : (code ?? -1),
               cancelled: !!signal?.aborted,
               timedOut: !signal?.aborted,
@@ -402,7 +443,7 @@ export default function (pi: ExtensionAPI) {
 
           // 截断信息放 details，content 保持完整输出（对齐 bash.ts）
           const details: Record<string, unknown> = {
-            command: params.command,
+            command,
             exitCode: code ?? 0,
           };
 

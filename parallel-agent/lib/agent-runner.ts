@@ -26,6 +26,7 @@ import {
   subAgentIdentity,
 } from "./helpers.js";
 import { loadSkillConfig } from "./tier-resolver.js";
+import { setExecutionContext } from "../../lib/execution-context.js";
 
 // ---- Session 创建串行化（防止并发 globalThis 写入） ----
 let sessionChain = Promise.resolve();
@@ -84,8 +85,12 @@ export function runSingleAgent(
 
         // ---- 串行化 globalThis 写入 ----
         sessionChain = sessionChain.then(async () => {
-          (globalThis as Record<string, unknown>).__pi_default_mode =
-            task.mode || "work";
+          if (task.parentExecutionContext?.approval?.inheritToChildren) {
+            setExecutionContext(task.parentExecutionContext);
+          }
+
+          (globalThis as Record<string, unknown>).__pi_default_phase =
+            task.phase || "work";
           (globalThis as Record<string, unknown>).__pi_is_sub_agent = true;
 
           try {
@@ -104,7 +109,7 @@ export function runSingleAgent(
             );
             return created.session;
           } finally {
-            delete (globalThis as Record<string, unknown>).__pi_default_mode;
+            delete (globalThis as Record<string, unknown>).__pi_default_phase;
             delete (globalThis as Record<string, unknown>).__pi_is_sub_agent;
           }
         });

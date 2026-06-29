@@ -39,9 +39,15 @@ export function registerManageProviders(pi: ExtensionAPI): void {
     description: "Register, remove, and list custom model providers.",
     promptSnippet: "Register/list/remove custom model providers. Use switch_model only after provider registration.",
     promptGuidelines: [
+      "Use when: the user explicitly wants to register, remove, repair, refresh, or inspect custom model providers.",
+      "Do not use when: ordinary model switching, tier routing, or thinking-level adjustment is enough.",
+      "Phase policy: Plan may list providers or plan a provider change; Work may register/remove only with explicit credentials and user intent.",
+      "Workflow: list existing providers -> register/refresh/remove -> switch_model or tier-add after registration succeeds.",
+      "Conflict policy: switch_model owns active model selection; manage_providers owns persistent provider configuration.",
+      "Failure / fallback: if connection tests fail, report baseUrl/apiStyle/model discovery diagnostics and stop instead of trying random modes repeatedly.",
       "Use action=register with baseUrl+apiKey to add a custom provider.",
       "apiStyle can be auto, openai, or anthropic; auto tests OpenAI-compatible first.",
-      "For OpenAI providers, openaiApiMode can be auto, responses, or chat-completions; prefer auto unless the user asks for a specific path.",
+      "For OpenAI providers, default to Chat Completions compatibility mode. Use Responses direct mode only as an explicit or fallback path.",
       "Use streamCompatMode=finish-reason-fallback only for OpenAI Chat Completions streams that lack finish_reason.",
       "AI may proactively choose apiStyle, openaiApiMode, and streamCompatMode based on provider capability tests.",
       "Provider names are suffixed with detected API style: {name}-{openai|anthropic}.",
@@ -61,7 +67,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       baseUrl: Type.Optional(Type.String({ description: "API base URL for register" })),
       apiKey: Type.Optional(Type.String({ description: "API key for register" })),
       apiStyle: Type.Optional(Type.String({ description: "openai|anthropic|auto, default auto" })),
-      openaiApiMode: Type.Optional(Type.String({ description: "OpenAI API mode: auto(default) | responses | chat-completions" })),
+      openaiApiMode: Type.Optional(Type.String({ description: "OpenAI API mode: auto(default: prefer chat-completions compatibility, fallback responses) | chat-completions | responses" })),
       testModel: Type.Optional(Type.String({ description: "Model ID used for connection tests" })),
       contextWindow: Type.Optional(Type.Number({ description: "Optional context window override" })),
       maxTokens: Type.Optional(Type.Number({ description: "Optional max output token override" })),
@@ -338,7 +344,8 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `Invalid openaiApiMode: ${requestedOpenAIMode}. Supported: auto | responses | chat-completions` }], details: {} };
       }
 
-      const testResult = await testProviderConnection(baseUrl, apiKey, apiStyle, params.testModel);
+      const preferredOpenAIMode = requestedOpenAIMode === "responses" ? "responses" : "chat-completions";
+      const testResult = await testProviderConnection(baseUrl, apiKey, apiStyle, params.testModel, preferredOpenAIMode);
       if (!testResult.ok) {
         return { content: [{ type: "text", text: `Connection test failed: ${testResult.error}\nCheck baseUrl, apiKey, and API style.` }], details: {} };
       }
@@ -349,9 +356,15 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           ? (testResult.openaiApiMode ?? "chat-completions")
           : requestedOpenAIMode as OpenAIApiMode
         : undefined;
+      if (detectedApi === "openai" && requestedOpenAIMode === "chat-completions" && testResult.openaiApiMode !== "chat-completions") {
+        return {
+          content: [{ type: "text", text: "OpenAI Chat Completions compatibility test failed; Responses direct mode appears available. Use openaiApiMode=auto or responses if you want the fallback path." }],
+          details: { detectedMode: testResult.openaiApiMode },
+        };
+      }
       if (detectedApi === "openai" && requestedOpenAIMode === "responses" && testResult.openaiApiMode !== "responses") {
         return {
-          content: [{ type: "text", text: "OpenAI Responses API stream test failed; cannot register with openaiApiMode=responses. Use auto or chat-completions." }],
+          content: [{ type: "text", text: "OpenAI Responses direct-mode stream test failed; cannot register with openaiApiMode=responses. Use auto or chat-completions compatibility mode." }],
           details: { supportsOpenAIResponses: testResult.supportsOpenAIResponses === true },
         };
       }

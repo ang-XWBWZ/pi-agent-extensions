@@ -30,6 +30,12 @@ export function registerSwitchModel(
     description: "切换模型、查看模型列表、管理模型层级和思考深度。",
     promptSnippet: "List/switch models; manage tier config; set thinking level",
     promptGuidelines: [
+      "Use when: task complexity, context size, cost, or reasoning depth justifies a model or thinking-level change.",
+      "Do not use when: the current model is adequate, the task is already in progress and switching would disrupt continuity, or the user asked not to switch.",
+      "Phase policy: Chat/Plan may temporarily switch for analysis; Work may switch for implementation quality; tier/default configuration changes require explicit user intent.",
+      "Workflow: use tier for normal routing; use provider+model only for an explicit model choice; use thinkingLevel alone for temporary reasoning depth changes.",
+      "Conflict policy: use manage_providers for provider registration; do not modify provider config from this tool.",
+      "Failure / fallback: if a tier/model is unavailable, continue with the current model and report the missing config instead of looping.",
       "Without args: list models grouped by configured tiers.",
       "With provider+model: switch to that model.",
       "With tier: switch to tier's model + thinking level.",

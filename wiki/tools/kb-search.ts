@@ -51,6 +51,12 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       "搜索 wiki 知识库。每页 10 条，返回总数。支持 keyword / semantic / hybrid 模式。",
     promptSnippet: "Search wiki (query, mode?, fullContent?, page?)",
     promptGuidelines: [
+      "Use when: project memory, domain terminology, prior decisions, or user-specific notes may clarify the request.",
+      "Do not use when: the answer is already in the current repository context or a direct file read is more precise.",
+      "Phase policy: Chat/Plan may search proactively; Work may search to resolve a concrete implementation question.",
+      "Workflow: search first, inspect result titles/snippets, then read a specific entry only when details are needed.",
+      "Conflict policy: use repository read/rg for source truth; use wiki for historical context and domain memory.",
+      "Failure / fallback: try 2-3 query variants, then stop and report no match instead of looping.",
       // ── 工作流前置 ──
       "## Wiki Setup (required before searching)",
       "Minimal: wiki_DANGER_load → wiki_read_search works with keyword mode.",

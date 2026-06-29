@@ -13,6 +13,7 @@ import {
   type SubTask,
   type AgentJob,
 } from "../../lib/agent-bus.js";
+import { getExecutionContext } from "../../lib/execution-context.js";
 import { loadToolConfig } from "../lib/tier-resolver.js";
 import { spawnAllBackground } from "../lib/spawner.js";
 
@@ -41,6 +42,13 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
       "在后台并行运行，不阻塞主 Agent。返回 jobId 用于查询结果。",
     promptSnippet: "Spawn sub-agents for parallel code exploration (read-only)",
     promptGuidelines: [
+      "Use when: the task has independent search, review, comparison, or analysis branches that can run in parallel.",
+      "Do not use when: a single local read/search is enough, the decision must be owned by the main agent, or the task needs unsafe side effects.",
+      "Phase policy: in Plan, sub-agents should be read-only analysts by default; in Work, delegate bounded implementation or verification only when the scope is explicit.",
+      "Authorization policy: sub-agents run guarded by default. Use autonomy:'auto' only when the current Work authorization explicitly allows inheritance.",
+      "Workflow: give each task Goal, Scope, Allowed tools, Forbidden tools, Expected output, and Stop condition.",
+      "Conflict policy: use direct read/rg for cheap local lookups; use spawn_agent only for parallelism or second-pass review.",
+      "Failure / fallback: if a sub-agent times out or returns vague output, narrow the task and retry once, or continue with direct inspection.",
       "Use spawn_agent to delegate exploration/research to sub-agents.",
       "Each task runs in an isolated in-memory session with default tools.",
       "Keep prompts focused on analysis. Results returned as structured JSON.",
@@ -66,7 +74,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
           prompt: Type.String({ description: "子任务描述" }),
           context: Type.Optional(Type.Array(Type.String())),
           skills: Type.Optional(Type.Array(Type.String())),
-          mode: Type.Optional(StringEnum(["plan", "work", "yolo"] as const)),
+          phase: Type.Optional(StringEnum(["chat", "plan", "work"] as const)),
           provider: Type.Optional(Type.String({ description: "模型 provider（和 model 搭配使用，优先级高于 tier）" })),
           model: Type.Optional(Type.String({ description: "模型 ID（可单独用 provider/model 格式，也可和 provider 分开指定）" })),
           tier: Type.Optional(Type.String({ description: "模型层级: L0(快速) | L1(主要) | L2(高级)。自动选模型+思考深度" })),
@@ -122,14 +130,25 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
         }
       }
 
-      const job = createJob(resolvedTasks);
+      const parentExecutionContext = getExecutionContext();
+      const inheritableExecutionContext =
+        parentExecutionContext.approval.inheritToChildren
+          ? parentExecutionContext
+          : undefined;
+      const inheritedTasks = resolvedTasks.map((task) => ({
+        ...task,
+        parentExecutionContext:
+          task.parentExecutionContext ?? inheritableExecutionContext,
+      }));
+
+      const job = createJob(inheritedTasks);
       job.status = "running";
 
       try {
         pi.appendEntry("agent-job", {
           jobId: job.jobId,
           total,
-          tasks: resolvedTasks.map((t) => ({ id: t.id, prompt: t.prompt.slice(0, 80) })),
+          tasks: inheritedTasks.map((t) => ({ id: t.id, prompt: t.prompt.slice(0, 80) })),
           createdAt: job.createdAt,
           status: "running",
         });
@@ -139,7 +158,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
 
       spawnAllBackground(
         job.jobId,
-        resolvedTasks,
+        inheritedTasks,
         ctx.cwd,
         defaultModel,
         ctx.modelRegistry,

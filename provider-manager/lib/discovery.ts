@@ -241,6 +241,7 @@ export async function testProviderConnection(
   apiKey: string,
   apiStyle: string = "auto",
   testModel?: string,
+  preferredOpenAIMode: "chat-completions" | "responses" = "chat-completions",
 ): Promise<TestResult> {
   const clean = normalizeBaseUrl(baseUrl);
 
@@ -261,6 +262,21 @@ export async function testProviderConnection(
         if (!model) {
           if (apiStyle === "openai") return { ok: false, error: "/v1/models returned an empty model list" };
         } else {
+          let chatResult: ChatStreamResult | undefined;
+          if (preferredOpenAIMode === "chat-completions") {
+            chatResult = await testOpenAIChatStream(clean, apiKey, model);
+            if (chatResult.kind === "hasFinishReason" || chatResult.kind === "noFinishReason") {
+              return {
+                ok: true,
+                detectedApi: "openai",
+                openaiApiMode: "chat-completions",
+                supportsOpenAIResponses: false,
+                needsFinishReasonFallback: chatResult.kind === "noFinishReason",
+                discoveredModels,
+              };
+            }
+          }
+
           const responsesResult = await testOpenAIResponsesStream(clean, apiKey, model);
           if (responsesResult.kind === "supported") {
             const toolResult = await testOpenAIResponsesToolStream(clean, apiKey, model);
@@ -275,19 +291,26 @@ export async function testProviderConnection(
             }
           }
 
-          const chatResult = await testOpenAIChatStream(clean, apiKey, model);
-          if (chatResult.kind === "hasFinishReason" || chatResult.kind === "noFinishReason") {
-            return {
-              ok: true,
-              detectedApi: "openai",
-              openaiApiMode: "chat-completions",
-              supportsOpenAIResponses: false,
-              needsFinishReasonFallback: chatResult.kind === "noFinishReason",
-              discoveredModels,
-            };
+          if (preferredOpenAIMode === "responses") {
+            chatResult = await testOpenAIChatStream(clean, apiKey, model);
+            if (chatResult.kind === "hasFinishReason" || chatResult.kind === "noFinishReason") {
+              return {
+                ok: true,
+                detectedApi: "openai",
+                openaiApiMode: "chat-completions",
+                supportsOpenAIResponses: false,
+                needsFinishReasonFallback: chatResult.kind === "noFinishReason",
+                discoveredModels,
+              };
+            }
           }
+
           if (apiStyle === "openai") {
-            return { ok: false, error: `/v1/chat/completions unavailable (HTTP ${chatResult.status}); try anthropic style or check API style` };
+            const chatStatus = chatResult?.kind === "endpointError" ? `HTTP ${chatResult.status}` : "unavailable";
+            return {
+              ok: false,
+              error: `OpenAI-compatible tests failed: Chat Completions ${chatStatus}; Responses unavailable or incompatible`,
+            };
           }
         }
       } else if (apiStyle === "openai") {
