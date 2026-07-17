@@ -15,6 +15,7 @@ import {
   discoverModelsFromProvider,
   discoverModelsFromProviderWithDiagnostics,
 } from "../lib/discovery.js";
+import { updateCustomModelLimits } from "../lib/model-limits.js";
 import { buildModelConfigs, registerCustomProvider } from "../lib/register.js";
 
 type OpenAIApiMode = "chat-completions" | "responses";
@@ -52,7 +53,9 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       "AI may proactively choose apiStyle, openaiApiMode, and streamCompatMode based on provider capability tests.",
       "Provider names are suffixed with detected API style: {name}-{openai|anthropic}.",
       "All custom provider models support every standard thinking level by default.",
+      "Automatic context-window inference uses Codex authorization defaults, not API-only maximums. Use contextWindow, set_context_window, or set_model_limits for explicit provider-specific limits.",
       "Use action=set_reasoning_models with provider+reasoningModels only when you want to restrict reasoning models.",
+      "Use action=set_context_window with provider+model+contextWindow to adjust an already registered model's context window.",
       "Use action=set_model_limits with provider+model+contextWindow/maxTokens to edit one model's limits.",
       "Use action=refresh_models with provider=<name> to rediscover and persist models for an existing provider.",
       "Use action=set_stream_compat_mode with provider+streamCompatMode to switch an OpenAI Chat Completions provider between builtin and finish-reason-fallback.",
@@ -61,9 +64,9 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       "Use action=remove with provider=<name> to unregister and remove a custom provider.",
     ],
     parameters: Type.Object({
-      action: Type.Optional(Type.String({ description: "register|remove|list|set_reasoning_models|set_model_limits|set_stream_compat_mode|refresh_models" })),
+      action: Type.Optional(Type.String({ description: "register|remove|list|set_reasoning_models|set_context_window|set_model_limits|set_stream_compat_mode|refresh_models" })),
       provider: Type.Optional(Type.String({ description: "Provider name" })),
-      model: Type.Optional(Type.String({ description: "Model ID for set_model_limits" })),
+      model: Type.Optional(Type.String({ description: "Model ID for set_context_window or set_model_limits" })),
       baseUrl: Type.Optional(Type.String({ description: "API base URL for register" })),
       apiKey: Type.Optional(Type.String({ description: "API key for register" })),
       apiStyle: Type.Optional(Type.String({ description: "openai|anthropic|auto, default auto" })),
@@ -147,7 +150,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         };
       }
 
-      if (action === "set_model_limits") {
+      if (action === "set_context_window" || action === "set_model_limits") {
         const providerName = params.provider?.trim();
         const modelId = params.model?.trim();
         if (!providerName) return { content: [{ type: "text", text: "provider is required" }], details: {} };
@@ -160,56 +163,22 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         if (maxTokens !== undefined && (!Number.isFinite(maxTokens) || maxTokens <= 0)) {
           return { content: [{ type: "text", text: "maxTokens must be positive" }], details: {} };
         }
-        if (contextWindow === undefined && maxTokens === undefined) {
+        if (action === "set_context_window" && contextWindow === undefined) {
+          return { content: [{ type: "text", text: "contextWindow is required" }], details: {} };
+        }
+        if (action === "set_model_limits" && contextWindow === undefined && maxTokens === undefined) {
           return { content: [{ type: "text", text: "contextWindow or maxTokens is required" }], details: {} };
         }
 
-        const customProviders = readCustomProviders();
-        const cfg = customProviders[providerName];
-        if (!cfg) {
-          const keys = Object.keys(customProviders);
-          return { content: [{ type: "text", text: `Provider does not exist: ${providerName}. Registered: ${keys.join(", ") || "(none)"}` }], details: {} };
-        }
-
-        let found = false;
-        cfg.models = cfg.models.map((m) => {
-          if (m.id !== modelId) return m;
-          found = true;
+        try {
+          const updated = updateCustomModelLimits(pi, providerName, modelId, contextWindow, maxTokens);
           return {
-            ...m,
-            ...(contextWindow !== undefined ? { contextWindow } : {}),
-            ...(maxTokens !== undefined ? { maxTokens } : {}),
+            content: [{ type: "text", text: `Updated ${providerName}/${modelId}: contextWindow=${updated.contextWindow}, maxTokens=${updated.maxTokens}` }],
+            details: updated,
           };
-        });
-        if (!found) {
-          return { content: [{ type: "text", text: `Model does not exist: ${providerName}/${modelId}` }], details: {} };
+        } catch (e: unknown) {
+          return { content: [{ type: "text", text: (e as Error).message }], details: {} };
         }
-
-        customProviders[providerName] = cfg;
-        writeCustomProviders(customProviders);
-
-        const compat = cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
-          ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
-          : undefined;
-        const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
-        try { pi.unregisterProvider(providerName); } catch {}
-        registerCustomProvider(
-          pi,
-          providerName,
-          cfg.baseUrl,
-          cfg.apiKey,
-          cfg.apiStyle,
-          modelConfigs,
-          cfg.streamCompatMode ?? "builtin",
-          cfg.openaiApiMode ?? "chat-completions",
-          cfg.anthropicThinkingMode ?? "builtin",
-        );
-
-        const updated = modelConfigs.find((m) => m.id === modelId);
-        return {
-          content: [{ type: "text", text: `Updated ${providerName}/${modelId}: contextWindow=${updated?.contextWindow}, maxTokens=${updated?.maxTokens}` }],
-          details: { provider: providerName, model: modelId, contextWindow: updated?.contextWindow, maxTokens: updated?.maxTokens },
-        };
       }
 
       if (action === "set_stream_compat_mode") {
@@ -323,7 +292,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       }
 
       if (action !== "register") {
-        return { content: [{ type: "text", text: `Unknown action: ${action}. Supported: register|remove|list|set_reasoning_models|set_model_limits|set_stream_compat_mode|refresh_models` }], details: {} };
+        return { content: [{ type: "text", text: `Unknown action: ${action}. Supported: register|remove|list|set_reasoning_models|set_context_window|set_model_limits|set_stream_compat_mode|refresh_models` }], details: {} };
       }
 
       const baseUrl = params.baseUrl?.trim();
@@ -412,7 +381,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       );
 
       const streamCompatModeRaw = params.streamCompatMode
-        || (detectedApi === "openai" && openaiApiMode === "chat-completions" && testResult.needsFinishReasonFallback
+        || (detectedApi === "openai" && openaiApiMode === "chat-completions"
           ? "finish-reason-fallback"
           : "builtin");
       if (!isStreamCompatMode(streamCompatModeRaw)) {

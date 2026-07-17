@@ -136,9 +136,9 @@ export function restoreCustomProviders(pi: ExtensionAPI): void {
         ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
         : undefined;
       const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
-      const legacyCustomStream = cfg.customStream === true && cfg.customStreamExplicit === true;
+      const isOpenAIChatCompletions = cfg.apiStyle === "openai" && (cfg.openaiApiMode ?? "chat-completions") === "chat-completions";
       const streamCompatMode = cfg.streamCompatMode
-        ?? (legacyCustomStream ? "finish-reason-fallback" : "builtin");
+        ?? (isOpenAIChatCompletions ? "finish-reason-fallback" : "builtin");
       registerCustomProvider(
         pi,
         name,

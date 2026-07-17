@@ -151,6 +151,34 @@ export function runSingleAgent(
         // ---- 输出收集 ----
         let output = "";
 
+        const extractAssistantText = (messages: unknown): string => {
+          if (!Array.isArray(messages)) return "";
+          const parts: string[] = [];
+          for (const msg of messages) {
+            const m = msg as { role?: string; content?: unknown };
+            if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+            for (const block of m.content) {
+              const b = block as { type?: string; text?: unknown };
+              if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+                parts.push(b.text);
+              }
+            }
+          }
+          return parts.join("\n\n").trim();
+        };
+
+        const truncateOutput = () => {
+          // 输出截断策略：保留头和尾，丢弃中间
+          // 避免大输出（代码审查、文件分析）丢尾导致关键结论丢失
+          const MAX_OUTPUT_CHARS = 10_000;
+          const TAIL_RESERVE = 2_000;
+          if (output.length > MAX_OUTPUT_CHARS) {
+            const head = output.slice(0, MAX_OUTPUT_CHARS - TAIL_RESERVE);
+            const tail = output.slice(-TAIL_RESERVE);
+            output = head + "\n\n... [中间截断 " + (output.length - MAX_OUTPUT_CHARS + TAIL_RESERVE) + " 字符] ...\n\n" + tail;
+          }
+        };
+
         // ---- 空闲检测 + 自动续推 ----
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
         let autoContinueTimer: ReturnType<typeof setTimeout> | null = null;
@@ -209,17 +237,9 @@ export function runSingleAgent(
           if (event.type === "message_update") {
             if (event.assistantMessageEvent.type === "text_delta") {
               output += event.assistantMessageEvent.delta;
-              instRef.outputLength = output.length;
               instRef.outputTokens += estimateTokens(event.assistantMessageEvent.delta);
-              // 输出截断策略：保留头和尾，丢弃中间
-          // 避免大输出（代码审查、文件分析）丢尾导致关键结论丢失
-          const MAX_OUTPUT_CHARS = 10_000;
-          const TAIL_RESERVE = 2_000;
-          if (output.length > MAX_OUTPUT_CHARS) {
-            const head = output.slice(0, MAX_OUTPUT_CHARS - TAIL_RESERVE);
-            const tail = output.slice(-TAIL_RESERVE);
-            output = head + "\n\n... [中间截断 " + (output.length - MAX_OUTPUT_CHARS + TAIL_RESERVE) + " 字符] ...\n\n" + tail;
-          }
+              truncateOutput();
+              instRef.outputLength = output.length;
               updateInstanceStatus(jobId, task.id, {
                 detailedStatus: "thinking",
                 outputLength: instRef.outputLength,
@@ -295,6 +315,11 @@ export function runSingleAgent(
             if (abortedExternally) {
               abortedExternally = false;
               return;
+            }
+            if (!output.trim()) {
+              output = extractAssistantText(event.messages) || extractAssistantText(instRef._savedMessages);
+              truncateOutput();
+              instRef.outputLength = output.length;
             }
             await finish({
               id: task.id,

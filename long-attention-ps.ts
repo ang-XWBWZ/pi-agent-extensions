@@ -23,6 +23,8 @@ type PsType =
   | "note";
 type PsExpires = "turn" | "task" | "phase" | "session" | "project" | "persistent";
 type PsSource = "agent" | "user" | "tool" | "shadow" | "runtime";
+type PsPhase = "hot" | "warm" | "cold" | "archived";
+type PsMode = "silent" | "visible";
 
 interface PsItem {
   id: string;
@@ -32,8 +34,12 @@ interface PsItem {
   expires: PsExpires;
   source: PsSource;
   createdAt: number;
+  createdRound: number;
   lastInjectedAt: number;
   usedCount: number;
+  phase: PsPhase;
+  mode: PsMode;
+  keywords: string[];
   enabled: boolean;
 }
 
@@ -43,6 +49,10 @@ interface PsConfig {
   maxCharsPerItem: number;
   cooldownRounds: number;
   injectLowPriority: boolean;
+  minScore: number;
+  enableRelevance: boolean;
+  hotRounds: number;
+  warmRounds: number;
 }
 
 interface PsState {
@@ -50,17 +60,23 @@ interface PsState {
   config: PsConfig;
   sessionRounds: number;
   calibrated: boolean;
+  configVersion: number;
 }
 
 const MARKER = "[long-attention-ps]";
 const STATE_KEY = "__pi_long_attention_ps";
+const CONFIG_VERSION = 2;
 
 const DEFAULT_CONFIG: PsConfig = {
-  maxPsPerTurn: 3,
-  maxItems: 32,
-  maxCharsPerItem: 180,
-  cooldownRounds: 2,
+  maxPsPerTurn: 1,
+  maxItems: 16,
+  maxCharsPerItem: 140,
+  cooldownRounds: 6,
   injectLowPriority: false,
+  minScore: 14,
+  enableRelevance: true,
+  hotRounds: 3,
+  warmRounds: 12,
 };
 
 const PRIORITY_WEIGHT: Record<PsPriority, number> = {
@@ -82,20 +98,47 @@ const TYPE_WEIGHT: Record<PsType, number> = {
   note: 1,
 };
 
+const PHASE_FACTOR: Record<PsPhase, number> = {
+  hot: 1.0,
+  warm: 0.55,
+  cold: 0.35,
+  archived: 0,
+};
+
 let idCounter = 0;
 
 function loadState(): PsState {
   const raw = (globalThis as Record<string, unknown>)[STATE_KEY] as PsState | undefined;
   if (raw) {
+    const legacyVersion = raw.configVersion ?? 1;
     raw.config = { ...DEFAULT_CONFIG, ...(raw.config ?? {}) };
+    if (legacyVersion < CONFIG_VERSION) {
+      raw.config.maxPsPerTurn = Math.min(raw.config.maxPsPerTurn, DEFAULT_CONFIG.maxPsPerTurn);
+      raw.config.maxItems = Math.min(raw.config.maxItems, DEFAULT_CONFIG.maxItems);
+      raw.config.maxCharsPerItem = Math.min(raw.config.maxCharsPerItem, DEFAULT_CONFIG.maxCharsPerItem);
+      raw.config.cooldownRounds = Math.max(raw.config.cooldownRounds, DEFAULT_CONFIG.cooldownRounds);
+      raw.config.minScore = DEFAULT_CONFIG.minScore;
+      raw.config.enableRelevance = DEFAULT_CONFIG.enableRelevance;
+      raw.config.hotRounds = DEFAULT_CONFIG.hotRounds;
+      raw.config.warmRounds = DEFAULT_CONFIG.warmRounds;
+      raw.configVersion = CONFIG_VERSION;
+    }
     raw.items ??= [];
     raw.sessionRounds ??= 0;
     raw.calibrated ??= false;
     for (const it of raw.items) {
+      it.message = trimText(it.message, raw.config.maxCharsPerItem);
       it.lastInjectedAt ??= -999_999;
       it.usedCount ??= 0;
       it.enabled ??= true;
+      it.createdRound ??= Math.max(0, raw.sessionRounds - it.usedCount);
+      it.phase = parsePhase((it as Partial<PsItem>).phase ?? inferInitialPhase(it.type, it.priority, it.expires));
+      it.mode = parseMode((it as Partial<PsItem>).mode);
+      it.keywords = Array.isArray((it as Partial<PsItem>).keywords)
+        ? (it as Partial<PsItem>).keywords!.filter((x): x is string => typeof x === "string")
+        : extractKeywords(it.message);
     }
+    while (raw.items.length > raw.config.maxItems) evictOne(raw);
     return raw;
   }
 
@@ -104,6 +147,7 @@ function loadState(): PsState {
     config: { ...DEFAULT_CONFIG },
     sessionRounds: 0,
     calibrated: false,
+    configVersion: CONFIG_VERSION,
   };
   (globalThis as Record<string, unknown>)[STATE_KEY] = fresh;
   return fresh;
@@ -116,6 +160,42 @@ function nextId(): string {
 function trimText(text: string, max: number): string {
   const s = String(text ?? "").trim().replace(/\s+/g, " ");
   return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+function inferInitialPhase(type: PsType, priority: PsPriority, expires: PsExpires): PsPhase {
+  if (expires === "turn" || type === "open_loop" || type === "risk_memory" || type === "task_state") return "hot";
+  if (priority === "critical" || priority === "high" || type === "project_constraint" || type === "prior_decision") return "warm";
+  if (expires === "persistent" || type === "user_preference" || type === "environment_fact") return "cold";
+  return "warm";
+}
+
+function extractKeywords(message: string): string[] {
+  const text = message.toLowerCase();
+  const kws = new Set<string>();
+  const pairs: Array<[RegExp, string]> = [
+    [/\bwsl\b|linux|ubuntu/, "wsl"],
+    [/windows|powershell|cmd\.exe|\bcmd\b/, "windows"],
+    [/git|commit|push|stash|branch|merge/, "git"],
+    [/部署|deploy|copy|复制|安装|reload|重载/, "deploy"],
+    [/测试|test|check|校验|verify|验证/, "test"],
+    [/删除|delete|remove|清理|clear|覆盖|overwrite/, "destructive"],
+    [/provider|供应商|openai|anthropic|模型/, "provider"],
+    [/parallel-agent|sub-agent|子\s*agent|子进程|通信|结果汇报/, "parallel-agent"],
+    [/wiki|知识库|语义搜索|semantic/, "wiki"],
+    [/计划|plan|work|需求|requirements/, "workflow"],
+  ];
+  for (const [re, kw] of pairs) if (re.test(text)) kws.add(kw);
+  return [...kws];
+}
+
+function parsePhase(raw: unknown): PsPhase {
+  const s = String(raw ?? "");
+  return (["hot", "warm", "cold", "archived"] as string[]).includes(s) ? s as PsPhase : "warm";
+}
+
+function parseMode(raw: unknown): PsMode {
+  const s = String(raw ?? "silent");
+  return s === "visible" ? "visible" : "silent";
 }
 
 function parsePriority(raw: unknown): PsPriority {
@@ -152,18 +232,26 @@ function evictOne(st: PsState): void {
 function addPs(
   st: PsState,
   message: string,
-  options: Partial<Pick<PsItem, "type" | "priority" | "expires" | "source">> = {},
+  options: Partial<Pick<PsItem, "type" | "priority" | "expires" | "source" | "phase" | "mode" | "keywords">> = {},
 ): PsItem {
+  const type = options.type ?? "note";
+  const priority = options.priority ?? "medium";
+  const expires = options.expires ?? "task";
+  const messageText = trimText(message, st.config.maxCharsPerItem);
   const item: PsItem = {
     id: nextId(),
-    message: trimText(message, st.config.maxCharsPerItem),
-    type: options.type ?? "note",
-    priority: options.priority ?? "medium",
-    expires: options.expires ?? "task",
+    message: messageText,
+    type,
+    priority,
+    expires,
     source: options.source ?? "agent",
     createdAt: Date.now(),
+    createdRound: st.sessionRounds,
     lastInjectedAt: -999_999,
     usedCount: 0,
+    phase: options.phase ?? inferInitialPhase(type, priority, expires),
+    mode: options.mode ?? "silent",
+    keywords: options.keywords ?? extractKeywords(messageText),
     enabled: true,
   };
   st.items.push(item);
@@ -186,41 +274,85 @@ function isCoolingDown(st: PsState, it: PsItem): boolean {
   return st.sessionRounds - it.lastInjectedAt < st.config.cooldownRounds;
 }
 
-function scoreItem(st: PsState, it: PsItem): number {
-  if (!it.enabled) return -Infinity;
+function recentContextText(messages: Array<{ role?: string; content?: unknown }>): string {
+  return messages
+    .slice(-8)
+    .map((m) => typeof m.content === "string" && !m.content.startsWith(MARKER) ? m.content : "")
+    .join("\n")
+    .toLowerCase();
+}
+
+function relevanceScore(st: PsState, it: PsItem, contextText: string): number {
+  if (!st.config.enableRelevance) return 1;
+  if (it.expires === "turn" || it.phase === "hot") return 1;
+  if (it.keywords.length === 0) return it.priority === "critical" ? 0.75 : 0.35;
+  const hits = it.keywords.filter((kw) => contextText.includes(kw)).length;
+  if (hits === 0) return it.phase === "cold" ? 0.15 : 0.35;
+  return Math.min(1.2, 0.65 + hits * 0.25);
+}
+
+function ageDecay(st: PsState, it: PsItem): number {
+  const age = Math.max(0, st.sessionRounds - it.createdRound);
+  if (it.phase === "hot") return age <= st.config.hotRounds ? 1 : 0.75;
+  if (it.phase === "warm") return age <= st.config.warmRounds ? 0.75 : 0.45;
+  if (it.phase === "cold") return 1;
+  return 0;
+}
+
+function frequencyDecay(it: PsItem): number {
+  return 1 / (1 + it.usedCount * 0.75);
+}
+
+function scoreItem(st: PsState, it: PsItem, contextText: string): number {
+  if (!it.enabled || it.phase === "archived") return -Infinity;
   if (!st.config.injectLowPriority && it.priority === "low") return -Infinity;
   if (isCoolingDown(st, it)) return -Infinity;
 
-  let score = 0;
-  score += PRIORITY_WEIGHT[it.priority] * 10;
-  score += TYPE_WEIGHT[it.type] * 3;
-  if (it.expires === "project" || it.expires === "persistent") score += 5;
-  if (it.expires === "turn") score += 8;
-  // critical 额外衰减：注入次数越多分越低
-  if (it.priority === "critical") {
-    score -= Math.min(it.usedCount, MAX_CRITICAL_INJECTIONS) * 4;
-  } else {
-    score -= Math.min(it.usedCount, 6) * 2;
-  }
+  const base = PRIORITY_WEIGHT[it.priority] * 10 + TYPE_WEIGHT[it.type] * 3;
+  const relevance = relevanceScore(st, it, contextText);
+  const phase = PHASE_FACTOR[it.phase];
+  const age = ageDecay(st, it);
+  const freq = frequencyDecay(it);
+  let score = base * relevance * phase * age * freq;
+
+  if (it.expires === "turn") score += 12;
+  if (it.expires === "project" && relevance >= 0.65) score += 4;
+  if (it.expires === "persistent" && relevance >= 0.65) score += 3;
+  if (it.priority === "critical" && relevance >= 0.35) score += 10;
   return score;
 }
 
-function selectPs(st: PsState): PsItem[] {
+function selectPs(st: PsState, contextText: string): PsItem[] {
   return st.items
-    .map((item) => ({ item, score: scoreItem(st, item) }))
-    .filter((c) => Number.isFinite(c.score))
+    .map((item) => ({ item, score: scoreItem(st, item, contextText) }))
+    .filter((c) => Number.isFinite(c.score) && c.score >= st.config.minScore)
     .sort((a, b) => b.score - a.score)
     .slice(0, st.config.maxPsPerTurn)
     .map((c) => c.item);
 }
 
 function formatPs(st: PsState, selected: PsItem[]): string {
-  const lines = selected.map((it) => `PS[${it.priority}][${it.type}]: ${it.message}`);
+  const visible = selected.filter((it) => it.mode === "visible");
+  const silent = selected.filter((it) => it.mode !== "visible");
+  const lines = [
+    ...silent.map((it) => `SILENT-PS[${it.phase}][${it.priority}][${it.type}]: ${it.message}`),
+    ...visible.map((it) => `PS[${it.phase}][${it.priority}][${it.type}]: ${it.message}`),
+  ];
   return [
     `${MARKER} Runtime PS (${selected.length}/${st.config.maxPsPerTurn})`,
-    "这些是长程注意力模块生成的短提醒；除非涉及明确约束或风险，否则按建议处理。",
+    "默认把 SILENT-PS 当作内部约束/偏好，只影响行动，不要在回复中复述；visible PS 才可按需说明。",
     ...lines,
   ].join("\n");
+}
+
+function coolDownAfterInject(st: PsState, it: PsItem): void {
+  it.usedCount++;
+  it.lastInjectedAt = st.sessionRounds;
+  if (it.phase === "hot" && (it.usedCount >= 2 || st.sessionRounds - it.createdRound > st.config.hotRounds)) {
+    it.phase = "warm";
+  } else if (it.phase === "warm" && (it.usedCount >= 4 || st.sessionRounds - it.createdRound > st.config.warmRounds)) {
+    it.phase = "cold";
+  }
 }
 
 function updateStatus(ctx: ExtensionContext, st: PsState): void {
@@ -247,12 +379,16 @@ export default function (pi: ExtensionAPI) {
       "Prefer high/critical only for explicit constraints, safety risks, or important prior decisions.",
       "Do not store generic advice. Each PS must be directly useful later.",
       "Use expires=turn/task for short-lived reminders; project/persistent for stable decisions/preferences.",
+      "PS is silent by default: it should guide behavior, not be repeated in replies.",
     ],
     parameters: Type.Object({
       message: Type.String({ description: "PS 内容，必须短、具体、可行动" }),
       type: Type.Optional(Type.String({ description: "user_preference|project_constraint|prior_decision|open_loop|rejected_option|risk_memory|environment_fact|task_state|note" })),
       priority: Type.Optional(Type.String({ description: "low|medium|high|critical" })),
       expires: Type.Optional(Type.String({ description: "turn|task|phase|session|project|persistent" })),
+      phase: Type.Optional(Type.String({ description: "hot|warm|cold|archived（默认自动推断）" })),
+      mode: Type.Optional(Type.String({ description: "silent|visible（默认 silent）" })),
+      keywords: Type.Optional(Type.Array(Type.String(), { description: "相关触发关键词；不传则自动从 message 推断" })),
     }),
     async execute(_tcid, params, signal) {
       if (signal?.aborted) throw new Error("aborted");
@@ -260,6 +396,9 @@ export default function (pi: ExtensionAPI) {
         type: parseType(params.type),
         priority: parsePriority(params.priority),
         expires: parseExpires(params.expires),
+        phase: params.phase ? parsePhase(params.phase) : undefined,
+        mode: parseMode(params.mode),
+        keywords: Array.isArray(params.keywords) ? params.keywords.map(String).filter(Boolean) : undefined,
         source: "agent",
       });
       return {
@@ -287,7 +426,8 @@ export default function (pi: ExtensionAPI) {
       if (st.items.length === 0) return { content: [{ type: "text", text: "🧠 长程 PS 为空" }] };
       const lines = st.items.map((it, i) => {
         const off = it.enabled ? "" : " disabled";
-        return `  ${i + 1}. [${it.id}] PS[${it.priority}][${it.type}][${it.expires}]${off} used=${it.usedCount}: ${it.message}`;
+        const kws = it.keywords.length > 0 ? ` kw=${it.keywords.join(",")}` : "";
+        return `  ${i + 1}. [${it.id}] PS[${it.phase}][${it.mode}][${it.priority}][${it.type}][${it.expires}]${off} used=${it.usedCount}${kws}: ${it.message}`;
       });
       return {
         content: [{ type: "text", text: [`🧠 长程 PS (${st.items.length}/${st.config.maxItems})`, `配置: ${JSON.stringify(st.config)}`, `轮次: ${st.sessionRounds}`, "", ...lines].join("\n") }],
@@ -330,7 +470,7 @@ export default function (pi: ExtensionAPI) {
     label: "Long Attention Config PS",
     description: "查看或调整长程注意力 PS 注入配置。",
     promptSnippet: "Get or set Runtime PS config",
-    promptGuidelines: ["Valid keys: maxPsPerTurn, maxItems, maxCharsPerItem, cooldownRounds, injectLowPriority."],
+    promptGuidelines: ["Valid keys: maxPsPerTurn, maxItems, maxCharsPerItem, cooldownRounds, injectLowPriority, minScore, enableRelevance, hotRounds, warmRounds."],
     parameters: Type.Object({
       key: Type.Optional(Type.String({ description: "配置项名" })),
       value: Type.Optional(Type.Any({ description: "新值" })),
@@ -363,15 +503,26 @@ export default function (pi: ExtensionAPI) {
       switch (sub) {
         case "add": {
           const message = args._?.slice(1).join(" ") || args.text || "";
-          if (!message.trim()) { ctx.ui.notify("用法: /ps add <内容> [--type=prior_decision] [--priority=high] [--expires=project]", "warning"); return; }
-          const item = addPs(st, message, { type: parseType(args.type), priority: parsePriority(args.priority), expires: parseExpires(args.expires), source: "user" });
+          if (!message.trim()) { ctx.ui.notify("用法: /ps add <内容> [--type=prior_decision] [--priority=high] [--expires=project] [--phase=warm] [--mode=silent]", "warning"); return; }
+          const keywords = typeof args.keywords === "string"
+            ? String(args.keywords).split(",").map((s) => s.trim()).filter(Boolean)
+            : undefined;
+          const item = addPs(st, message, {
+            type: parseType(args.type),
+            priority: parsePriority(args.priority),
+            expires: parseExpires(args.expires),
+            phase: args.phase ? parsePhase(args.phase) : undefined,
+            mode: parseMode(args.mode),
+            keywords,
+            source: "user",
+          });
           updateStatus(ctx, st);
           ctx.ui.notify(`🧠 已添加 PS[${item.priority}][${item.type}]: ${item.message}`, "info");
           break;
         }
         case "list": {
           if (st.items.length === 0) { ctx.ui.notify("长程 PS 为空", "info"); return; }
-          ctx.ui.notify([`🧠 长程 PS (${st.items.length}/${st.config.maxItems})`, ...st.items.map((it, i) => `  ${i + 1}. PS[${it.priority}][${it.type}][${it.expires}] used=${it.usedCount}: ${it.message}`)].join("\n"), "info");
+          ctx.ui.notify([`🧠 长程 PS (${st.items.length}/${st.config.maxItems})`, ...st.items.map((it, i) => `  ${i + 1}. PS[${it.phase}][${it.mode}][${it.priority}][${it.type}][${it.expires}] used=${it.usedCount}: ${it.message}`)].join("\n"), "info");
           break;
         }
         case "clear": {
@@ -394,7 +545,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("context", (event, _ctx) => {
     const existingIdx = event.messages.findIndex((m) => typeof m.content === "string" && m.content.startsWith(MARKER));
-    const selected = selectPs(st);
+    const contextText = recentContextText(event.messages as Array<{ role?: string; content?: unknown }>);
+    const selected = selectPs(st, contextText);
 
     if (selected.length === 0) {
       if (existingIdx >= 0) {
@@ -406,8 +558,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     for (const it of selected) {
-      it.usedCount++;
-      it.lastInjectedAt = st.sessionRounds;
+      coolDownAfterInject(st, it);
     }
 
     const currentText = formatPs(st, selected);

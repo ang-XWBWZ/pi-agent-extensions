@@ -16,6 +16,7 @@ import {
 import { getExecutionContext } from "../../lib/execution-context.js";
 import { loadToolConfig } from "../lib/tier-resolver.js";
 import { spawnAllBackground } from "../lib/spawner.js";
+import { formatJobFullResult } from "../lib/result-format.js";
 
 // 硬编码安全网
 const TOOL_SAFETY_NET: ReadonlySet<string> = new Set([
@@ -143,6 +144,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
 
       const job = createJob(inheritedTasks);
       job.status = "running";
+      job._autoInjectRequested = autoInject;
 
       try {
         pi.appendEntry("agent-job", {
@@ -169,8 +171,17 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
 
       if (autoInject) {
         onJobComplete(job.jobId, async (completedJob) => {
-          if (completedJob._autoInjected) return;
-          completedJob._autoInjected = true;
+          if (completedJob._autoInjected || completedJob._autoInjecting) return;
+          completedJob._autoInjecting = true;
+          try {
+            const elapsed = completedJob.finishedAt
+              ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
+              : "?";
+            pi.sendUserMessage(formatJobFullResult(completedJob, elapsed), { deliverAs: "followUp" });
+            completedJob._autoInjected = true;
+          } finally {
+            completedJob._autoInjecting = false;
+          }
         });
       }
 

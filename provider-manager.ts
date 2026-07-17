@@ -7,6 +7,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerProviderContextCommand } from "./provider-manager/commands/provider-context.js";
 import { restoreCustomProviders } from "./provider-manager/lib/register.js";
 import { registerManageProviders } from "./provider-manager/tools/manage-providers.js";
 
@@ -18,4 +19,5 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerManageProviders(pi);
+  registerProviderContextCommand(pi);
 }

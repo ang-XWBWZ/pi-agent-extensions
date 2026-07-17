@@ -10,34 +10,19 @@ import {
   waitForJob,
   type AgentJob,
 } from "../../lib/agent-bus.js";
+import { formatJobAlreadyInjectedNotice, formatJobPreview } from "../lib/result-format.js";
 
 // ---- 格式化输出 ----
 
-function formatJobResult(job: AgentJob, elapsed: string) {
+function formatJobResult(job: AgentJob, elapsed: string, alreadyInjected = false) {
   const okCount = job.results.filter((r) => r.ok).length;
   const failCount = job.results.filter((r) => !r.ok).length;
-
-  const statusText =
-    job.status === "complete" ? "✅ 完成" :
-    job.status === "killed" ? "💀 已杀死" :
-    "❌ 错误";
-
-  const header = [
-    `${statusText} Job ${job.jobId.slice(0, 8)}`,
-    `⏱ 耗时: ${elapsed}s | ✅ ${okCount} | ❌ ${failCount} | 📊 ${job.total}`,
-    ``,
-  ];
-
-  const body = job.results.map((r) => {
-    const icon = r.ok ? "✅" : "❌";
-    const text = r.ok
-      ? (r.output ?? "").slice(0, 500)
-      : `错误: ${r.error ?? "未知"}`;
-    return `${icon} [${r.order}/${job.total}] ${r.name}\n   ${text}\n`;
-  });
+  const text = alreadyInjected
+    ? formatJobAlreadyInjectedNotice(job, elapsed)
+    : formatJobPreview(job, elapsed);
 
   return {
-    content: [{ type: "text", text: [...header, ...body].join("\n") }],
+    content: [{ type: "text", text }],
     details: {
       jobId: job.jobId,
       status: job.status,
@@ -45,11 +30,13 @@ function formatJobResult(job: AgentJob, elapsed: string) {
       okCount,
       failCount,
       total: job.total,
+      autoInjected: job._autoInjected === true,
       results: job.results.map((r) => ({
         id: r.id,
         name: r.name,
         ok: r.ok,
-        output: r.output?.slice(0, 500),
+        outputPreview: r.output?.slice(0, 500),
+        outputLength: r.output?.length ?? 0,
         error: r.error,
       })),
     },
@@ -69,7 +56,7 @@ export function registerCheckResults(pi: ExtensionAPI): void {
       "Pass wait=true to block until all sub-agents complete.",
       "Pass wait=false (default) for non-blocking poll — returns current progress.",
       "Call without jobId to list all pending/completed jobs.",
-      "PREFER non-blocking poll (wait=false, the default). Results are auto-injected via steer when complete — no need to block.",
+      "PREFER non-blocking poll (wait=false, the default). Results are auto-injected once when complete — no need to block.",
       "Use wait=true ONLY when you must synchronize before the next action, but know it blocks user interaction.",
       "Default to wait=false. Results auto-inject on completion — polling is rarely needed.",
       "FORBIDDEN: Do NOT use wait=true during interactive conversation. It freezes the UI and kills user experience.",
@@ -126,12 +113,8 @@ export function registerCheckResults(pi: ExtensionAPI): void {
           ? ((job.finishedAt - job.createdAt) / 1000).toFixed(1)
           : "?";
         if (job._autoInjected) {
-          return {
-            content: [{ type: "text", text: `📋 Job ${params.jobId!.slice(0, 8)} 已完成，结果已自动推送到对话中。` }],
-            details: { jobId: job.jobId, status: job.status, autoInjected: true },
-          };
+          return formatJobResult(job, elapsed, true);
         }
-        job._autoInjected = true;
         return formatJobResult(job, elapsed);
       }
 
@@ -163,18 +146,11 @@ export function registerCheckResults(pi: ExtensionAPI): void {
 
       const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
       ctx.ui.setStatus("sub-agent", undefined);
-      if (completedJob._autoInjected) {
-        return {
-          content: [{ type: "text", text: `📋 Job ${params.jobId!.slice(0, 8)} 已完成，结果已自动推送到对话中。` }],
-          details: { jobId: completedJob.jobId, status: completedJob.status, autoInjected: true },
-        };
-      }
-      completedJob._autoInjected = true;
-
+      const alreadyInjected = completedJob._autoInjected === true;
       const elapsed = completedJob.finishedAt
         ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
         : "?";
-      return formatJobResult(completedJob, elapsed);
+      return formatJobResult(completedJob, elapsed, alreadyInjected);
     },
   });
 }

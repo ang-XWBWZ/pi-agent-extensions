@@ -48,13 +48,17 @@ export function setupWidget(pi: ExtensionAPI): void {
     notifiedJobs.add(data.jobId);
 
     const completedJob = data.job;
-    const elapsed = completedJob.finishedAt
-      ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
-      : "?";
-    const line = formatJobNotificationLine(completedJob.jobId, completedJob.results, completedJob.total, elapsed);
-    try {
-      pi.sendUserMessage(line, { deliverAs: "steer", triggerTurn: true });
-    } catch { /* */ }
+    // autoInject=true 的 Job 由 spawn-agent 的幂等回调推送完整结果。
+    // Widget 只负责面板刷新；不要再额外向主 Agent 发送完成摘要，避免同一完成事件触发两条主消息。
+    if (!completedJob._autoInjectRequested) {
+      const elapsed = completedJob.finishedAt
+        ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
+        : "?";
+      const line = formatJobNotificationLine(completedJob.jobId, completedJob.results, completedJob.total, elapsed);
+      try {
+        pi.sendUserMessage(line, { deliverAs: "steer", triggerTurn: true });
+      } catch { /* */ }
+    }
     refreshWidget();
   });
 

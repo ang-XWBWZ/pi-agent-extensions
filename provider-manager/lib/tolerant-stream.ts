@@ -31,6 +31,19 @@ import {
   convertMessagesForUpstream,
 } from "./message-utils.js";
 
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
+
+function resolveStreamIdleTimeoutMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  }
+  // Pi maps disabled httpIdleTimeoutMs=0 to max int32 before it reaches providers.
+  // For this tolerant fetch stream we still need a finite idle guard, otherwise a
+  // half-open SSE connection can leave the agent stuck in Work forever.
+  if (value >= 2_000_000_000) return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  return Math.floor(value);
+}
+
 export function createOpenAITolerantStream() {
   return function tolerantStreamSimple(
     model: Model<Api>,
@@ -53,6 +66,9 @@ export function createOpenAITolerantStream() {
         stopReason: "stop",
         timestamp: Date.now(),
       };
+      let abortReason: "user" | "idle" | null = null;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let idleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS;
 
       try {
         const apiKey = options?.apiKey;
@@ -107,12 +123,20 @@ export function createOpenAITolerantStream() {
         }
 
         const controller = new AbortController();
+        idleTimeoutMs = resolveStreamIdleTimeoutMs(options?.timeoutMs);
+        const abortWith = (reason: "user" | "idle") => {
+          abortReason = abortReason ?? reason;
+          controller.abort();
+        };
+        const refreshIdleTimer = () => {
+          if (timeoutId) clearTimeout(timeoutId);
+          timeoutId = setTimeout(() => abortWith("idle"), idleTimeoutMs);
+        };
         if (options?.signal) {
           if (options.signal.aborted) throw new Error("Request was aborted");
-          options.signal.addEventListener("abort", () => controller.abort());
+          options.signal.addEventListener("abort", () => abortWith("user"), { once: true });
         }
-        const timeoutMs = options?.timeoutMs || 120000;
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        refreshIdleTimer();
 
         const reqHeaders: Record<string, string> = {
           "Content-Type": "application/json",
@@ -132,6 +156,7 @@ export function createOpenAITolerantStream() {
           body: JSON.stringify(reqBody),
           signal: controller.signal,
         });
+        refreshIdleTimer();
 
         if (!response.ok) {
           const errText = await response.text().catch(() => "Unknown error");
@@ -143,6 +168,7 @@ export function createOpenAITolerantStream() {
         const decoder = new TextDecoder();
         let buffer = "";
         let hasFinishReason = false;
+        let sawDoneMarker = false;
         let finishReason: string | null = null;
         let textBlock: any = null;
         let thinkingBlock: any = null;
@@ -223,18 +249,21 @@ export function createOpenAITolerantStream() {
           const fallbackBody = { ...reqBody, stream: false };
           delete fallbackBody.stream_options;
           const fallbackHeaders = { ...reqHeaders, Accept: "application/json" };
+          refreshIdleTimer();
           const fallbackResponse = await fetch(url, {
             method: "POST",
             headers: fallbackHeaders,
             body: JSON.stringify(fallbackBody),
             signal: controller.signal,
           });
+          refreshIdleTimer();
           if (!fallbackResponse.ok) {
             const errText = await fallbackResponse.text().catch(() => "Unknown error");
             throw new Error(`API request failed: ${fallbackResponse.status} - ${errText.slice(0, 500)}`);
           }
 
           const data: any = await fallbackResponse.json();
+          refreshIdleTimer();
           if (data.usage) {
             output.usage = parseOpenAIUsage(data.usage, model);
           }
@@ -277,94 +306,150 @@ export function createOpenAITolerantStream() {
                 : null);
         };
 
+        const processSseFrame = (raw: string) => {
+          const trimmed = raw.trim();
+          if (!trimmed) return;
+
+          const dataLines = trimmed
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim());
+          if (dataLines.length === 0) return;
+          const payload = dataLines.join("\n");
+          if (payload === "[DONE]") {
+            sawDoneMarker = true;
+            return;
+          }
+
+          let data: any;
+          try { data = JSON.parse(payload); } catch { return; }
+
+          if (data.usage) {
+            output.usage = parseOpenAIUsage(data.usage, model);
+          }
+
+          if (!data.choices?.length) return;
+          const choice = data.choices[0];
+          if (!choice) return;
+
+          if (choice.finish_reason) {
+            hasFinishReason = true;
+            finishReason = choice.finish_reason;
+          }
+
+          if (!choice.delta) return;
+          const delta = choice.delta;
+
+          // reasoning_content → thinking block
+          for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+            const val = delta[field];
+            if (typeof val === "string" && val.length > 0) {
+              const block = ensureThinkingBlock(field);
+              block.thinking += val;
+              outer.push({ type: "thinking_delta", contentIndex: getIdx(block), delta: val, partial: output });
+              break;
+            }
+          }
+
+          // content → text block
+          const content = delta.content;
+          if (typeof content === "string" && content.length > 0) {
+            emitTextDelta(content);
+          }
+
+          // tool_calls
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const block = upsertToolCallBlock(tc, tc.index ?? toolCallBlocks.length, true);
+              if (tc.function?.arguments) {
+                block.partialArgs = (block.partialArgs ?? "") + tc.function.arguments;
+                try { block.arguments = JSON.parse(block.partialArgs); } catch { /* partial */ }
+                outer.push({ type: "toolcall_delta", contentIndex: getIdx(block), delta: tc.function.arguments, partial: output });
+              }
+            }
+          }
+        };
+
         outer.push({ type: "start", partial: output });
 
         while (true) {
           if (options?.signal?.aborted) throw new Error("Request was aborted");
           const { done, value } = await reader.read();
           if (done) break;
+          refreshIdleTimer();
           buffer += decoder.decode(value, { stream: true });
-          const events = buffer.split("\n\n");
+          const events = buffer.split(/\r?\n\r?\n/);
           buffer = events.pop() || "";
 
           for (const raw of events) {
-            const trimmed = raw.trim();
-            if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) continue;
-            let data: any;
-            try { data = JSON.parse(trimmed.slice(6)); } catch { continue; }
-
-            if (data.usage) {
-              output.usage = parseOpenAIUsage(data.usage, model);
-            }
-
-            if (!data.choices?.length) continue;
-            const choice = data.choices[0];
-            if (!choice || !choice.delta) continue;
-
-            if (choice.finish_reason) {
-              hasFinishReason = true;
-              finishReason = choice.finish_reason;
-            }
-
-            const delta = choice.delta;
-
-            // reasoning_content → thinking block
-            for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
-              const val = delta[field];
-              if (typeof val === "string" && val.length > 0) {
-                const block = ensureThinkingBlock(field);
-                block.thinking += val;
-                outer.push({ type: "thinking_delta", contentIndex: getIdx(block), delta: val, partial: output });
-                break;
-              }
-            }
-
-            // content → text block
-            const content = delta.content;
-            if (typeof content === "string" && content.length > 0) {
-              emitTextDelta(content);
-            }
-
-            // tool_calls
-            if (delta.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                const block = upsertToolCallBlock(tc, tc.index ?? toolCallBlocks.length, true);
-                if (tc.function?.arguments) {
-                  block.partialArgs = (block.partialArgs ?? "") + tc.function.arguments;
-                  try { block.arguments = JSON.parse(block.partialArgs); } catch { /* partial */ }
-                  outer.push({ type: "toolcall_delta", contentIndex: getIdx(block), delta: tc.function.arguments, partial: output });
-                }
-              }
-            }
+            processSseFrame(raw);
           }
+        }
+
+        const tail = decoder.decode();
+        if (tail) buffer += tail;
+        if (buffer.trim()) {
+          processSseFrame(buffer);
+          buffer = "";
         }
 
         // 收尾
-        clearTimeout(timeoutId);
+        if (timeoutId) clearTimeout(timeoutId);
 
-        const hasMeaningfulText = !!textBlock?.text?.trim();
-        const hasMeaningfulThinking = !!thinkingBlock?.thinking?.trim();
-        const hasTextOrThinking = hasMeaningfulText || hasMeaningfulThinking;
-        const completeToolCalls = toolCallBlocks.filter(finalizeToolCallBlock);
-        const hasIncompleteToolCalls = completeToolCalls.length !== toolCallBlocks.length;
+        const inspectStreamState = () => {
+          const completeToolCalls = toolCallBlocks.filter(finalizeToolCallBlock);
+          const hasMeaningfulText = !!textBlock?.text?.trim();
+          const hasMeaningfulThinking = !!thinkingBlock?.thinking?.trim();
+          return {
+            completeToolCalls,
+            hasMeaningfulText,
+            hasMeaningfulThinking,
+            hasTextOrThinking: hasMeaningfulText || hasMeaningfulThinking,
+            hasIncompleteToolCalls: completeToolCalls.length !== toolCallBlocks.length,
+            onlyThinkingNoAnswer: hasMeaningfulThinking && !hasMeaningfulText && completeToolCalls.length === 0,
+          };
+        };
+
+        let streamState = inspectStreamState();
+        if (streamState.hasIncompleteToolCalls || !streamState.hasTextOrThinking || streamState.onlyThinkingNoAnswer) {
+          const fallbackFinishReason = await emitNonStreamingFallback();
+          if (fallbackFinishReason) {
+            finishReason = fallbackFinishReason;
+            hasFinishReason = true;
+          }
+          streamState = inspectStreamState();
+        }
 
         if (!hasFinishReason) {
-          if (completeToolCalls.length > 0 && !hasIncompleteToolCalls) {
+          if (streamState.completeToolCalls.length > 0 && !streamState.hasIncompleteToolCalls) {
             finishReason = "tool_calls";
-          } else if (hasIncompleteToolCalls) {
-            finishReason = await emitNonStreamingFallback();
-            if (!finishReason) {
-              throw new Error("Stream ended with incomplete tool_calls and no finish_reason");
-            }
-          } else if (hasTextOrThinking) {
+          } else if (streamState.hasTextOrThinking) {
+            // Some OpenAI-compatible providers omit finish_reason or [DONE]. If we
+            // already have a complete text/thinking block, finish the turn instead
+            // of surfacing pi-main's hard "Stream ended without finish_reason".
             finishReason = "stop";
           } else {
-            finishReason = await emitNonStreamingFallback();
-            if (!finishReason) {
-              throw new Error("Stream ended without finish_reason and meaningful content");
-            }
+            throw new Error("OpenAI-compatible stream ended without finish_reason or meaningful content");
           }
         }
+
+        if (streamState.hasIncompleteToolCalls) {
+          throw new Error("OpenAI-compatible stream ended with incomplete tool_calls");
+        }
+
+        if (!streamState.hasTextOrThinking && streamState.completeToolCalls.length === 0) {
+          throw new Error("OpenAI-compatible stream ended without meaningful content");
+        }
+
+        if (streamState.onlyThinkingNoAnswer) {
+          throw new Error("OpenAI-compatible stream ended after reasoning without final answer content");
+        }
+
+        if (!sawDoneMarker && !hasFinishReason && !streamState.hasTextOrThinking) {
+          throw new Error("OpenAI-compatible stream ended before [DONE]");
+        }
+
+        if (timeoutId) clearTimeout(timeoutId);
 
         if (thinkingBlock) {
           outer.push({ type: "thinking_end", contentIndex: getIdx(thinkingBlock), content: thinkingBlock.thinking, partial: output });
@@ -386,12 +471,24 @@ export function createOpenAITolerantStream() {
         outer.push({ type: "done", reason: mapped as any, message: output });
         outer.end();
       } catch (err: any) {
-        const msg = err?.message || String(err);
-        const aborted = err?.name === "AbortError" || msg === "Request was aborted";
+        if (timeoutId) clearTimeout(timeoutId);
+        const rawMsg = err?.message || String(err);
+        const idleTimedOut = abortReason === "idle";
+        const userAborted = abortReason === "user" || rawMsg === "Request was aborted";
+        const providerAborted = err?.name === "AbortError" && !userAborted;
+        const msg = idleTimedOut
+          ? `OpenAI-compatible stream idle timeout after ${idleTimeoutMs}ms`
+          : providerAborted
+            ? `OpenAI-compatible stream aborted or timed out: ${rawMsg}`
+            : rawMsg;
         outer.push({
           type: "error",
-          reason: aborted ? "aborted" : "error",
-          error: { ...output, stopReason: aborted ? "aborted" : "error", errorMessage: msg },
+          reason: userAborted && !idleTimedOut ? "aborted" : "error",
+          error: {
+            ...output,
+            stopReason: userAborted && !idleTimedOut ? "aborted" : "error",
+            errorMessage: msg,
+          },
         });
         outer.end();
       }

@@ -100,7 +100,11 @@ export interface AgentJob {
   status: "dispatched" | "running" | "complete" | "error" | "killed";
   createdAt: number;
   finishedAt?: number;
-  /** 是否已通过 autoInject 或 check_agent_results 推送过结果，防止重复 */
+  /** spawn_agent(autoInject=true) 请求自动注入完整结果 */
+  _autoInjectRequested?: boolean;
+  /** 自动注入进行中，防止完成事件重入造成重复完整结果 */
+  _autoInjecting?: boolean;
+  /** 是否已通过 autoInject 自动推送过完整结果，防止重复 */
   _autoInjected?: boolean;
 }
 
@@ -722,8 +726,10 @@ export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: 
       resolve(state.jobs.get(jobId)!);
     };
 
-    globalBus.once(Events.JOB_COMPLETE, onComplete);
-    globalBus.once(Events.JOB_ERROR, onError);
+    // 不能用 once：并发多个 Job 时，其他 Job 的完成事件会先触发并移除监听器，
+    // 导致当前 waitForJob 永远等不到目标 Job。
+    globalBus.on(Events.JOB_COMPLETE, onComplete);
+    globalBus.on(Events.JOB_ERROR, onError);
   });
 }
 

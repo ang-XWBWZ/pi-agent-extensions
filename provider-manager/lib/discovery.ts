@@ -425,9 +425,13 @@ export async function discoverModelsFromProviderWithDiagnostics(
 }
 
 export function detectContextWindow(modelId: string): number {
+  // Codex authorization defaults for custom-provider registration.
+  // API-only larger windows should be set explicitly with set_model_limits.
+  if (/gpt-5\.3-codex-spark/i.test(modelId)) return 128000;
+  if (/codex-mini-latest/i.test(modelId)) return 200000;
+  if (/gpt-5\.5|gpt-5\.4-mini|gpt-5\.3-codex|gpt-5-codex/i.test(modelId)) return 400000;
+  if (/gpt-5\.4(?:$|[^a-z0-9])/i.test(modelId)) return 272000;
   if (/v4-flash|v4-pro|1m|1000k|minimax-m3|mimo/i.test(modelId)) return 1000000;
-  if (/gpt-5\.5/i.test(modelId)) return 272000;
-  if (/gpt-5\.4$/i.test(modelId)) return 500000;
   if (/kimi-k2\.6|kimi-k2\.5|qwen3\.7|qwen3-7|glm-5\.1|glm-5|command-a/i.test(modelId)) return 262144;
   if (/claude|haiku|sonnet|opus/i.test(modelId)) return 200000;
   return 256000;

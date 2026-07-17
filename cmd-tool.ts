@@ -45,6 +45,9 @@ const ENCODING_LABELS: Record<number, string> = {
 
 // 启动时检测一次系统活动代码页
 const SYSTEM_CODEPAGE: number = (() => {
+  if (process.platform !== "win32") {
+    return 65001;
+  }
   try {
     const buf = execSync("chcp", { encoding: "buffer", timeout: 3000 });
     const match = buf.toString("utf8").match(/(\d+)/);
