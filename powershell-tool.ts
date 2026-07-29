@@ -18,8 +18,6 @@ import { Text } from "@earendil-works/pi-tui";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getExecutionContext, withPiExecutionEnv } from "./lib/execution-context.js";
-import { afterCommand, beforeCommand } from "./lib/work-goal-recorder.js";
 
 // ============================================================
 // 进程树清理 — 与 pi 内核 shell.ts 的 killProcessTree 等价
@@ -48,21 +46,11 @@ function killProcessTree(pid: number): void {
   }
 }
 
-/**
- * 安全地清理特定 PowerShell 进程树。
- *
- * 使用 taskkill /PID <pid> 按进程 ID 精确杀进程，
- * 绝不会错杀用户的独立 PowerShell 窗口。
- *
- * 兜底链路：
- *   1. 先 taskkill /T /PID childPid 杀进程树
- *   2. 子进程可能已经变成了孤儿（Start-Process 场景），
- *      但我们有 child.pid 就不应该出现其他同名进程被误杀。
- */
-function killSpecificPowerShell(pid: number): void {
+/** PowerShell 进程可能残留（Start-Process 等场景），兜底清理 */
+function killResidualPowerShell(): void {
   if (process.platform === "win32") {
     try {
-      spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+      spawn("taskkill", ["/F", "/IM", "powershell.exe"], {
         stdio: "ignore",
         detached: true,
       });
@@ -96,26 +84,6 @@ function truncateLine(line: string, maxChars: number): string {
 
 function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
-}
-
-function resultText(result: unknown): string | undefined {
-  const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
-  const text = content
-    ?.filter((c) => c.type === "text")
-    .map((c) => c.text ?? "")
-    .join("\n");
-  return text || undefined;
-}
-
-function resultExitCode(result: unknown): number | null | undefined {
-  const details = (result as { details?: Record<string, unknown> }).details;
-  const exitCode = details?.exitCode;
-  return typeof exitCode === "number" ? exitCode : undefined;
-}
-
-function resultError(result: unknown): unknown {
-  const details = (result as { details?: Record<string, unknown> }).details;
-  return details?.error;
 }
 
 /**
@@ -172,12 +140,6 @@ export default function (pi: ExtensionAPI) {
       "Execute a PowerShell command with native UTF-8 output",
 
     promptGuidelines: [
-      "Use when: you need Windows-native UTF-8 output, structured object pipelines, JSON/CSV processing, or mixed-encoding text search.",
-      "Do not use when: cmd builtins are enough, a structured project tool fits better, or the task is a trivial file read.",
-      "Phase policy: in Plan, only use read-only diagnostic commands; in Work, use for verification, scripts, and controlled system actions according to authorization.",
-      "Workflow: inspect first, run the smallest command that answers the question, then use results to decide whether implementation is safe.",
-      "Conflict policy: prefer read/rg for ordinary source inspection; prefer cmd for simple Windows builtins; use powershell for object/encoding-heavy work.",
-      "Failure / fallback: if a command times out or returns too much output, narrow the query before retrying.",
       "Use powershell for: reading files with explicit encoding (Get-Content -Encoding UTF8), searching mixed-encoding files (Select-String), JSON/CSV processing, or when cmd-tool produces garbled Chinese text.",
       "Prefer powershell over cmd for complex pipelines involving non-ASCII text.",
       "Use 'ls' or 'Get-ChildItem' instead of 'dir'. Use 'Select-String' instead of 'findstr'. Use 'gc' or 'Get-Content' instead of 'type'.",
@@ -348,11 +310,6 @@ export default function (pi: ExtensionAPI) {
     // ============================================================
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const command = String(params.command ?? "");
-      const cwd = ctx?.cwd ?? process.cwd();
-      const execCtx = getExecutionContext();
-      const started = await beforeCommand({ command, cwd });
-
       return new Promise((resolve) => {
         // ── 超时处理 ──
         // 默认 60s（PowerShell 启动比 cmd 慢）；AI 可传正数覆盖，无硬上限
@@ -364,7 +321,7 @@ export default function (pi: ExtensionAPI) {
             : 60;
 
         // ── 命令编码：Base64(UTF-16LE) 绕过 spawn ANSI 转换 ──
-        const wrappedCommand = wrapPowerShellCommand(command);
+        const wrappedCommand = wrapPowerShellCommand(params.command as string);
         const encodedCommand = encodePowerShellCommand(wrappedCommand);
 
         const child = spawn(
@@ -377,8 +334,7 @@ export default function (pi: ExtensionAPI) {
             encodedCommand,
           ],
           {
-            cwd,
-            env: withPiExecutionEnv(process.env, execCtx),
+            cwd: ctx?.cwd ?? process.cwd(),
             windowsHide: true,
             windowsVerbatimArguments: true,
             stdio: ["ignore", "pipe", "pipe"],
@@ -399,24 +355,16 @@ export default function (pi: ExtensionAPI) {
         // ── 超时定时器 ──
         const timer = setTimeout(() => {
           killed = true;
-          if (child.pid) {
-            killProcessTree(child.pid);
-            killSpecificPowerShell(child.pid);
-          }
+          if (child.pid) killProcessTree(child.pid);
+          // 兜底：powershell.exe 可能残留
+          killResidualPowerShell();
         }, timeoutSec * 1000);
 
         const finish = (result: Parameters<typeof resolve>[0]) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          void afterCommand({
-            command,
-            cwd,
-            startedAt: started.startedAt,
-            exitCode: resultExitCode(result),
-            stdout: resultText(result),
-            error: resultError(result),
-          }).finally(() => resolve(result));
+          resolve(result);
         };
 
         // ========================================================
@@ -424,10 +372,8 @@ export default function (pi: ExtensionAPI) {
         // ========================================================
 
         if (signal?.aborted) {
-          if (child.pid) {
-            killProcessTree(child.pid);
-            killSpecificPowerShell(child.pid);
-          }
+          if (child.pid) killProcessTree(child.pid);
+          killResidualPowerShell();
           child.stdout?.destroy();
           child.stderr?.destroy();
           child.stdin?.destroy();
@@ -439,7 +385,7 @@ export default function (pi: ExtensionAPI) {
               },
             ],
             details: {
-              command,
+              command: params.command,
               exitCode: -1,
               cancelled: true,
             },
@@ -464,10 +410,8 @@ export default function (pi: ExtensionAPI) {
           }
 
           // 杀进程树
-          if (child.pid) {
-            killProcessTree(child.pid);
-            killSpecificPowerShell(child.pid);
-          }
+          if (child.pid) killProcessTree(child.pid);
+          killResidualPowerShell();
 
           // ★ 强制摧毁管道：Windows 上 child.kill() 只杀主进程，
           // 孙进程可能继续持有 stdout pipe，导致 close 事件永不触发
@@ -536,18 +480,8 @@ export default function (pi: ExtensionAPI) {
           }
         };
 
-        // stderr 独立解码，用 [stderr] 行前缀标记
-        // 不进入 byteCount/lineCount 截断计数（stderr 通常较短）
-        const stderrDecoder = new TextDecoder("utf-8", { fatal: false });
-        child.stderr?.on("data", (chunk: Buffer) => {
-          const text = stderrDecoder.decode(chunk, { stream: true });
-          const prefixed = text
-            .split("\n")
-            .map((l, idx) => (idx > 0 && l.trim() ? "[stderr] " + l : l))
-            .join("\n");
-          output += prefixed;
-        });
         child.stdout?.on("data", onOutputData);
+        child.stderr?.on("data", onOutputData);
 
         // ========================================================
         // spawn 错误
@@ -563,7 +497,7 @@ export default function (pi: ExtensionAPI) {
               },
             ],
             details: {
-              command,
+              command: params.command,
               exitCode: -1,
               error: err.message,
             },
@@ -582,7 +516,7 @@ export default function (pi: ExtensionAPI) {
 
           if (killed) {
             const killedDetails: Record<string, unknown> = {
-              command,
+              command: params.command,
               exitCode: signal?.aborted ? -1 : (code ?? -1),
               cancelled: !!signal?.aborted,
               timedOut: !signal?.aborted,
@@ -629,7 +563,7 @@ export default function (pi: ExtensionAPI) {
           }
 
           const details: Record<string, unknown> = {
-            command,
+            command: params.command,
             exitCode: code ?? 0,
           };
 
