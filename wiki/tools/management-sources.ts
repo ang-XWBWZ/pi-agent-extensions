@@ -26,19 +26,8 @@ export function registerSourceTools(pi: ExtensionAPI): void {
       "加载一个目录作为 wiki 数据源。自动递归扫描该目录下所有 .md 文件并建立搜索索引。",
     promptSnippet: "Load wiki source (path)",
     promptGuidelines: [
-      "## Quick Start (minimum viable)",
-      "① wiki_DANGER_load(path) → ② wiki_read_search(query)  // keyword-only, substring match",
-      "",
-      "## Best Quality (recommended)",
-      "① wiki_DANGER_load(path) → ② wiki_DANGER_semantic(action='on') → ③ wiki_read_search(query)  // hybrid RRF, bge embedding",
-      "",
-      "## Ultimate Quality (for fragmented/personal notes)",
-      "① wiki_DANGER_load(path) → ② wiki_DANGER_semantic(action='on') → ③ wiki_DANGER_compile on key files",
-      "→ ④ spawn sub-agent (Flash, work mode) to compile → ⑤ wiki_DANGER_store → ⑥ wiki_read_search(query)",
-      "",
-      "Use to add new knowledge base directories to the wiki.",
-      "The directory path can be absolute or relative to the project root.",
-      "FORBIDDEN: Do NOT auto-enable semantic search after loading. Ask the user first.",
+      "Use wiki_DANGER_load only when the user intends to persistently index a knowledge directory.",
+      "After wiki_DANGER_load, keyword search is immediately available; enable semantic search separately only when requested.",
     ],
     parameters: Type.Object({
       path: Type.String({ description: "数据源目录路径（绝对路径或相对路径）" }),
@@ -78,25 +67,22 @@ export function registerSourceTools(pi: ExtensionAPI): void {
     description: "卸载一个 wiki 数据源。不传路径时列出所有已加载的数据源。",
     promptSnippet: "Unload wiki source (path?) — omit to list all",
     promptGuidelines: [
-      "Pass no argument to list all loaded sources.",
-      "Pass the source path (or its basename) to unload.",
-      "Unloading removes the source and its index entries.",
-      "The original files on disk are NOT deleted.",
-      "FORBIDDEN: Do NOT unload a source without user confirmation.",
+      "Use wiki_DANGER_unload without a path to inspect sources; unloading a path requires user confirmation and removes only index state.",
     ],
     parameters: Type.Object({
       path: Type.Optional(Type.String({ description: "要卸载的数据源路径（留空列出所有）" })),
     }),
     async execute(_tcid, params, signal) {
       if (signal?.aborted) throw new Error("aborted");
-      if (!params.path) {
+      const path = params.path?.trim();
+      if (!path) {
         return { content: [{ type: "text", text: formatSourcesList() }] };
       }
-      const removed = removeSource(params.path);
+      const removed = removeSource(path);
       if (!removed) {
-        const src = resolveSource(params.path);
+        const src = resolveSource(path);
         if (!src)
-          return { content: [{ type: "text", text: `❌ 未找到数据源: ${params.path}\n${formatSourcesList()}` }] };
+          return { content: [{ type: "text", text: `❌ 未找到数据源: ${path}\n${formatSourcesList()}` }] };
         const r2 = removeSource(src);
         if (!r2) return { content: [{ type: "text", text: `❌ 卸载失败: ${src}` }] };
         return { content: [{ type: "text", text: `🗑️ 已卸载: ${basename(r2)}` }] };
@@ -117,8 +103,7 @@ export function registerSourceTools(pi: ExtensionAPI): void {
     description: "列出所有已加载的 wiki 数据源及其状态（文件数、最后扫描时间）。",
     promptSnippet: "List all wiki data sources",
     promptGuidelines: [
-      "Call before wiki_edit_create or wiki_read_entry to discover available sources.",
-      "Returns source paths, file counts, and last scan time.",
+      "Use wiki_read_sources to discover source paths and status before addressing a specific wiki source.",
     ],
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
@@ -139,10 +124,8 @@ export function registerSourceTools(pi: ExtensionAPI): void {
       "重新扫描数据源以更新索引。不传 source 时刷新所有数据源。用于源文件在外部变更后同步索引。",
     promptSnippet: "Refresh wiki index (source?, rebuildVectors?, relPath?)",
     promptGuidelines: [
-      "Call after making file changes (rename, create, delete) outside wiki tools.",
-      "Call when you suspect the index is stale.",
-      "Pass the source path to refresh a single source, or omit to refresh all.",
-      "FORBIDDEN: Do NOT refresh without user request or explicit need (e.g. after wiki_edit_create, index is already auto-updated).",
+      "Use wiki_DANGER_refresh only when external changes made a known source or file index stale.",
+      "Scope wiki_DANGER_refresh to one source or relPath when possible; wiki edit tools already update their own index.",
     ],
     parameters: Type.Object({
       source: Type.Optional(Type.String({ description: "要刷新的数据源路径（留空刷新全部）" })),

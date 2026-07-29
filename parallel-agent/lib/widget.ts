@@ -9,15 +9,12 @@ import {
   listAgentTaskPanels,
   getAgentBus,
   Events,
-  type AgentJob,
 } from "../../lib/agent-bus.js";
 import { truncateToWidth, fmtNum } from "./helpers.js";
-import { formatJobNotificationLine } from "./spawner.js";
 
 let widgetTui: { requestRender(): void } | null = null;
 let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
 const WIDGET_BUS_CLEANUP_KEY = "__pi_parallel_agent_widget_bus_cleanup";
-const notifiedJobs = new Set<string>();
 
 export function refreshWidget(): void {
   try { widgetTui?.requestRender(); } catch { /* */ }
@@ -36,24 +33,6 @@ export function setupWidget(pi: ExtensionAPI): void {
   const bus = getAgentBus();
 
   const onEvent = () => refreshWidget();
-  const onJobComplete = (data: { jobId: string; job: AgentJob }) => {
-    if (notifiedJobs.has(data.jobId)) return;
-    notifiedJobs.add(data.jobId);
-    const completedJob = data.job;
-    const elapsed = completedJob.finishedAt
-      ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
-      : "?";
-    const line = formatJobNotificationLine(
-      completedJob.jobId,
-      completedJob.results,
-      completedJob.total,
-      elapsed,
-    );
-    try {
-      pi.sendUserMessage(line, { deliverAs: "steer", triggerTurn: true });
-    } catch { /* 旧版运行时完成通知失败不影响结果查询 */ }
-    refreshWidget();
-  };
   const watchedEvents = [
     Events.INSTANCE_REGISTERED,
     Events.INSTANCE_UNREGISTERED,
@@ -77,10 +56,8 @@ export function setupWidget(pi: ExtensionAPI): void {
   bus.on(Events.STATUS_CHANGED, onEvent);
   bus.on(Events.TASK_PANEL_UPDATED, onEvent);
   bus.on(Events.JOB_COMPLETE, onEvent);
-  bus.on(Events.JOB_COMPLETE, onJobComplete);
   globalState[WIDGET_BUS_CLEANUP_KEY] = () => {
     for (const eventName of watchedEvents) bus.off(eventName, onEvent);
-    bus.off(Events.JOB_COMPLETE, onJobComplete);
   };
 
   // ---- Widget：每次 session_start 更新 TUI 引用 ----
@@ -161,6 +138,9 @@ export function setupWidget(pi: ExtensionAPI): void {
             }
             metrics.push(`${elapsed}s`);
             metrics.push(statusText);
+            if (panel.stageReports.length > 0) {
+              metrics.push(`结论${panel.stageReports.length}`);
+            }
 
             const fullLine =
               `  ${statusIcon} ${theme.fg("accent", panel.taskId)} ${theme.fg("muted", title)}  ${theme.fg("dim", modelTag)}  ${theme.fg("dim", metrics.join(" "))}`;
@@ -171,13 +151,18 @@ export function setupWidget(pi: ExtensionAPI): void {
             );
 
             const lastNote = panel.notes.at(-1)?.text;
-            const detail = panel.currentStep || panel.summary || lastNote;
+            const latestConclusion = panel.stageReports.at(-1)?.conclusion;
+            const detail = latestConclusion || panel.summary || panel.currentStep || lastNote;
             if (detail) {
               const noteSuffix =
                 lastNote && lastNote !== detail ? ` | 📝 ${lastNote}` : "";
+              const stepSuffix =
+                panel.currentStep && panel.currentStep !== detail
+                  ? ` | ↪ ${panel.currentStep}`
+                  : "";
               const detailLine = theme.fg(
                 "dim",
-                `     ↳ ${detail}${noteSuffix}${
+                `     ↳ ${detail}${stepSuffix}${noteSuffix}${
                   panel.persistenceError ? " | ⚠️ 未落盘" : ""
                 }`,
               );

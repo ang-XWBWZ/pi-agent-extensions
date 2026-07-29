@@ -63,6 +63,8 @@ export function updateCustomModelLimits(
     cfg.apiStyle,
     modelConfigs,
     cfg.streamCompatMode ?? "builtin",
+    cfg.openaiApiMode ?? "chat-completions",
+    cfg.anthropicThinkingMode ?? "builtin",
   );
 
   const updated = modelConfigs.find((m) => m.id === modelId);

@@ -1,11 +1,9 @@
-/**
- * security-reviewer.ts — 计划文本安全审查
- *
- * 对 AI 输出的执行计划进行规则式安全检查，发现潜在风险。
- * 从 work-mode.ts 提取。
- */
+/** Rule-based review for the current structured Work plan. */
 
-import { PROTECTED_PATH_PATTERNS } from "./types.js";
+import {
+  ADVISORY_PATH_PATTERNS,
+  PROTECTED_PATH_PATTERNS,
+} from "./types.js";
 
 // ============================================================
 // Types
@@ -23,7 +21,7 @@ export interface SecurityFinding {
 // ============================================================
 
 /** 对计划文本执行安全审查 */
-export function securityReview(text: string, steps: string[]): SecurityFinding[] {
+export function securityReview(text: string, steps: Array<string | { text?: string }>): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
   const fullText = text.toLowerCase();
 
@@ -32,8 +30,17 @@ export function securityReview(text: string, steps: string[]): SecurityFinding[]
     findings.push({
       severity: "high",
       category: "受保护路径",
-      description: "计划涉及 node_modules/.git/.pi/.agents/.claude 等受保护路径的操作",
+      description: "计划涉及 node_modules/.git/.pi 等受保护路径的操作",
       suggestion: "确认这些操作是否必要；受保护路径在 WORK 模式下会被自动拦截",
+    });
+  }
+
+  if (ADVISORY_PATH_PATTERNS.some((re) => re.test(fullText))) {
+    findings.push({
+      severity: "medium",
+      category: "提醒路径",
+      description: "计划涉及 .agents/.claude 路径的操作",
+      suggestion: "核对目标和变更范围；运行时会提醒并审计，但不会仅因目录名自动拦截",
     });
   }
 
@@ -74,7 +81,7 @@ export function securityReview(text: string, steps: string[]): SecurityFinding[]
       severity: "medium",
       category: "备份缺失",
       description: "计划包含修改/删除操作，但未明确提及备份或回滚策略",
-      suggestion: "在涉及文件修改的步骤前添加备份（如 git stash / 复制副本）",
+      suggestion: "先检查 git diff，并采用可逆的小步提交或窄范围反向补丁",
     });
   }
 

@@ -1,17 +1,9 @@
-/**
- * plan-parser.ts — 计划步骤解析 & 面板渲染
- *
- * 从 AI 输出的 ## Execution Plan 段落中提取步骤列表，
- * 并渲染为终端计划面板。
- * 从 work-mode.ts 提取。
- */
+/** plan-parser.ts — step IDs and terminal plan-panel rendering. */
 
 import type { PlanStep } from "./types.js";
-import { MAX_PLAN_STEPS, DEFAULT_VISIBLE_STEPS } from "./types.js";
+import { DEFAULT_VISIBLE_STEPS } from "./types.js";
 
-// ============================================================
-// Shared step ID counter (used by parsePlanSteps and manage_plan)
-// ============================================================
+// Shared step IDs are assigned only by structured workflow tools.
 
 let _stepIdCounter = 0;
 
@@ -23,46 +15,6 @@ export function nextStepId(): number {
 /** Reset to 0 or given value */
 export function resetStepIdCounter(value = 0): void {
   _stepIdCounter = value;
-}
-
-// ============================================================
-// Plan step parsing
-// ============================================================
-
-/** 从 AI 输出的计划文本中提取步骤列表 —— 仅解析 ## Execution Plan 段落 */
-export function parsePlanSteps(text: string): PlanStep[] {
-  // 只提取 ## Execution Plan 之后到下一个 ## 标题或文件末尾的内容
-  const planMatch = text.match(/(?:^|\n)#{2,}\s*Execution\s+Plan\s*\n([\s\S]*?)(?:\n#{2,}\s|\n*$)/i);
-  const section = planMatch ? planMatch[1] : "";
-  if (!section.trim()) return [];
-
-  const lines = section.split("\n");
-  const steps: PlanStep[] = [];
-  let inCodeBlock = false;
-
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.startsWith("```")) { inCodeBlock = !inCodeBlock; continue; }
-    if (inCodeBlock) continue;
-
-    const numbered = line.match(/^\s*(?:\d+[\.\)]|[a-z][\.\)])\s+(.+)/i);
-    if (numbered) {
-      const desc = numbered[1].trim();
-      if (desc.length > 3) { steps.push({ id: nextStepId(), text: desc, status: "pending" }); continue; }
-    }
-
-    const bullet = line.match(/^\s*[-*]\s+(.+)/);
-    if (bullet) {
-      const desc = bullet[1].trim();
-      if (desc.length > 3) { steps.push({ id: nextStepId(), text: desc, status: "pending" }); continue; }
-    }
-  }
-
-  const result = steps.slice(0, MAX_PLAN_STEPS);
-  // 第一个步骤自动标记为 current
-  if (result.length > 0) result[0].status = "current";
-  return result;
 }
 
 // ============================================================

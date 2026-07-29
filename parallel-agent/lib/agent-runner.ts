@@ -13,7 +13,10 @@ import {
   registerInstance,
   unregisterInstance,
   getInstance,
+  getAgentTaskPanel,
   saveAgentState,
+  appendAgentTaskOutput,
+  replaceAgentTaskOutput,
   updateInstanceStatus,
   updateAgentTaskPanel,
   type SubTask,
@@ -27,6 +30,7 @@ import {
   subAgentIdentity,
 } from "./helpers.js";
 import { loadSkillConfig } from "./tier-resolver.js";
+import { setExecutionContext } from "../../lib/execution-context.js";
 
 // ---- Session 创建串行化（防止并发 globalThis 写入） ----
 let sessionChain: Promise<void> = Promise.resolve();
@@ -36,6 +40,23 @@ class AgentLifecycleError extends Error {
     super(message);
     this.name = "AgentLifecycleError";
   }
+}
+
+const OUTPUT_SNAPSHOT_HEAD_CHARS = 48_000;
+const OUTPUT_SNAPSHOT_TAIL_CHARS = 15_800;
+const FINAL_CONCLUSION_MAX_CHARS = 8_000;
+const FINAL_ANSWER_LEAD_CHARS = 8_000;
+
+function normalizeFinalConclusion(conclusion: string | undefined): string | undefined {
+  const text = conclusion?.trim();
+  if (!text) return undefined;
+  return text.length <= FINAL_CONCLUSION_MAX_CHARS
+    ? text
+    : `${text.slice(0, FINAL_CONCLUSION_MAX_CHARS)}…`;
+}
+
+function fallbackFinalConclusion(output: string): string {
+  return normalizeFinalConclusion(output) ?? "任务已完成，但未生成文本结论。";
 }
 
 export function runSingleAgent(
@@ -68,6 +89,7 @@ export function runSingleAgent(
       let settled = false;
       let abortedExternally = false;
       let lastOutputCheckpointAt = 0;
+      let outputLogWritable = true;
 
       const clearTimers = () => {
         if (timerRef) {
@@ -118,13 +140,27 @@ export function runSingleAgent(
           result.errorCode === "timeout" ? "timed_out" :
           result.errorCode === "killed" ? "killed" :
           "failed";
+        const panelBeforeFinish = getAgentTaskPanel(jobId, task.id);
+        const panelConclusion = normalizeFinalConclusion(
+          panelBeforeFinish?.summary,
+        );
+        const completionConclusion = normalizeFinalConclusion(result.summary) || (
+          result.ok
+            ? panelConclusion || fallbackFinalConclusion(result.output ?? output)
+            : result.error ?? panelConclusion ?? "任务异常结束"
+        );
+        const hasTerminalReport = panelBeforeFinish?.stageReports.some(
+          (report) => report.status === panelStatus,
+        );
         updateAgentTaskPanel(jobId, task.id, {
           status: panelStatus,
           progress: result.ok ? 100 : undefined,
-          summary: result.ok
-            ? (result.output ?? "任务已完成")
-            : (result.error ?? "任务异常结束"),
+          summary: completionConclusion,
+          // 子 Agent 未能在终止前主动提交时，系统仅补一条明确标注的终态结论。
+          conclusion: hasTerminalReport ? undefined : completionConclusion,
+          reportSource: "system",
           outputSnapshot: (result.output ?? output.trim()) || undefined,
+          outputLength: result.outputLength ?? totalOutputChars,
         });
 
         const shouldCheckpoint =
@@ -214,9 +250,12 @@ export function runSingleAgent(
           "[子 Agent 任务面板协议]",
           "你有一个仅属于当前子任务的持久化任务面板。",
           "开始工作时调用 update_agent_task，写入 currentStep 和初始进度。",
-          "每完成一个有意义的步骤、发现可复用结论、遇到阻塞或准备输出最终答案时，再次调用 update_agent_task。",
-          "把容易因超时丢失的中间结论写入 summary 或 note；note 会追加而不会覆盖旧记录。",
-          "最终回答前将状态设为 completed、进度设为 100，并写入简洁 summary。",
+          "每完成一个有意义的阶段、发现可复用结论、遇到阻塞或准备输出最终答案时，主动再次调用 update_agent_task。",
+          "每次阶段提交使用 conclusion，说明实际结果、证据、影响或阻塞；结论以能完整说明结果为准，不必刻意压成短摘要。",
+          "detail 是可选的详细控制面板，适合写必要的命令、文件、边界或推理；没有有用补充就省略。不要把完整日志或原始输出放进 conclusion/detail。",
+          "note 仅用于不属于阶段结论的短暂持久备注；summary 只是兼容旧字段，新调用优先使用 conclusion。",
+          `最终回答前必须将状态设为 completed、进度设为 100，并写入不超过 ${FINAL_CONCLUSION_MAX_CHARS} 字的最终 conclusion。结论先写最终结果、完成项、验证证据和阻塞项；detail 按需补充。`,
+          `最终回答的前 ${FINAL_ANSWER_LEAD_CHARS} 字也应包含同一结论；详细过程、命令输出和逐行证据放在后面。主 Agent 需要原文时会按需分页读取，不会主动加载完整存档。`,
         ].join("\n");
         const prompt = `${basePrompt}\n\n${taskPanelProtocol}`;
 
@@ -227,8 +266,12 @@ export function runSingleAgent(
               `${task.id} 在 session 创建前已超时`,
             );
           }
-          (globalThis as Record<string, unknown>).__pi_default_mode =
-            task.mode || "work";
+          if (task.parentExecutionContext?.approval?.inheritToChildren) {
+            setExecutionContext(task.parentExecutionContext);
+          }
+
+          (globalThis as Record<string, unknown>).__pi_default_phase =
+            task.phase || "work";
           (globalThis as Record<string, unknown>).__pi_is_sub_agent = true;
 
           try {
@@ -247,7 +290,7 @@ export function runSingleAgent(
             );
             return created.session;
           } finally {
-            delete (globalThis as Record<string, unknown>).__pi_default_mode;
+            delete (globalThis as Record<string, unknown>).__pi_default_phase;
             delete (globalThis as Record<string, unknown>).__pi_is_sub_agent;
           }
         };
@@ -319,23 +362,41 @@ export function runSingleAgent(
           const omitted =
             totalOutputChars - outputHead.length - outputTail.length;
           output = omitted > 0
-            ? `${outputHead}\n\n... [中间截断 ${omitted} 字符] ...\n\n${outputTail}`
+            ? `${outputHead}\n\n... [中间快照截断 ${omitted} 字符；原文可按需展开] ...\n\n${outputTail}`
             : outputHead + outputTail;
         };
 
-        const appendOutput = (delta: string) => {
-          const HEAD_CHARS = 16_000;
-          const TAIL_CHARS = 4_000;
+        const markOutputLogUnavailable = () => {
+          if (!outputLogWritable) return;
+          outputLogWritable = false;
+          updateAgentTaskPanel(jobId, task.id, {
+            note: "原始输出日志写入失败；展开读取将降级为面板快照。",
+            noteSource: "system",
+          });
+        };
+
+        const appendOutput = (delta: string, persistRawOutput = true) => {
+          if (!delta) return;
+          if (
+            persistRawOutput &&
+            outputLogWritable &&
+            !appendAgentTaskOutput(jobId, task.id, delta)
+          ) {
+            markOutputLogUnavailable();
+          }
           totalOutputChars += delta.length;
 
           let remaining = delta;
-          if (outputHead.length < HEAD_CHARS) {
-            const take = Math.min(HEAD_CHARS - outputHead.length, remaining.length);
+          if (outputHead.length < OUTPUT_SNAPSHOT_HEAD_CHARS) {
+            const take = Math.min(
+              OUTPUT_SNAPSHOT_HEAD_CHARS - outputHead.length,
+              remaining.length,
+            );
             outputHead += remaining.slice(0, take);
             remaining = remaining.slice(take);
           }
           if (remaining) {
-            outputTail = (outputTail + remaining).slice(-TAIL_CHARS);
+            outputTail = (outputTail + remaining).slice(-OUTPUT_SNAPSHOT_TAIL_CHARS);
           }
           rebuildOutputSnapshot();
         };
@@ -345,7 +406,13 @@ export function runSingleAgent(
           outputHead = "";
           outputTail = "";
           totalOutputChars = 0;
-          appendOutput(value);
+          if (
+            outputLogWritable &&
+            !replaceAgentTaskOutput(jobId, task.id, value)
+          ) {
+            markOutputLogUnavailable();
+          }
+          appendOutput(value, false);
         };
 
         // ---- 空闲检测 + 自动续推 ----
@@ -403,6 +470,7 @@ export function runSingleAgent(
           lastOutputCheckpointAt = now;
           updateAgentTaskPanel(jobId, task.id, {
             outputSnapshot: output.trim() || undefined,
+            outputLength: totalOutputChars,
           });
         };
 
@@ -513,12 +581,22 @@ export function runSingleAgent(
               instRef.outputLength = totalOutputChars;
             }
             checkpointOutput(true);
+            const panelBeforeCompletion = getAgentTaskPanel(jobId, task.id);
+            const finalConclusion =
+              normalizeFinalConclusion(panelBeforeCompletion?.summary) ||
+              fallbackFinalConclusion(output);
+            const hasCompletedReport = panelBeforeCompletion?.stageReports.some(
+              (report) => report.status === "completed",
+            );
             updateAgentTaskPanel(jobId, task.id, {
               status: "completed",
               progress: 100,
               currentStep: "任务完成，正在提交最终结果",
-              summary: output.trim() || "(无输出)",
+              summary: finalConclusion,
+              conclusion: hasCompletedReport ? undefined : finalConclusion,
+              reportSource: "system",
               outputSnapshot: output.trim() || undefined,
+              outputLength: totalOutputChars,
             });
             const saved = saveAgentState(jobId, task.id, {
               reason: "completed",
@@ -530,7 +608,9 @@ export function runSingleAgent(
               name,
               order,
               ok: true,
+              summary: finalConclusion,
               output: output.trim() || "(无输出)",
+              outputLength: totalOutputChars,
               saveId: saved?.saveId,
               tokens: {
                 input: instRef.inputTokens,

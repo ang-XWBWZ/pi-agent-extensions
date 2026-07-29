@@ -369,17 +369,9 @@ export default function (pi: ExtensionAPI) {
     description: "添加一条长程注意力 PS。用于保存主 agent 后续需要被短提醒的约束、决策、风险或未闭环事项。",
     promptSnippet: "Add a Runtime PS reminder for the main agent",
     promptGuidelines: [
-      "Use when: a stable constraint, user preference, prior decision, rejected option, risk, or open loop must survive future turns.",
-      "Do not use when: the information is just a current execution step, temporary search result, or generic advice.",
-      "Phase policy: Plan may store confirmed decisions or unresolved blockers; Work may store durable risks or handoff state.",
-      "Workflow: write one short actionable reminder with type, priority, and expiration; prefer expires=task/phase unless the decision is truly stable.",
-      "Conflict policy: use manage_requirements for active requirement questions; use manage_plan for execution steps; use PS only for cross-turn reminders.",
-      "Failure / fallback: if the reminder would be vague, do not store it.",
-      "Use for compact, actionable reminders that should reappear across turns.",
-      "Prefer high/critical only for explicit constraints, safety risks, or important prior decisions.",
-      "Do not store generic advice. Each PS must be directly useful later.",
-      "Use expires=turn/task for short-lived reminders; project/persistent for stable decisions/preferences.",
-      "PS is silent by default: it should guide behavior, not be repeated in replies.",
+      "Use long_attention_add_ps only for a compact constraint, decision, risk, or open loop that must survive future turns.",
+      "Do not use long_attention_add_ps for current plan steps, temporary findings, or generic advice.",
+      "Give long_attention_add_ps the shortest useful expiration; reserve project/persistent for stable decisions.",
     ],
     parameters: Type.Object({
       message: Type.String({ description: "PS 内容，必须短、具体、可行动" }),
@@ -419,7 +411,7 @@ export default function (pi: ExtensionAPI) {
     label: "Long Attention List PS",
     description: "查看长程注意力 PS 列表和当前注入配置。",
     promptSnippet: "List Runtime PS reminders",
-    promptGuidelines: ["Use before deciding whether to clear or tune PS items."],
+    promptGuidelines: ["Use long_attention_list_ps before clearing or tuning Runtime PS items."],
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
       if (signal?.aborted) throw new Error("aborted");
@@ -446,7 +438,7 @@ export default function (pi: ExtensionAPI) {
     label: "Long Attention Clear PS",
     description: "清空或按 expires 清理长程注意力 PS。",
     promptSnippet: "Clear Runtime PS reminders",
-    promptGuidelines: ["Do not clear project/persistent PS without a clear reason or user request."],
+    promptGuidelines: ["Use long_attention_clear_ps only with a clear scope; preserve project/persistent items unless the user requests removal."],
     parameters: Type.Object({
       scope: Type.Optional(Type.String({ description: "all|turn|task|phase|session|project|persistent，默认 all" })),
     }),
@@ -470,7 +462,7 @@ export default function (pi: ExtensionAPI) {
     label: "Long Attention Config PS",
     description: "查看或调整长程注意力 PS 注入配置。",
     promptSnippet: "Get or set Runtime PS config",
-    promptGuidelines: ["Valid keys: maxPsPerTurn, maxItems, maxCharsPerItem, cooldownRounds, injectLowPriority, minScore, enableRelevance, hotRounds, warmRounds."],
+    promptGuidelines: ["Use long_attention_config_ps only to inspect or intentionally change Runtime PS injection settings."],
     parameters: Type.Object({
       key: Type.Optional(Type.String({ description: "配置项名" })),
       value: Type.Optional(Type.Any({ description: "新值" })),

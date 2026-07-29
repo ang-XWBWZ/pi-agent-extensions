@@ -1,49 +1,64 @@
 /**
- * plan-feature.ts — 计划功能：manage_plan 工具 + 计划命令 + 计划生命周期事件
+ * Structured execution progress for Work.
+ *
+ * Plans are created from structured tool input, never parsed from assistant
+ * markdown. State changes are persisted as session audit entries.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text, Container } from "@earendil-works/pi-tui";
-import { type WorkMode, type AppState, type StepStatus, type PlanStep, MAX_PLAN_STEPS, DEFAULT_VISIBLE_STEPS } from "./types.js";
-import { parsePlanSteps, renderPlanPanel, nextStepId, resetStepIdCounter } from "./plan-parser.js";
-import { type SecurityFinding, securityReview, formatSecurityReview } from "./security-reviewer.js";
-
-// ============================================================
-// Shared state & callbacks
-// ============================================================
+import { redactAuditText } from "../lib/audit-sanitize.js";
+import {
+  type ConversationPhase,
+  type PlanStep,
+  MAX_PLAN_STEPS,
+  DEFAULT_VISIBLE_STEPS,
+} from "./types.js";
+import { renderPlanPanel, nextStepId, resetStepIdCounter } from "./plan-parser.js";
+import { securityReview, formatSecurityReview } from "./security-reviewer.js";
+import {
+  advancePlanWithEvidence,
+  hasUnfinishedPlan,
+  isPlanComplete,
+  setPlanStepStatus,
+} from "./plan-state.js";
 
 export interface PlanState {
-  mode: WorkMode;
-  appState: AppState;
+  phase: ConversationPhase;
   isSubAgent: boolean;
   planSteps: PlanStep[];
   planFullText: string;
-  planProduced: boolean;
   planPanelExpanded: boolean;
-  pendingErrorInfo: { stepIndex: number; message: string; isSevere: boolean } | null;
 }
 
-export interface PlanCallbacks {
-  setMode: (m: WorkMode, ctx: ExtensionContext) => void;
-  persist: (ctx: ExtensionContext) => void;
+interface PlanEntry {
+  type: "custom";
+  customType: "work-plan-state";
+  data: {
+    steps: PlanStep[];
+    fullText: string;
+    completed: boolean;
+  };
 }
-
-// ============================================================
-// Setup
-// ============================================================
 
 export function setupPlanFeature(
   pi: ExtensionAPI,
   s: PlanState,
-  cb: PlanCallbacks,
 ): {
   updatePlanPanel: (ctx: ExtensionContext) => void;
-  closePlanPanel: (ctx: ExtensionContext) => void;
   clearPlanPanel: (ctx: ExtensionContext) => void;
   getCurrentStepIndex: () => number;
+  replacePlanSteps: (steps: string[], ctx: ExtensionContext, fullText?: string) => void;
 } {
-  // ---- Widget helpers ----
+  function persistPlan(completed = false) {
+    pi.appendEntry("work-plan-state", {
+      steps: s.planSteps.map((step) => ({ ...step })),
+      fullText: s.planFullText,
+      completed,
+    });
+  }
+
   function updatePlanPanel(ctx: ExtensionContext) {
     if (s.isSubAgent) return;
     if (s.planSteps.length === 0) {
@@ -51,339 +66,553 @@ export function setupPlanFeature(
       return;
     }
     ctx.ui.setWidget("plan-panel", (_tui, theme) => ({
-      render: (_width: number) => renderPlanPanel(s.planSteps, theme, s.planPanelExpanded),
+      render: (_width: number) =>
+        renderPlanPanel(s.planSteps, theme, s.planPanelExpanded),
       invalidate: () => _tui.requestRender?.(),
     }));
   }
 
-  function clearAllSteps() {
+  function clearState() {
     s.planSteps = [];
     s.planFullText = "";
-    resetStepIdCounter(0);
     s.planPanelExpanded = false;
-    s.pendingErrorInfo = null;
-  }
-
-  function closePlanPanel(ctx: ExtensionContext) {
-    if (s.isSubAgent) return;
-    clearAllSteps();
-    ctx.ui.setWidget("plan-panel", undefined);
+    resetStepIdCounter(0);
   }
 
   function clearPlanPanel(ctx: ExtensionContext) {
-    clearAllSteps();
-    ctx.ui.setWidget("plan-panel", undefined);
+    clearState();
+    if (!s.isSubAgent) ctx.ui.setWidget("plan-panel", undefined);
+    persistPlan(false);
   }
 
   function getCurrentStepIndex(): number {
-    return s.planSteps.findIndex(st => st.status === "current");
+    return s.planSteps.findIndex((step) => step.status === "current");
   }
 
-  // ---- acceptPlan ----
-  function acceptPlan(ctx: ExtensionContext) {
-    s.mode = "work";
-    s.appState = "working";
-    s.pendingErrorInfo = null;
-    cb.setMode("work", ctx);
-    if (!s.isSubAgent && s.planSteps.length > 0) updatePlanPanel(ctx);
-    ctx.ui.notify("计划已接受，切换到 WORK 模式执行", "info");
+  function replacePlanSteps(
+    steps: string[],
+    ctx: ExtensionContext,
+    fullText = "",
+  ) {
+    const texts = steps
+      .map((step) => redactAuditText(step.trim()).slice(0, 300))
+      .filter(Boolean)
+      .slice(0, MAX_PLAN_STEPS);
+    resetStepIdCounter(0);
+    s.planSteps = texts.map((text, index) => ({
+      id: nextStepId(),
+      text,
+      status: index === 0 ? "current" : "pending",
+      updatedAt: Date.now(),
+    }));
+    s.planFullText = fullText;
+    s.planPanelExpanded = s.planSteps.length <= DEFAULT_VISIBLE_STEPS;
+    updatePlanPanel(ctx);
+    persistPlan(false);
   }
 
-  // ---- message_end: detect plan + show confirmation ----
-  pi.on("message_end", async (event, ctx) => {
-    const textParts = (event.message.content ?? []).filter(
-      (c: { type: string }) => c.type === "text",
-    );
-    if (textParts.length === 0) return;
-    if (!textParts.some((c: { text?: string }) => (c.text ?? "").trim().length > 50)) return;
-    const fullText = textParts.map((c: { text?: string }) => c.text ?? "").join("\n");
-
-    // Detect explicit ## Execution Plan — works in ANY mode
-    if (!s.planProduced && s.planSteps.length === 0) {
-      const hasExplicitPlan = /(?:^|\n)#{2,}\s*Execution\s+Plan\s*\n/i.test(fullText);
-      if (hasExplicitPlan) {
-        const parsed = parsePlanSteps(fullText);
-        if (parsed.length > 0) {
-          s.planProduced = true;
-          s.planFullText = fullText;
-          s.planSteps = parsed;
-          s.appState = "planning";
-          updatePlanPanel(ctx);
-          if (s.mode !== "plan") { s.mode = "plan"; cb.persist(ctx); }
-
-          // Show confirmation dialog (message_end is async, UI works here)
-          const choice = await ctx.ui.select(
-            "是否接受此计划？",
-            ["是，开始执行", "修改计划"],
-          );
-          if (choice === "是，开始执行") {
-            acceptPlan(ctx);
-            setTimeout(() => {
-              pi.sendUserMessage("请按计划步骤逐步执行，使用 manage_plan(set_step_status) 推进面板");
-            }, 100);
-          } else {
-            s.planProduced = false;
-            clearAllSteps();
-            ctx.ui.notify("计划已放弃", "info");
-          }
-        }
+  pi.on("session_start", (_event, ctx) => {
+    let restored: PlanEntry["data"] | undefined;
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (
+        entry.type === "custom" &&
+        (entry as PlanEntry).customType === "work-plan-state"
+      ) {
+        restored = (entry as PlanEntry).data;
       }
     }
-  });
-
-  // ---- agent_end: (plan continuation handled by SMART_PLAN_PROMPT) ----
-  pi.on("tool_execution_end", (_event, ctx) => {
-    if (s.mode !== "work" || s.planSteps.length === 0) return;
+    if (!restored) return;
+    const validStatuses = new Set([
+      "pending",
+      "current",
+      "done",
+      "error",
+      "skipped",
+    ]);
+    s.planSteps = (Array.isArray(restored.steps) ? restored.steps : [])
+      .filter(
+        (step) =>
+          step &&
+          Number.isFinite(step.id) &&
+          typeof step.text === "string" &&
+          step.text.trim().length > 0 &&
+          validStatuses.has(step.status),
+      )
+      .slice(0, MAX_PLAN_STEPS)
+      .map((step) => ({
+        ...step,
+        text: redactAuditText(step.text.trim()).slice(0, 300),
+        evidence:
+          typeof step.evidence === "string"
+            ? redactAuditText(step.evidence.trim()).slice(0, 500) || undefined
+            : undefined,
+      }));
+    let sawCurrent = false;
+    for (const step of s.planSteps) {
+      if (step.status !== "current") continue;
+      if (sawCurrent) step.status = "pending";
+      sawCurrent = true;
+    }
+    s.planFullText =
+      typeof restored.fullText === "string"
+        ? redactAuditText(restored.fullText).slice(0, 12_000)
+        : "";
+    resetStepIdCounter(Math.max(0, ...s.planSteps.map((step) => step.id)));
     updatePlanPanel(ctx);
   });
 
-  // ============================================================
-  // Commands
-  // ============================================================
+  pi.on("tool_execution_end", (_event, ctx) => {
+    if (s.phase === "work" && s.planSteps.length > 0) updatePlanPanel(ctx);
+  });
 
   pi.registerCommand("security-review", {
-    description: "Run security review on the current plan text (manual trigger)",
-    handler: (_a, ctx) => {
-      if (!s.planFullText || s.planSteps.length === 0) {
-        ctx.ui.notify("没有当前计划可审查。先使用 /plan 或让 AI 输出带 ## Execution Plan 标记的计划", "warning");
+    description: "Run a rule-based review on the current structured plan",
+    handler: async (_a, ctx) => {
+      if (s.planSteps.length === 0) {
+        ctx.ui.notify("当前没有可审查的执行计划", "warning");
         return;
       }
-      const findings = securityReview(s.planFullText, s.planSteps);
-      if (findings.length === 0) {
-        ctx.ui.notify("安全审查通过，未发现问题", "info");
-      } else {
-        ctx.ui.notify(formatSecurityReview(findings), "warning");
-      }
+      const reviewText =
+        s.planFullText || s.planSteps.map((step) => step.text).join("\n");
+      const findings = securityReview(reviewText, s.planSteps);
+      ctx.ui.notify(
+        findings.length === 0 ? "安全审查通过，未发现问题" : formatSecurityReview(findings),
+        findings.length === 0 ? "info" : "warning",
+      );
     },
   });
 
   pi.registerCommand("plan-expand", {
     description: "展开计划面板显示全部步骤",
-    handler: (_a, ctx) => {
+    handler: async (_a, ctx) => {
       s.planPanelExpanded = true;
       updatePlanPanel(ctx);
-      ctx.ui.notify("计划面板已展开", "info");
     },
   });
 
   pi.registerCommand("plan-collapse", {
-    description: "折叠计划面板，以当前步骤为中心滚动显示 " + DEFAULT_VISIBLE_STEPS + " 步",
-    handler: (_a, ctx) => {
+    description: "折叠计划面板",
+    handler: async (_a, ctx) => {
       s.planPanelExpanded = false;
       updatePlanPanel(ctx);
-      ctx.ui.notify("计划面板已折叠为滚动视图", "info");
     },
   });
 
   pi.registerCommand("plan-cancel", {
-    description: "终止当前计划，清除面板，回到空闲状态",
-    handler: (_a, ctx) => {
+    description: "按用户指令放弃当前计划并保留审计快照",
+    handler: async (_a, ctx) => {
       clearPlanPanel(ctx);
-      s.appState = "idle";
-      s.planProduced = false;
-      ctx.ui.notify("计划已终止，面板已清除", "info");
+      ctx.ui.notify("当前计划已由用户终止", "warning");
     },
   });
 
-  // ============================================================
-  // manage_plan tool
-  // ============================================================
+  const evidenceFrom = (value: unknown): string =>
+    typeof value === "string"
+      ? redactAuditText(value.trim()).slice(0, 500)
+      : "";
 
-  const isStatus = (x: unknown): x is StepStatus =>
-    x === "pending" || x === "current" || x === "done" || x === "error" || x === "skipped";
+  const statusErrorText = (error: string): string =>
+    ({
+      invalid_status:
+        "错误: status 必须是 current | done | error | skipped。",
+      missing_evidence: "错误: 结束当前步骤需要简短、可观察的 evidence。",
+      no_current_step: "错误: 当前没有进行中的步骤。",
+      invalid_id: "错误: stepId 不存在。",
+      non_current_terminal_transition:
+        "错误: 只有当前步骤可进入终态；请按顺序推进计划。",
+      invalid_current_transition:
+        "错误: 只有 pending 或 error 步骤可以重新设为 current。",
+      current_step_exists:
+        "错误: 已有步骤正在进行；请先用 advance 结束它。",
+    })[error] ?? `错误: 无效的计划状态转换 (${error})`;
 
   pi.registerTool({
     name: "manage_plan",
     label: "Manage Plan",
     description:
-      "操控计划面板：设置步骤、推进进度、标记错误、清除面板。" +
-      "让 AI 在执行过程中主动更新面板状态。",
-    promptSnippet: "Update the plan panel (set steps, advance, mark errors, clear)",
+      "Maintain truthful execution progress for multi-step Work. It does not confirm requirements or grant authorization.",
+    promptSnippet: "Update truthful multi-step Work progress",
     promptGuidelines: [
-      "Use manage_plan to update the execution plan panel during task execution.",
-      "Actions: 'set_steps' (replace all steps), 'set_step_status' (set a step's status), 'insert_step' (insert at position), 'delete_step' (remove by id/index), 'update_step' (edit step text), 'complete' (mark all done + close), 'clear' (remove panel), 'status' (query current plan state).",
-      "Step statuses: 'pending' | 'current' | 'done' | 'error' | 'skipped'. Only ONE step should be 'current' at a time.",
-      "Use set_step_status to advance: mark current step 'done', mark next step 'current'.",
-      "Use set_steps to replace the current plan with a refined one (max 10 steps).",
-      "Use clear when the task is done or the plan is no longer relevant.",
-      "Advance one step at a time via set_step_status. Mark errors honestly — don't skip silently.",
-      "FORBIDDEN: Do NOT clear the panel when steps remain unfinished, unless the user explicitly says so.",
+      "Use manage_plan only for meaningful multi-step Work; use manage_requirements for contract confirmation.",
+      "Use manage_plan action=advance with observable evidence to finish the current step and select the next one atomically.",
+      "Never use manage_plan complete or force-clear while unfinished work remains.",
     ],
     parameters: Type.Object({
-      action: Type.String({ description: "操作: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear | status" }),
-      steps: Type.Optional(Type.Array(Type.String(), { description: "步骤文本列表 (set_steps 时使用，上限10)" })),
-      stepId: Type.Optional(Type.Number({ description: "步骤 id（set_step_status/delete_step/update_step 时使用）" })),
-      stepIndex: Type.Optional(Type.Number({ description: "步骤索引（insert_step 时使用，0-based，默认追加到末尾）" })),
-      status: Type.Optional(Type.String({ description: "步骤状态: pending | current | done | error | skipped（set_step_status 时使用）" })),
-      text: Type.Optional(Type.String({ description: "步骤文本（insert_step/update_step 时使用）" })),
+      action: Type.String({
+        description:
+          "set_steps | advance | set_step_status | insert_step | delete_step | update_step | complete | clear | status",
+      }),
+      steps: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Top-level execution steps for set_steps (maximum 10)",
+        }),
+      ),
+      stepId: Type.Optional(Type.Number({ description: "Stable plan step id" })),
+      stepIndex: Type.Optional(
+        Type.Number({ description: "Zero-based insertion index" }),
+      ),
+      status: Type.Optional(
+        Type.String({
+          description: "current | done | error | skipped",
+        }),
+      ),
+      text: Type.Optional(Type.String({ description: "Step text" })),
+      evidence: Type.Optional(
+        Type.String({
+          description:
+            "Short observable evidence required for done, error, or skipped transitions",
+        }),
+      ),
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Use with clear only after the user explicitly abandons unfinished work",
+        }),
+      ),
     }),
 
     renderCall(args, theme, context) {
       const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
       const action = typeof args.action === "string" ? args.action : "?";
-      let detail = "";
-      switch (action) {
-        case "set_steps":
-          detail = args.steps ? ` ${args.steps.length}步` : "";
-          break;
-        case "set_step_status":
-          detail = ` #${args.stepId} → ${args.status}`;
-          break;
-        case "insert_step":
-          detail = args.text ? ` "${args.text.slice(0, 30)}"` : "";
-          break;
-        case "delete_step":
-          detail = ` #${args.stepId}`;
-          break;
-        case "update_step":
-          detail = ` #${args.stepId}`;
-          break;
-        case "complete":
-          detail = " ✅";
-          break;
-        case "clear":
-          detail = " 🧹";
-          break;
-        case "status":
-          detail = " 🔍";
-          break;
-      }
-      text.setText(theme.fg("toolTitle", theme.bold(`manage_plan: ${action}${detail}`)));
+      const detail =
+        action === "set_steps"
+            ? ` ${args.steps?.length ?? 0}步`
+          : action === "advance"
+            ? ` → ${args.status ?? "?"}`
+            : action === "set_step_status"
+              ? ` #${args.stepId} → ${args.status}`
+              : args.stepId != null
+                ? ` #${args.stepId}`
+                : "";
+      text.setText(
+        theme.fg("toolTitle", theme.bold(`manage_plan: ${action}${detail}`)),
+      );
       return text;
     },
 
     renderResult(result, options, theme, context) {
-      const text = result.content
-        ?.filter((c: { type: string; text?: string }) => c.type === "text")
-        .map((c: { type: string; text?: string }) => c.text ?? "")
-        .join("\n")
-        .trim() ?? "";
-      if (!text) return (context.lastComponent as Container) ?? new Container();
-
-      const container = (context.lastComponent as Container) ?? new Container();
-      container.clear();
-
-      if (options.expanded) {
-        // 展开：显示完整输出
-        container.addChild(new Text(text, 0, 0));
-      } else {
-        // 折叠：只显示一行摘要
-        const firstLine = text.split("\n")[0].slice(0, 100);
-        const hint = text.includes("\n") || text.length > 100
-          ? theme.fg("muted", " … (Ctrl+O 展开)")
-          : "";
-        container.addChild(new Text(firstLine + hint, 0, 0));
+      const output =
+        result.content
+          ?.flatMap((item) => (item.type === "text" ? [item.text ?? ""] : []))
+          .join("\n")
+          .trim() ?? "";
+      if (!output) {
+        return (context.lastComponent as Container) ?? new Container();
       }
+      const container =
+        (context.lastComponent as Container) ?? new Container();
+      container.clear();
+      const shown = options.expanded
+        ? output
+        : output.split("\n")[0].slice(0, 120) +
+          (output.includes("\n") || output.length > 120
+            ? theme.fg("muted", " … (Ctrl+O 展开)")
+            : "");
+      container.addChild(new Text(shown, 0, 0));
       return container;
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (s.phase !== "work" && params.action !== "status") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "manage_plan 只在 WORK 阶段更新进度；PLAN 请使用 manage_requirements。",
+            },
+          ],
+          details: { error: "wrong_phase", phase: s.phase },
+        };
+      }
+
       switch (params.action) {
         case "set_steps": {
-          if (!params.steps || params.steps.length === 0) {
-            return { content: [{ type: "text", text: "错误: set_steps 需要 steps 参数" }], details: { error: "missing_steps" } };
+          if (!params.steps?.length) {
+            return {
+              content: [{ type: "text", text: "错误: set_steps 需要 steps" }],
+              details: { error: "missing_steps" },
+            };
           }
-          const texts = params.steps.slice(0, MAX_PLAN_STEPS);
-          resetStepIdCounter(0);
-          s.planSteps = texts.map((t, i) => ({
-            id: nextStepId(),
-            text: t,
-            status: i === 0 ? "current" : "pending",
-          }));
-          s.planPanelExpanded = s.planSteps.length <= DEFAULT_VISIBLE_STEPS;
-          s.pendingErrorInfo = null;
+          if (hasUnfinishedPlan(s.planSteps)) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "错误: 已有未完成计划；请推进或由用户通过 /plan-cancel 放弃，不能静默覆盖。",
+                },
+              ],
+              details: { error: "unfinished_plan_exists" },
+            };
+          }
+          replacePlanSteps(params.steps, ctx);
+          return {
+            content: [
+              { type: "text", text: `计划已建立: ${s.planSteps.length} 步` },
+            ],
+            details: { action: "set_steps", steps: s.planSteps },
+          };
+        }
+
+        case "advance": {
+          const evidence = evidenceFrom(params.evidence);
+          const result = advancePlanWithEvidence(
+            s.planSteps,
+            params.status,
+            evidence,
+          );
+          if (!result.ok) {
+            return {
+              content: [{ type: "text", text: statusErrorText(result.error) }],
+              details: result,
+            };
+          }
           updatePlanPanel(ctx);
-          return { content: [{ type: "text", text: `✅ 计划面板已更新: ${s.planSteps.length} 步` }], details: { action: "set_steps", count: s.planSteps.length } };
+          persistPlan(false);
+          return {
+            content: [
+              {
+                type: "text",
+                text: result.next
+                  ? `步骤 #${result.target.id} → ${result.status}（${result.target.evidence}）；下一步 #${result.next.id}: ${result.next.text}`
+                  : `步骤 #${result.target.id} → ${result.status}（${result.target.evidence}）；没有剩余待办`,
+              },
+            ],
+            details: { action: "advance", ...result },
+          };
         }
 
         case "set_step_status": {
-          if (params.stepId == null || !isStatus(params.status)) {
-            return { content: [{ type: "text", text: "错误: set_step_status 需要 stepId (number) 和 status (pending|current|done|error|skipped)" }], details: { error: "missing_params" } };
+          if (params.stepId == null) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "错误: set_step_status 需要有效的 stepId 和 status",
+                },
+              ],
+              details: { error: "missing_params" },
+            };
           }
-          const target = s.planSteps.find(st => st.id === params.stepId);
-          if (!target) {
-            return { content: [{ type: "text", text: `错误: stepId ${params.stepId} 不存在` }], details: { error: "invalid_id" } };
+          const result = setPlanStepStatus(
+            s.planSteps,
+            params.stepId,
+            params.status,
+            evidenceFrom(params.evidence),
+          );
+          if (!result.ok) {
+            return {
+              content: [
+                { type: "text", text: statusErrorText(result.error) },
+              ],
+              details: result,
+            };
           }
-          if (params.status === "current") {
-            for (const st of s.planSteps) { if (st.status === "current") st.status = "done"; }
-          }
-          target.status = params.status as StepStatus;
           updatePlanPanel(ctx);
-          return { content: [{ type: "text", text: `步骤 #${target.id} "${target.text.slice(0, 40)}" → ${params.status}` }], details: { action: "set_step_status", stepId: target.id, status: params.status } };
+          persistPlan(false);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `步骤 #${result.target.id} → ${result.status}${
+                  result.target.evidence
+                    ? `（${result.target.evidence}）`
+                    : ""
+                }`,
+              },
+            ],
+            details: { action: "set_step_status", ...result },
+          };
         }
 
         case "insert_step": {
-          if (!params.text) {
-            return { content: [{ type: "text", text: "错误: insert_step 需要 text 参数" }], details: { error: "missing_text" } };
+          const value = params.text
+            ? redactAuditText(params.text.trim()).slice(0, 300)
+            : "";
+          if (!value) {
+            return {
+              content: [{ type: "text", text: "错误: insert_step 需要 text" }],
+              details: { error: "missing_text" },
+            };
           }
           if (s.planSteps.length >= MAX_PLAN_STEPS) {
-            return { content: [{ type: "text", text: `错误: 已达上限 ${MAX_PLAN_STEPS} 步` }], details: { error: "max_steps" } };
+            return {
+              content: [
+                { type: "text", text: `错误: 计划最多 ${MAX_PLAN_STEPS} 步` },
+              ],
+              details: { error: "max_steps" },
+            };
           }
-          const idx = params.stepIndex != null ? params.stepIndex : s.planSteps.length;
-          const clampedIdx = Math.max(0, Math.min(idx, s.planSteps.length));
-          s.planSteps.splice(clampedIdx, 0, { id: nextStepId(), text: params.text, status: "pending" });
+          const index = Math.max(
+            0,
+            Math.min(params.stepIndex ?? s.planSteps.length, s.planSteps.length),
+          );
+          const step: PlanStep = {
+            id: nextStepId(),
+            text: value,
+            status: "pending",
+            updatedAt: Date.now(),
+          };
+          s.planSteps.splice(index, 0, step);
           updatePlanPanel(ctx);
-          return { content: [{ type: "text", text: `➕ 在位置 ${clampedIdx + 1} 插入步骤: ${params.text.slice(0, 40)}` }], details: { action: "insert_step", stepIndex: clampedIdx } };
+          persistPlan(false);
+          return {
+            content: [{ type: "text", text: `已插入步骤 #${step.id}` }],
+            details: { action: "insert_step", step, index },
+          };
         }
 
         case "delete_step": {
           if (params.stepId == null) {
-            return { content: [{ type: "text", text: "错误: delete_step 需要 stepId 参数" }], details: { error: "missing_stepId" } };
+            return {
+              content: [{ type: "text", text: "错误: delete_step 需要 stepId" }],
+              details: { error: "missing_stepId" },
+            };
           }
-          const idx = s.planSteps.findIndex(st => st.id === params.stepId);
-          if (idx < 0) {
-            return { content: [{ type: "text", text: `错误: stepId ${params.stepId} 不存在` }], details: { error: "invalid_id" } };
+          const index = s.planSteps.findIndex(
+            (step) => step.id === params.stepId,
+          );
+          if (index < 0) {
+            return {
+              content: [
+                { type: "text", text: `错误: stepId ${params.stepId} 不存在` },
+              ],
+              details: { error: "invalid_id" },
+            };
           }
-          const removed = s.planSteps[idx];
-          s.planSteps.splice(idx, 1);
+          const [removed] = s.planSteps.splice(index, 1);
+          if (removed.status === "current") {
+            const next = s.planSteps.find((step) => step.status === "pending");
+            if (next) {
+              next.status = "current";
+              next.updatedAt = Date.now();
+            }
+          }
           updatePlanPanel(ctx);
-          return { content: [{ type: "text", text: `🗑 已删除步骤 #${removed.id}: ${removed.text.slice(0, 40)}` }], details: { action: "delete_step", stepId: removed.id } };
+          persistPlan(false);
+          return {
+            content: [{ type: "text", text: `已删除步骤 #${removed.id}` }],
+            details: { action: "delete_step", removed },
+          };
         }
 
         case "update_step": {
-          if (params.stepId == null || !params.text) {
-            return { content: [{ type: "text", text: "错误: update_step 需要 stepId 和 text 参数" }], details: { error: "missing_params" } };
+          const value = params.text
+            ? redactAuditText(params.text.trim()).slice(0, 300)
+            : "";
+          const target = s.planSteps.find((step) => step.id === params.stepId);
+          if (!target || !value) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "错误: update_step 需要有效的 stepId 和 text",
+                },
+              ],
+              details: { error: "missing_params" },
+            };
           }
-          const target2 = s.planSteps.find(st => st.id === params.stepId);
-          if (!target2) {
-            return { content: [{ type: "text", text: `错误: stepId ${params.stepId} 不存在` }], details: { error: "invalid_id" } };
+          if (target.status === "done" || target.status === "skipped") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "错误: 已完成或已跳过步骤是审计事实，不能静默改写。",
+                },
+              ],
+              details: { error: "terminal_step_immutable" },
+            };
           }
-          target2.text = params.text;
+          target.text = value;
+          target.updatedAt = Date.now();
           updatePlanPanel(ctx);
-          return { content: [{ type: "text", text: `✏ 步骤 #${target2.id} 已更新: ${params.text.slice(0, 40)}` }], details: { action: "update_step", stepId: target2.id } };
+          persistPlan(false);
+          return {
+            content: [{ type: "text", text: `已更新步骤 #${target.id}` }],
+            details: { action: "update_step", step: target },
+          };
         }
 
         case "status": {
           if (s.planSteps.length === 0) {
-            return { content: [{ type: "text", text: "当前无计划" }], details: { action: "status", steps: [], count: 0 } };
+            return {
+              content: [{ type: "text", text: "当前无执行计划" }],
+              details: { action: "status", steps: [] },
+            };
           }
-          const summary = s.planSteps.map(st => {
-            const icon = st.status === "current" ? "▶" : st.status === "done" ? "✅" : st.status === "error" ? "❌" : st.status === "skipped" ? "⏭" : "○";
-            return `${icon} [id=${st.id}] ${st.status}: ${st.text}`;
-          }).join("\n");
+          const lines = s.planSteps.map(
+            (step) =>
+              `[${step.id}] ${step.status}: ${step.text}${
+                step.evidence ? ` — evidence: ${step.evidence}` : ""
+              }`,
+          );
           return {
-            content: [{ type: "text", text: `计划面板状态 (${s.planSteps.length} 步):\n${summary}` }],
-            details: { action: "status", steps: s.planSteps.map(st => ({ id: st.id, text: st.text, status: st.status })), count: s.planSteps.length },
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: {
+              action: "status",
+              steps: s.planSteps.map((step) => ({ ...step })),
+            },
           };
         }
 
         case "complete": {
-          for (const st of s.planSteps) st.status = "done";
-          closePlanPanel(ctx);
-          s.appState = "working";
-          return { content: [{ type: "text", text: "✅ 计划已全部完成，面板已关闭" }], details: { action: "complete" } };
+          const unfinished = s.planSteps.filter(
+            (step) => step.status !== "done" && step.status !== "skipped",
+          );
+          if (!isPlanComplete(s.planSteps)) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `无法完成计划：仍有 ${unfinished.length} 个未完成步骤。`,
+                },
+              ],
+              details: { error: "unfinished_steps", unfinished },
+            };
+          }
+          updatePlanPanel(ctx);
+          persistPlan(true);
+          return {
+            content: [
+              { type: "text", text: "计划已完成，最终状态保留用于审计" },
+            ],
+            details: { action: "complete", steps: s.planSteps },
+          };
         }
 
         case "clear": {
+          const unfinished = hasUnfinishedPlan(s.planSteps);
+          if (unfinished && params.force !== true) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "拒绝清除：计划尚未完成。仅在用户明确放弃后传 force=true。",
+                },
+              ],
+              details: { error: "unfinished_plan" },
+            };
+          }
           clearPlanPanel(ctx);
-          return { content: [{ type: "text", text: "🧹 计划面板已清除" }], details: { action: "clear" } };
+          return {
+            content: [{ type: "text", text: "计划面板已清除" }],
+            details: { action: "clear" },
+          };
         }
 
         default:
-          return { content: [{ type: "text", text: `未知操作: ${params.action}\n支持: set_steps | set_step_status | insert_step | delete_step | update_step | complete | clear` }], details: { error: "unknown_action" } };
+          return {
+            content: [
+              { type: "text", text: `未知 manage_plan 操作: ${params.action}` },
+            ],
+            details: { error: "unknown_action" },
+          };
       }
     },
   });
 
-  return { updatePlanPanel, closePlanPanel, clearPlanPanel, getCurrentStepIndex };
+  return {
+    updatePlanPanel,
+    clearPlanPanel,
+    getCurrentStepIndex,
+    replacePlanSteps,
+  };
 }

@@ -1,26 +1,21 @@
 /**
  * tier-config.ts — 层级配置读写 + 解析
+ *
+ * 自 v4.2 使用共享 settings-io 单例，不再直接读写磁盘。
+ * 避免与 provider-manager 的 settings 写入冲突。
  */
 
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { isValidThinkingLevel, type ThinkingLevel, type TierConfig, type TierKey, TIER_DEFAULTS } from "./types.js";
 import { KEY_TIERS } from "./types.js";
-
-function sp(): string {
-  return path.join(process.env.USERPROFILE ?? ".", ".pi", "agent", "settings.json");
-}
-
-export function readSettings(): Record<string, unknown> {
-  try { return JSON.parse(fs.readFileSync(sp(), "utf-8")); } catch { return {}; }
-}
-
-export function writeSettingsRaw(data: Record<string, unknown>): void {
-  fs.writeFileSync(sp(), JSON.stringify(data, null, 2) + "\n", "utf-8");
-}
+import {
+  getSettings,
+  updateSettings,
+  readSettings as compatRead,
+  writeSettingsRaw as compatWrite,
+} from "../../lib/settings-io.js";
 
 export function readAllTiers(): Record<TierKey, TierConfig> {
-  const s = readSettings();
+  const s = getSettings();
   const tiers = s[KEY_TIERS] as Record<string, unknown> | undefined;
   if (!tiers || typeof tiers !== "object") return {} as Record<TierKey, TierConfig>;
 
@@ -42,25 +37,26 @@ export function readAllTiers(): Record<TierKey, TierConfig> {
 }
 
 export function writeAllTiers(config: Record<TierKey, TierConfig>): void {
-  const s = readSettings();
-  const tierObj: Record<string, unknown> = {};
-  for (const key of ["L0", "L1", "L2"] as TierKey[]) {
-    const c = config[key];
-    if (c && c.models.length > 0) {
-      tierObj[key] = {
-        label: c.label,
-        desc: c.desc,
-        models: c.models,
-        ...(c.thinkingLevel ? { thinkingLevel: c.thinkingLevel } : {}),
-      };
+  updateSettings((s) => {
+    const tierObj: Record<string, unknown> = {};
+    for (const key of ["L0", "L1", "L2"] as TierKey[]) {
+      const c = config[key];
+      if (c && c.models.length > 0) {
+        tierObj[key] = {
+          label: c.label,
+          desc: c.desc,
+          models: c.models,
+          ...(c.thinkingLevel ? { thinkingLevel: c.thinkingLevel } : {}),
+        };
+      }
     }
-  }
-  if (Object.keys(tierObj).length > 0) {
-    s[KEY_TIERS] = tierObj;
-  } else {
-    delete s[KEY_TIERS];
-  }
-  writeSettingsRaw(s);
+    if (Object.keys(tierObj).length > 0) {
+      s[KEY_TIERS] = tierObj;
+    } else {
+      delete s[KEY_TIERS];
+    }
+    return s;
+  });
 }
 
 export function resolveTierModel(

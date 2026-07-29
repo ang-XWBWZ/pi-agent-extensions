@@ -4,8 +4,9 @@
 
 import type { AgentJob, SubResult } from "../../lib/agent-bus.js";
 
-const CHECK_PREVIEW_CHARS = 500;
-const INJECT_OUTPUT_CHARS = 10_000;
+const CHECK_PREVIEW_CHARS = 1_200;
+const INJECT_OUTPUT_CHARS = 12_000;
+const CONCLUSION_PREVIEW_CHARS = 8_000;
 
 export function jobElapsedSeconds(job: AgentJob): string {
   return job.finishedAt
@@ -29,12 +30,26 @@ export function formatJobStatusLine(job: AgentJob, elapsed: string = jobElapsedS
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   const head = Math.max(0, maxChars - 240);
-  return `${text.slice(0, head)}\n\n... [截断 ${text.length - head} 字符，避免一次性污染主上下文；如需更完整内容，请收窄子任务后重跑或查看子 Agent 存档] ...`;
+  return `${text.slice(0, head)}\n\n... [截断 ${text.length - head} 字符，避免一次性污染主上下文；如需原文，请按需调用 read_agent_output 读取一段] ...`;
 }
 
-function formatResultBody(result: SubResult, maxChars: number): string {
+function readOutputHint(jobId: string, result: SubResult): string {
+  return "原始输出可按需展开：" +
+    `read_agent_output({ jobId: ${JSON.stringify(jobId)}, taskId: ${JSON.stringify(result.id)}, cursor: 0 })`;
+}
+
+function formatResultBody(
+  jobId: string,
+  result: SubResult,
+  maxChars: number,
+): string {
+  const parts: string[] = [];
+  if (result.summary?.trim()) {
+    parts.push(`最终结论:\n${truncateText(result.summary, CONCLUSION_PREVIEW_CHARS)}`);
+  }
+
   if (!result.ok) {
-    const parts = [`错误: ${result.error ?? "未知"}`];
+    parts.push(`错误: ${result.error ?? "未知"}`);
     if (result.output?.trim()) {
       parts.push(
         `已保留的中间产出:\n${truncateText(result.output, maxChars)}`,
@@ -51,9 +66,15 @@ function formatResultBody(result: SubResult, maxChars: number): string {
     if (result.cleanupErrors?.length) {
       parts.push(`清理警告: ${result.cleanupErrors.join("; ")}`);
     }
+    if (result.output?.trim()) parts.push(readOutputHint(jobId, result));
     return parts.join("\n");
   }
-  return truncateText(result.output ?? "(无输出)", maxChars);
+  parts.push(truncateText(result.output ?? "(无输出)", maxChars));
+  if (result.outputLength !== undefined) {
+    parts.push(`原始输出长度: ${result.outputLength} 字。`);
+  }
+  if (result.output?.trim()) parts.push(readOutputHint(jobId, result));
+  return parts.join("\n\n");
 }
 
 export function formatJobPreview(job: AgentJob, elapsed: string = jobElapsedSeconds(job)): string {
@@ -61,7 +82,7 @@ export function formatJobPreview(job: AgentJob, elapsed: string = jobElapsedSeco
     .sort((a, b) => a.order - b.order)
     .map((r) => {
       const icon = r.ok ? "✅" : "❌";
-      return `${icon} [${r.order}/${job.total}] ${r.name}\n   ${formatResultBody(r, CHECK_PREVIEW_CHARS)}\n`;
+      return `${icon} [${r.order}/${job.total}] ${r.name}\n   ${formatResultBody(job.jobId, r, CHECK_PREVIEW_CHARS)}\n`;
     });
 
   return [formatJobStatusLine(job, elapsed), "", ...body].join("\n");
@@ -74,7 +95,7 @@ export function formatJobFullResult(job: AgentJob, elapsed: string = jobElapsedS
       const icon = r.ok ? "✅" : "❌";
       return [
         `${icon} [${r.order}/${job.total}] ${r.name}`,
-        formatResultBody(r, INJECT_OUTPUT_CHARS),
+        formatResultBody(job.jobId, r, INJECT_OUTPUT_CHARS),
       ].join("\n");
     });
 

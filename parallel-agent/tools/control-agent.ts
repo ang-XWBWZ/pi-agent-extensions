@@ -15,10 +15,61 @@ import {
   getJobInstances,
   getAgentTaskPanel,
   listAgentTaskPanels,
+  getAgentTaskOutputInfo,
   saveAgentState,
   deleteAgentSave,
   listAgentSaves,
+  type AgentTaskPanel,
+  type AgentTaskStageReport,
 } from "../../lib/agent-bus.js";
+
+function compactText(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars)}…`;
+}
+
+function compactStageReport(report: AgentTaskStageReport) {
+  return {
+    ...report,
+    conclusion: compactText(report.conclusion, 8_000),
+    detail: report.detail ? compactText(report.detail, 12_000) : undefined,
+  };
+}
+
+function selectedStageReport(panel: AgentTaskPanel, offset = 0) {
+  const normalizedOffset = Math.max(0, Math.floor(offset));
+  const index = panel.stageReports.length - 1 - normalizedOffset;
+  return index >= 0
+    ? { index, report: panel.stageReports[index] }
+    : undefined;
+}
+
+function compactTaskPanel(panel: AgentTaskPanel | undefined) {
+  if (!panel) return undefined;
+  const output = getAgentTaskOutputInfo(panel.jobId, panel.taskId);
+  const latestStageReport = panel.stageReports.at(-1);
+  return {
+    jobId: panel.jobId,
+    taskId: panel.taskId,
+    status: panel.status,
+    progress: panel.progress,
+    currentStep: panel.currentStep,
+    summary: panel.summary ? compactText(panel.summary, 8_000) : undefined,
+    stageReportCount: panel.stageReports.length,
+    latestStageReport: latestStageReport
+      ? compactStageReport(latestStageReport)
+      : undefined,
+    latestNotes: panel.notes.slice(-10).map((note) => ({
+      ...note,
+      text: compactText(note.text, 1_000),
+    })),
+    outputLength: output.characterLength ?? panel.outputLength ?? 0,
+    outputBytes: output.byteLength,
+    outputSource: output.source,
+    outputReadable: output.available,
+    saveId: panel.saveId,
+    updatedAt: panel.updatedAt,
+  };
+}
 
 export function registerControlAgent(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -26,7 +77,7 @@ export function registerControlAgent(pi: ExtensionAPI): void {
     label: "Control Agent",
     description:
       "控制子 Agent 生命周期：列出、查看状态、注入消息、打断、暂停、恢复、杀死、存档、恢复存档、删除存档。" +
-      "支持操作单个 task 或整个 job。",
+      "status 会显示子 Agent 主动提交的阶段结论；可用 stageOffset 展开某一阶段的可选详细说明。支持操作单个 task 或整个 job。",
     promptSnippet: "Manage sub-agent lifecycle (list/status/send/abort/pause/resume/kill/save/load/list_saves/delete_save)",
     promptGuidelines: [
       "Use control_agent list/status before changing a child Agent lifecycle; taskId targets one task and omission targets the job.",
@@ -36,6 +87,7 @@ export function registerControlAgent(pi: ExtensionAPI): void {
       action: Type.String({ description: "操作: list | status | send | abort | pause | resume | kill | kill_job | save | list_saves | delete_save" }),
       jobId: Type.Optional(Type.String({ description: "Job ID" })),
       taskId: Type.Optional(Type.String({ description: "Task ID（单 agent 操作时必填）" })),
+      stageOffset: Type.Optional(Type.Number({ description: "仅 status 使用；0 为最新阶段，1 为上一个阶段，用于展开该阶段的详细控制面板" })),
       input: Type.Optional(Type.String({ description: "消息内容（send/resume 操作时使用）" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -51,9 +103,9 @@ export function registerControlAgent(pi: ExtensionAPI): void {
         if (insts.length === 0) {
           const panelLines = recentPanels.map((panel) =>
             `  📌 [${panel.jobId.slice(0, 8)}] ${panel.taskId} — ${panel.status} ${panel.progress}% — ${(
-              panel.currentStep ||
               panel.summary ||
-              "无阶段摘要"
+              panel.currentStep ||
+              "无阶段结论"
             ).slice(0, 100)}`,
           );
           return {
@@ -63,7 +115,10 @@ export function registerControlAgent(pi: ExtensionAPI): void {
                 ? `没有运行中的子 Agent 实例。\n\n最近任务面板:\n${panelLines.join("\n")}`
                 : "没有运行中的子 Agent 实例或任务面板。",
             }],
-            details: { instances: [], taskPanels: recentPanels },
+            details: {
+              instances: [],
+              taskPanels: recentPanels.map(compactTaskPanel),
+            },
           };
         }
         const lines = insts.map((inst) => {
@@ -79,8 +134,8 @@ export function registerControlAgent(pi: ExtensionAPI): void {
           const elapsed = ((Date.now() - inst.startedAt) / 1000).toFixed(1);
           const taskProgress = panel
             ? ` | 📌 ${panel.progress}% ${(
-                panel.currentStep ||
                 panel.summary ||
+                panel.currentStep ||
                 ""
               ).slice(0, 80)}`
             : "";
@@ -96,7 +151,7 @@ export function registerControlAgent(pi: ExtensionAPI): void {
               status: i.status,
               detailedStatus: i.detailedStatus,
               currentTool: i.currentTool,
-              taskPanel: getAgentTaskPanel(i.jobId, i.taskId),
+              taskPanel: compactTaskPanel(getAgentTaskPanel(i.jobId, i.taskId)),
             })),
           },
         };
@@ -112,6 +167,19 @@ export function registerControlAgent(pi: ExtensionAPI): void {
         if (!inst && !panel) {
           return { content: [{ type: "text", text: `实例和任务面板均不存在: ${jobId}/${taskId}` }], details: { error: "not_found" } };
         }
+        if (
+          params.stageOffset !== undefined &&
+          (!Number.isFinite(params.stageOffset) || params.stageOffset < 0)
+        ) {
+          return {
+            content: [{ type: "text", text: "stageOffset 必须是大于等于 0 的有限数字。" }],
+            details: { error: "invalid_stage_offset", jobId, taskId },
+          };
+        }
+        const stageOffset = Math.floor(params.stageOffset ?? 0);
+        const selectedStage = panel
+          ? selectedStageReport(panel, stageOffset)
+          : undefined;
         const startedAt = inst?.startedAt ?? panel!.createdAt;
         const endAt = panel?.finishedAt ?? Date.now();
         const elapsed = ((endAt - startedAt) / 1000).toFixed(1);
@@ -133,10 +201,40 @@ export function registerControlAgent(pi: ExtensionAPI): void {
               "📝 任务备注:",
               ...panel.notes.slice(-10).map((note) => {
                 const at = new Date(note.createdAt).toLocaleTimeString();
-                return `  - [${note.source} ${at}] ${note.text}`;
+                return `  - [${note.source} ${at}] ${compactText(note.text, 1_000)}`;
               }),
             ]
           : [];
+        const stageTimelineLines = panel?.stageReports.length
+          ? [
+              "",
+              `🧩 阶段结论记录（${panel.stageReports.length} 条，最新在后）:`,
+              ...panel.stageReports.slice(-5).map((report, offset) => {
+                const index = panel.stageReports.length - Math.min(5, panel.stageReports.length) + offset + 1;
+                return `  ${index}. ${report.status} ${report.progress}% — ${compactText(report.conclusion, 800)}`;
+              }),
+            ]
+          : [];
+        const selectedStageLines = selectedStage
+          ? [
+              "",
+              `📋 结论控制面板（第 ${selectedStage.index + 1}/${panel!.stageReports.length} 阶段）:`,
+              `   状态: ${selectedStage.report.status} | 进度: ${selectedStage.report.progress}% | 来源: ${selectedStage.report.source}`,
+              selectedStage.report.currentStep
+                ? `   步骤: ${selectedStage.report.currentStep}`
+                : undefined,
+              "   结论:",
+              compactText(selectedStage.report.conclusion, 8_000),
+              selectedStage.report.detail
+                ? "\n📚 详细控制面板（可选）:"
+                : "   详细: （本阶段未填写）",
+              selectedStage.report.detail
+                ? compactText(selectedStage.report.detail, 12_000)
+                : undefined,
+            ].filter((line): line is string => Boolean(line))
+          : panel?.stageReports.length
+            ? [`   未找到 stageOffset=${stageOffset} 对应的阶段；可用范围为 0-${panel.stageReports.length - 1}。`]
+            : [];
 
         const lines = [
           `📊 ${inst?.name ?? panel!.name}`,
@@ -148,14 +246,18 @@ export function registerControlAgent(pi: ExtensionAPI): void {
             ? `   任务面板: ${panel.status} | 进度: ${panel.progress}% | 修订: ${panel.revision} | 落盘: ${panel.persistenceError ? "失败" : "成功"}`
             : undefined,
           panel?.currentStep ? `   当前步骤: ${panel.currentStep}` : undefined,
-          panel?.summary ? `   阶段摘要: ${panel.summary}` : undefined,
+          panel?.summary && (panel?.stageReports.length ?? 0) === 0
+            ? `   最新结论（兼容字段）: ${compactText(panel.summary, 8_000)}`
+            : undefined,
           panel?.saveId ? `   可恢复存档: ${panel.saveId}` : undefined,
           inst
             ? `   输入: ${inst.promptLength}字 | 输出: ${inst.outputLength}字 | 自动续推: ${inst.autoContinue ? "✅" : "❌"}(${inst.autoContinueDelay}s)`
-            : panel?.outputSnapshot
-              ? `   输出快照: ${panel.outputSnapshot.length}字`
+            : (panel?.outputLength ?? panel?.outputSnapshot?.length ?? 0) > 0
+              ? `   原始输出: ${panel?.outputLength ?? panel?.outputSnapshot?.length ?? 0}字（按需使用 read_agent_output 展开）`
               : undefined,
           ...toolLines,
+          ...stageTimelineLines,
+          ...selectedStageLines,
           ...noteLines,
         ].filter((line): line is string => Boolean(line));
 
@@ -171,10 +273,14 @@ export function registerControlAgent(pi: ExtensionAPI): void {
             elapsed,
             idleSec,
             promptLength: inst?.promptLength,
-            outputLength: inst?.outputLength ?? panel?.outputSnapshot?.length ?? 0,
+            outputLength: inst?.outputLength ?? panel?.outputLength ?? panel?.outputSnapshot?.length ?? 0,
             autoContinue: inst?.autoContinue,
             toolHistory: inst?.toolHistory.slice(-10) ?? [],
-            taskPanel: panel,
+            taskPanel: compactTaskPanel(panel),
+            selectedStageIndex: selectedStage?.index,
+            selectedStageReport: selectedStage
+              ? compactStageReport(selectedStage.report)
+              : undefined,
           },
         };
       }

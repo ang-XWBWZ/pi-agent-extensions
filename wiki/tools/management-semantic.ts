@@ -31,16 +31,8 @@ export function registerSemanticTools(pi: ExtensionAPI): void {
       "管理语义搜索：查看状态、启用/关闭、切换模型。不传 action 时显示状态和模型列表。",
     promptSnippet: "Manage wiki semantic (action?, autoInstall?, id?)",
     promptGuidelines: [
-      "IMPORTANT: Semantic search ≠ Semantic compilation (wiki_compile_file).",
-      "  • Semantic search = bge ONNX embeds raw text → cosine similarity. Basic but immediate.",
-      "  • Semantic compilation = LLM normalizes → re-embed → higher recall.",
-      "  • Independent. Compilation is optional, recommended for fragmented notes.",
-      "",
-      "## Actions",
-      "  wiki_semantic() → status + model list",
-      "  wiki_semantic(action='on', autoInstall=true) → enable (auto install deps+model)",
-      "  wiki_semantic(action='off') → disable (vectors preserved)",
-      "  wiki_semantic(action='model', id='paraphrase-multilingual') → switch model (dim mismatch → auto-clear)",
+      "Use wiki_DANGER_semantic without action to inspect status; on, off, and model persist semantic-search configuration.",
+      "wiki_DANGER_semantic embeds raw text and is independent from optional LLM semantic compilation.",
     ],
     parameters: Type.Object({
       action: Type.Optional(Type.String({ description: "操作: on | off | model（不传=状态）" })),

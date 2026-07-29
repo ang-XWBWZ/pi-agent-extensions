@@ -5,8 +5,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ThinkingLevel, TierKey, TierConfig } from "../lib/types.js";
-import { isValidThinkingLevel, TIER_DEFAULTS, thinkingLabel, forceThinkingSupport } from "../lib/types.js";
+import { isValidThinkingLevel, TIER_DEFAULTS, thinkingLabel, forceThinkingSupport, KEY_PROVIDER, KEY_MODEL, KEY_TIER } from "../lib/types.js";
 import { readAllTiers, writeAllTiers, resolveTierModel, getCurrentTier } from "../lib/tier-config.js";
+import { updateSettings } from "../../lib/settings-io.js";
 
 export function registerSwitchModel(
   pi: ExtensionAPI,
@@ -29,14 +30,9 @@ export function registerSwitchModel(
     description: "切换模型、查看模型列表、管理模型层级和思考深度。",
     promptSnippet: "List/switch models; manage tier config; set thinking level",
     promptGuidelines: [
-      "Without args: list models grouped by configured tiers.",
-      "With provider+model: switch to that model.",
-      "With tier: switch to tier's model + thinking level.",
-      "With action: manage tier config.",
-      "  add_to_tier / remove_from_tier / set_tier_thinking / show_tier_config: manage model tiers.",
-      "With thinkingLevel alone: set main thinking level.",
-      "Tiers must be configured first via action=add_to_tier.",
-      "Use manage_providers for custom provider registration/removal/listing.",
+      "Use switch_model only when task complexity, context, cost, or requested reasoning depth materially benefits from a change.",
+      "Use switch_model tiers for normal routing and manage_providers only for provider registration.",
+      "If switch_model cannot resolve a requested tier or model, continue with the current model and report the missing configuration.",
     ],
     parameters: Type.Object({
       provider: Type.Optional(Type.String({ description: "模型 provider" })),
@@ -123,6 +119,12 @@ export function registerSwitchModel(
           setState({ currentTier: tier as TierKey, tierConfig: config });
           if (params.thinkingLevel) setThinking(params.thinkingLevel, t);
           else applyThinking(tier as TierKey, t);
+          // 持久化：写回 defaultProvider/defaultModel/defaultTier
+          const s = readSettings();
+          s[KEY_PROVIDER] = r.provider;
+          s[KEY_MODEL] = r.model;
+          s[KEY_TIER] = tier;
+          writeSettingsRaw(s);
         }
         const think = params.thinkingLevel ?? config[tier as TierKey]?.thinkingLevel;
         return { content: [{ type: "text", text: ok ? `\u2705 ${tier} · ${config[tier as TierKey].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "失败" }], details: {} };
@@ -139,6 +141,12 @@ export function registerSwitchModel(
           setState({ currentTier: getCurrentTier(params.provider, params.model, tierConfig) });
           if (params.thinkingLevel) setThinking(params.thinkingLevel, t);
           else { const ct = getState().currentTier; if (ct) applyThinking(ct, t); }
+          // 持久化：写回 defaultProvider/defaultModel，清除 defaultTier
+          const s = readSettings();
+          s[KEY_PROVIDER] = params.provider;
+          s[KEY_MODEL] = params.model;
+          delete s[KEY_TIER];
+          writeSettingsRaw(s);
         }
         return { content: [{ type: "text", text: ok ? `Switched to ${params.provider}/${params.model}${params.thinkingLevel ? ` | \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` : ""}` : "Failed" }], details: {} };
       }

@@ -8,6 +8,7 @@ import {
   getJob,
   listJobs,
   listAgentTaskPanels,
+  getAgentTaskOutputInfo,
   waitForJob,
   type AgentJob,
   type AgentTaskPanel,
@@ -19,12 +20,25 @@ import { formatJobAlreadyInjectedNotice, formatJobPreview } from "../lib/result-
 function formatPanelLine(panel: AgentTaskPanel): string {
   const lastNote = panel.notes.at(-1)?.text;
   const detail =
-    panel.currentStep || panel.summary || lastNote || "尚无阶段性更新";
+    panel.summary || panel.currentStep || lastNote || "尚无阶段性更新";
   const save = panel.saveId ? ` | 💾 ${panel.saveId}` : "";
-  return `  📌 ${panel.taskId} — ${panel.status} ${panel.progress}% — ${detail.slice(0, 180)}${save}`;
+  const reports = panel.stageReports.length > 0
+    ? ` | 阶段 ${panel.stageReports.length}`
+    : "";
+  return `  📌 ${panel.taskId} — ${panel.status} ${panel.progress}%${reports} — ${detail.slice(0, 180)}${save}`;
+}
+
+function panelOutputPreview(output: string | undefined): string | undefined {
+  if (!output) return undefined;
+  const headChars = 1_500;
+  const tailChars = 500;
+  if (output.length <= headChars + tailChars) return output;
+  return `${output.slice(0, headChars)}\n… [面板预览省略] …\n${output.slice(-tailChars)}`;
 }
 
 function panelDetails(panel: AgentTaskPanel) {
+  const outputInfo = getAgentTaskOutputInfo(panel.jobId, panel.taskId);
+  const latestStageReport = panel.stageReports.at(-1);
   return {
     jobId: panel.jobId,
     taskId: panel.taskId,
@@ -32,9 +46,19 @@ function panelDetails(panel: AgentTaskPanel) {
     progress: panel.progress,
     currentStep: panel.currentStep,
     summary: panel.summary,
+    latestConclusion: latestStageReport?.conclusion ?? panel.summary,
+    stageReportCount: panel.stageReports.length,
+    latestStageReport,
     latestNotes: panel.notes.slice(-5),
-    outputPreview: panel.outputSnapshot?.slice(-1_000),
-    outputLength: panel.outputSnapshot?.length ?? 0,
+    outputPreview: panelOutputPreview(panel.outputSnapshot),
+    outputLength:
+      outputInfo.characterLength ??
+      panel.outputLength ??
+      panel.outputSnapshot?.length ??
+      0,
+    outputBytes: outputInfo.byteLength,
+    outputSource: outputInfo.source,
+    outputReadable: outputInfo.available,
     saveId: panel.saveId,
     updatedAt: panel.updatedAt,
     persisted: !panel.persistenceError,
@@ -65,11 +89,12 @@ function formatJobResult(job: AgentJob, elapsed: string, alreadyInjected = false
       autoInjected: job._autoInjected === true,
       taskPanels: panels.map(panelDetails),
       results: job.results.map((r) => ({
-        id: r.id,
-        name: r.name,
-        ok: r.ok,
-        outputPreview: r.output?.slice(0, 500),
-        outputLength: r.output?.length ?? 0,
+          id: r.id,
+          name: r.name,
+          ok: r.ok,
+          summary: r.summary,
+          outputPreview: r.output?.slice(0, 500),
+          outputLength: r.outputLength ?? r.output?.length ?? 0,
         error: r.error,
         errorCode: r.errorCode,
         saveId: r.saveId,
@@ -161,7 +186,7 @@ export function registerCheckResults(pi: ExtensionAPI): void {
                 ``,
                 `已完成:`,
                 ...job.results.map(
-                  (r) => `  ${r.ok ? "✅" : "❌"} ${r.name}: ${(r.output ?? r.error ?? "").slice(0, 120)}`,
+                  (r) => `  ${r.ok ? "✅" : "❌"} ${r.name}: ${(r.summary ?? r.output ?? r.error ?? "").slice(0, 120)}`,
                 ),
                 ``,
                 `任务面板:`,

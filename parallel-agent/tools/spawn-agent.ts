@@ -13,13 +13,16 @@ import {
   type SubTask,
   type AgentJob,
 } from "../../lib/agent-bus.js";
+import { getExecutionContext } from "../../lib/execution-context.js";
 import { loadToolConfig } from "../lib/tier-resolver.js";
 import { spawnAllBackground } from "../lib/spawner.js";
+import { formatJobFullResult } from "../lib/result-format.js";
 
 // 硬编码安全网
 const TOOL_SAFETY_NET: ReadonlySet<string> = new Set([
   "spawn_agent",
   "check_agent_results",
+  "read_agent_output",
   "control_agent",
 ]);
 const REQUIRED_CHILD_TOOLS: ReadonlySet<string> = new Set([
@@ -50,24 +53,10 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
       "返回 jobId 用于查询结果。",
     promptSnippet: "Spawn sub-agents for parallel code exploration (read-only)",
     promptGuidelines: [
-      "Use spawn_agent to delegate exploration/research to sub-agents.",
-      "Each task runs in an isolated in-memory session with default tools.",
-      "Keep prompts focused on analysis. Results returned as structured JSON.",
-      "After spawning, use check_agent_results(jobId) to retrieve results.",
-      "For multiple independent tasks, spawn them together for parallel execution.",
-      "Results are auto-injected into the conversation when complete — you DO NOT need to block-wait. Keep interacting with the user normally.",
-      "To resume from a saved state, set resumeFrom on the task to the saveId from control_agent save/list_saves.",
-      "Each task supports 'tier' (L0/L1/L2) for automatic model + thinking level selection from modelTiers config.",
-      "Use tier: \"L0\" for cheap/fast tasks: file lookups, code maps, simple queries — saves tokens.",
-      "Use tier: \"L1\" (default if not specified) for coding, refactoring, debugging.",
-      "Use tier: \"L2\" for architecture design, cross-module analysis, security review — deepest reasoning.",
-      "Override thinking level per task with 'thinkingLevel' (off/minimal/low/medium/high/xhigh).",
-      "Task model resolution priority: task.model > task.tier > main agent model.",
-      "Skills passed in spawn_agent are loaded in FULL.",
-      "Skills in the global settings.json skills.blacklist are never loaded.",
-      "Delegate independent read/search/analysis tasks only. Sub-agents are YOUR workers — dispatch and move on.",
-      "FORBIDDEN: Do NOT spawn sub-agents for trivial single-file reads or single kb_search calls. These are faster done directly.",
-      "Use spawn_agent notes for durable initial constraints or handoff context that must remain visible on the child task panel.",
+      "Use spawn_agent only for bounded independent work that benefits from parallelism or a second-pass review; in PLAN every task must explicitly use phase=plan or chat.",
+      "Give every spawn_agent task a goal, scope, allowed and forbidden tools, expected output, and stop condition.",
+      "Do not use spawn_agent for a trivial read/search; completed results auto-inject and can also be checked with check_agent_results.",
+      "Use spawn_agent notes for durable initial constraints or handoff context that must remain visible on the child task panel; the child must later submit a conclusion for every meaningful stage and detail only when useful.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(
@@ -76,8 +65,9 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
           prompt: Type.String({ description: "子任务描述" }),
           context: Type.Optional(Type.Array(Type.String())),
           skills: Type.Optional(Type.Array(Type.String())),
-          mode: Type.Optional(StringEnum(["plan", "work", "yolo"] as const)),
-          model: Type.Optional(Type.String()),
+          phase: Type.Optional(StringEnum(["chat", "plan", "work"] as const)),
+          provider: Type.Optional(Type.String({ description: "模型 provider（和 model 搭配使用，优先级高于 tier）" })),
+          model: Type.Optional(Type.String({ description: "模型 ID（可单独用 provider/model 格式，也可和 provider 分开指定）" })),
           tier: Type.Optional(Type.String({ description: "模型层级: L0(快速) | L1(主要) | L2(高级)。自动选模型+思考深度" })),
           thinkingLevel: Type.Optional(Type.String({ description: "覆盖层级默认思考深度: off | minimal | low | medium | high | xhigh" })),
           resumeFrom: Type.Optional(Type.String({ description: "从存档恢复（saveId），继承历史对话上下文" })),
@@ -131,6 +121,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
         if (resumeId) {
           const saved = loadAgentState(resumeId);
           if (saved) {
+            const latestStage = saved.taskPanel?.stageReports?.at(-1);
             const historyText = saved.messages
               .map((m) => {
                 if (m.role === "user") return `[User]: ${typeof m.content === "string" ? m.content : "(content)"}`;
@@ -140,8 +131,13 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
               .join("\n");
             const resumeContext = `[从存档恢复: ${saved.name} (${saved.model}, ${saved.messages.length} 条消息)]\n\n--- 历史对话 ---\n${historyText.slice(-10_000)}\n--- 历史结束 ---`;
             const checkpointContext = [
-              saved.taskPanel?.summary
-                ? `阶段摘要: ${saved.taskPanel.summary}`
+              latestStage?.conclusion
+                ? `最新阶段结论: ${latestStage.conclusion}`
+                : saved.taskPanel?.summary
+                  ? `最新阶段结论（兼容字段）: ${saved.taskPanel.summary}`
+                  : undefined,
+              latestStage?.detail
+                ? `最新阶段详细说明:\n${latestStage.detail}`
                 : undefined,
               saved.output ? `中间输出快照:\n${saved.output}` : undefined,
               saved.taskPanel?.notes.length
@@ -171,14 +167,26 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
         }
       }
 
-      const job = createJob(resolvedTasks);
+      const parentExecutionContext = getExecutionContext();
+      const inheritableExecutionContext =
+        parentExecutionContext.approval.inheritToChildren
+          ? parentExecutionContext
+          : undefined;
+      const inheritedTasks = resolvedTasks.map((task) => ({
+        ...task,
+        parentExecutionContext:
+          task.parentExecutionContext ?? inheritableExecutionContext,
+      }));
+
+      const job = createJob(inheritedTasks);
       job.status = "running";
+      job._autoInjectRequested = autoInject;
 
       try {
         pi.appendEntry("agent-job", {
           jobId: job.jobId,
           total,
-          tasks: resolvedTasks.map((t) => ({ id: t.id, prompt: t.prompt.slice(0, 80) })),
+          tasks: inheritedTasks.map((t) => ({ id: t.id, prompt: t.prompt.slice(0, 80) })),
           createdAt: job.createdAt,
           status: "running",
         });
@@ -188,7 +196,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
 
       spawnAllBackground(
         job.jobId,
-        resolvedTasks,
+        inheritedTasks,
         ctx.cwd,
         defaultModel,
         ctx.modelRegistry,
@@ -199,8 +207,28 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
 
       if (autoInject) {
         onJobComplete(job.jobId, async (completedJob) => {
-          if (completedJob._autoInjected) return;
-          completedJob._autoInjected = true;
+          if (completedJob._autoInjected || completedJob._autoInjecting) return;
+          completedJob._autoInjecting = true;
+          try {
+            const elapsed = completedJob.finishedAt
+              ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
+              : "?";
+            pi.sendMessage(
+              {
+                customType: "sub-agent-results",
+                content: formatJobFullResult(completedJob, elapsed),
+                display: false,
+                details: {
+                  jobId: completedJob.jobId,
+                  status: completedJob.status,
+                },
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+            completedJob._autoInjected = true;
+          } finally {
+            completedJob._autoInjecting = false;
+          }
         });
       }
 
@@ -219,6 +247,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
               `📌 每个子任务的面板、备注和输出快照会在执行中增量落盘；超时会自动生成可恢复 saveId。`,
               ``,
               `主动查询: \`check_agent_results("${job.jobId}")\`（非阻塞，立即返回当前进度）`,
+              `阶段结论/详情: \`control_agent({ action: "status", jobId: "${job.jobId}", taskId, stageOffset: 0 })\`（0 为最新阶段）`,
               `生命周期: \`control_agent({ action: "kill" | "abort" | "send" | "pause" | "resume" | "list" | "status", jobId: "${job.jobId}" })\``,
             ].join("\n"),
           },

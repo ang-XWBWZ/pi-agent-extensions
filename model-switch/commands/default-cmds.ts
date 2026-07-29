@@ -5,15 +5,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TierKey, TierConfig } from "../lib/types.js";
 import { KEY_PROVIDER, KEY_MODEL, KEY_TIER, isValidThinkingLevel, VALID_THINKING_LEVELS, thinkingLabel } from "../lib/types.js";
-import { readSettings, writeSettingsRaw, readAllTiers, resolveTierModel, getCurrentTier } from "../lib/tier-config.js";
+import { readAllTiers, resolveTierModel, getCurrentTier } from "../lib/tier-config.js";
+import { getSettings, updateSettings } from "../../lib/settings-io.js";
 
 function writeDefaults(provider: string | null, model: string | null, tier: string | null): void {
-  const s = readSettings();
-  if (provider && model) { s[KEY_PROVIDER] = provider; s[KEY_MODEL] = model; }
-  else { delete s[KEY_PROVIDER]; delete s[KEY_MODEL]; }
-  if (tier) { s[KEY_TIER] = tier; }
-  else { delete s[KEY_TIER]; }
-  writeSettingsRaw(s);
+  updateSettings((s) => {
+    if (provider && model) { s[KEY_PROVIDER] = provider; s[KEY_MODEL] = model; }
+    else { delete s[KEY_PROVIDER]; delete s[KEY_MODEL]; }
+    if (tier) { s[KEY_TIER] = tier; }
+    else { delete s[KEY_TIER]; }
+    return s;
+  });
 }
 
 export function registerDefaultCmds(

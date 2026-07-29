@@ -51,37 +51,9 @@ export function registerKbSearchTool(pi: ExtensionAPI): void {
       "搜索 wiki 知识库。每页 10 条，返回总数。支持 keyword / semantic / hybrid 模式。",
     promptSnippet: "Search wiki (query, mode?, fullContent?, page?)",
     promptGuidelines: [
-      // ── 工作流前置 ──
-      "## Wiki Setup (required before searching)",
-      "Minimal: wiki_DANGER_load → wiki_read_search works with keyword mode.",
-      "Recommended: wiki_DANGER_load → wiki_DANGER_semantic(action='on') → wiki_read_search (hybrid mode, bge embedding).",
-      "Best: above + wiki_DANGER_compile on key notes → wiki_DANGER_store → wiki_read_search (LLM-normalized concepts).",
-      "",
-      "Semantic search (wiki_DANGER_semantic(action='on')) uses bge ONNX to embed raw text directly.",
-      "Semantic compilation (wiki_DANGER_compile) uses LLM to normalize text BEFORE embedding — higher quality.",
-      "They are independent steps. Compilation is optional but recommended for fragmented/personal notes.",
-      "",
-      // ── 搜索策略：拆解 · 翻译 · 联想 · 组合 ──
-      "BEFORE searching, decompose the user's query: identify abbreviations, mixed-language terms, compound concepts, and domain jargon.",
-      "For the FIRST search, construct keyword variants by:",
-      "  • Expanding abbreviations to full names",
-      "  • Translating between the user's language and the knowledge base's dominant language",
-      "  • Splitting compound terms and searching core concepts separately",
-      "  • Trying domain synonyms or alternative phrasings",
-      "A query that fails on its raw form may succeed on a translated, expanded, or simplified variant. Do NOT re-search with the same query.",
-      // ── 模式选择 ──
-      "PREFER keyword mode. Semantic/hybrid adds noise on short/technical queries and does NOT understand abbreviations.",
-      "Use semantic mode only for vague natural-language intent.",
-      // ── 分页 ──
-      "Each page returns up to 10 results (5 when fullContent=true). Pass page=N to paginate.",
-      "If total > page results, more pages available. Paginate when the user asks for more, or when a thorough review is needed.",
-      "Do NOT spam pagination — show first page results, then ask the user if they want more.",
-      // ── 读内容 ──
-      "Never auto-read wiki_read_entry. Summarize what you see in search results first, then ask the user which entry to read.",
-      "If the user asks for details on specific results, read those entries.",
-      // ── 无结果 ──
-      "If no results: try a different variant immediately. If still no results after 2-3 tries: tell user and STOP.",
-      "If no results, suggest loading a data source via wiki_DANGER_load.",
+      "Use wiki_read_search for project memory, terminology, and prior decisions; repository files remain source truth.",
+      "Start wiki_read_search with keyword mode for technical terms and semantic mode for vague natural-language intent.",
+      "If wiki_read_search misses, try at most two materially different query variants before reporting no match.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "搜索关键词" }),

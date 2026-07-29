@@ -7,13 +7,14 @@
  *   send_agent_message   — Agent 间消息传递
  *   control_agent        — 子 Agent 完整生命周期控制
  *   update_agent_task    — 子 Agent 专属任务面板与增量备注
+ *   read_agent_output    — 按需分页读取子 Agent 原始输出
  *
  * v10 改进:
  *   - 模型分级联动：task 支持 tier (L0/L1/L2) 自动选模型 + 思考深度
  *   - 思考深度传递：task.thinkingLevel 覆盖层级默认值
  *   - 优先级链：task.model > task.tier + thinkingLevel > 主 Agent 模型
  *   - 超时前保存会话、输出快照与任务面板，返回可恢复 saveId
- *   - 每个子任务拥有独立面板、进度、阶段摘要和追加式备注
+ *   - 每个子任务拥有独立面板、进度、阶段结论、可选详细说明和追加式备注
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -29,6 +30,7 @@ import { registerControlAgent } from "./parallel-agent/tools/control-agent.js";
 import { registerManageSkills } from "./parallel-agent/tools/manage-skills.js";
 import { registerManageTools } from "./parallel-agent/tools/manage-tools.js";
 import { registerUpdateAgentTask } from "./parallel-agent/tools/update-task.js";
+import { registerReadAgentOutput } from "./parallel-agent/tools/read-output.js";
 
 export default function (pi: ExtensionAPI) {
 
@@ -86,6 +88,7 @@ export default function (pi: ExtensionAPI) {
   registerUpdateAgentTask(pi);
   registerSpawnAgent(pi);
   registerCheckResults(pi);
+  registerReadAgentOutput(pi);
   registerSendMessage(pi);
   registerControlAgent(pi);
   registerManageSkills(pi);

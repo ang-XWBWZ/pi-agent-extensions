@@ -14,17 +14,26 @@
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
+  readSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage as SessionMessage } from "@earendil-works/pi-agent-core";
+import type {
+  ConversationPhase,
+  ExecutionContext,
+} from "./workflow-types.js";
 
 // ---- 全局单例 ----
 
@@ -93,7 +102,8 @@ export interface SubTask {
   prompt: string;
   context?: string[];
   skills?: string[];
-  mode?: "plan" | "work" | "yolo";
+  phase?: ConversationPhase;
+  parentExecutionContext?: ExecutionContext;
   provider?: string;
   model?: string;
   tier?: string;
@@ -107,7 +117,11 @@ export interface SubResult {
   name: string;
   order: number;
   ok: boolean;
+  /** 子 Agent 在最终提交前写入的最终结论，优先于长输出展示。 */
+  summary?: string;
   output?: string;
+  /** 原始输出的字符数；output 本身可能是受限快照。 */
+  outputLength?: number;
   error?: string;
   errorCode?: "timeout" | "runtime" | "killed" | "disposed" | "configuration";
   /** 超时或异常时自动保存的会话存档 ID */
@@ -163,6 +177,23 @@ export interface AgentTaskNote {
 }
 
 /**
+ * 子 Agent 主动提交的一条阶段报告。
+ *
+ * conclusion 是面板的主视图内容，detail 是按需展开的补充说明；两者都不
+ * 用来承载逐行日志或完整原始输出。
+ */
+export interface AgentTaskStageReport {
+  id: string;
+  conclusion: string;
+  detail?: string;
+  status: AgentTaskPanelStatus;
+  progress: number;
+  currentStep?: string;
+  source: AgentTaskNote["source"];
+  createdAt: number;
+}
+
+/**
  * 每个子 Agent 独立的持久化任务面板。
  *
  * 面板与会话存档分离：面板用于高频、小体积的增量检查点；会话存档用于
@@ -178,9 +209,14 @@ export interface AgentTaskPanel {
   status: AgentTaskPanelStatus;
   progress: number;
   currentStep?: string;
+  /** 最近一条阶段结论；保留此字段以兼容旧调用方。 */
   summary?: string;
+  /** 按时间追加的阶段结论与可选详细说明。 */
+  stageReports: AgentTaskStageReport[];
   notes: AgentTaskNote[];
   outputSnapshot?: string;
+  /** 完整原始输出的字符数；面板仅保留 outputSnapshot。 */
+  outputLength?: number;
   lastTool?: string;
   saveId?: string;
   revision: number;
@@ -195,12 +231,25 @@ export interface AgentTaskPanelUpdate {
   status?: AgentTaskPanelStatus;
   progress?: number;
   currentStep?: string;
+  /** 兼容旧调用方的最近阶段结论字段。 */
   summary?: string;
+  /** 新阶段报告的结论；写入时同时更新 summary。 */
+  conclusion?: string;
+  /** 新阶段报告的可选详细说明；必须伴随 conclusion。 */
+  detail?: string;
+  reportSource?: AgentTaskStageReport["source"];
   outputSnapshot?: string;
+  outputLength?: number;
   lastTool?: string;
   saveId?: string;
   note?: string;
   noteSource?: AgentTaskNote["source"];
+}
+
+/** 兼容扩展热重载和旧落盘状态中尚未包含 stageReports 的面板。 */
+function ensureStageReports(panel: AgentTaskPanel): AgentTaskStageReport[] {
+  if (!Array.isArray(panel.stageReports)) panel.stageReports = [];
+  return panel.stageReports;
 }
 
 /** 子 Agent 精细行为状态 */
@@ -366,6 +415,10 @@ function taskPanelDir(): string {
   return join(agentDataDir(), "sub-agent-tasks");
 }
 
+function taskOutputDir(): string {
+  return join(agentDataDir(), "sub-agent-output");
+}
+
 /** 用户可控 ID 绝不直接成为路径片段，避免越界写入和 Windows 非法字符。 */
 function safeStorageName(value: string): string {
   const slug = value
@@ -387,6 +440,251 @@ function panelPath(jobId: string, taskId: string): string {
   return join(dir, `${safeStorageName(taskId)}.json`);
 }
 
+function taskOutputPath(
+  jobId: string,
+  taskId: string,
+  createDirectory = false,
+): string {
+  const dir = join(taskOutputDir(), safeStorageName(jobId));
+  if (createDirectory) mkdirSync(dir, { recursive: true });
+  return join(dir, `${safeStorageName(taskId)}.log`);
+}
+
+export type AgentTaskOutputSource = "log" | "snapshot" | "none";
+
+export interface AgentTaskOutputInfo {
+  source: AgentTaskOutputSource;
+  available: boolean;
+  byteLength: number;
+  characterLength?: number;
+}
+
+export interface ReadAgentTaskOutputOptions {
+  /** 由上一次读取返回的字节游标；从 0 开始。 */
+  cursor?: number;
+  /** 单次最多读取的 UTF-8 字节数；范围 256-32,000。 */
+  maxBytes?: number;
+}
+
+export interface AgentTaskOutputSlice {
+  source: AgentTaskOutputSource;
+  /** 实际开始读取的位置；输入位于 UTF-8 字符中间时会后移到下一个字符边界。 */
+  cursor: number;
+  /** 继续读取时使用的字节游标。 */
+  nextCursor: number;
+  totalBytes: number;
+  hasMore: boolean;
+  text: string;
+}
+
+const DEFAULT_AGENT_TASK_OUTPUT_READ_BYTES = 12_000;
+const MAX_AGENT_TASK_OUTPUT_READ_BYTES = 32_000;
+
+function outputReadLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return DEFAULT_AGENT_TASK_OUTPUT_READ_BYTES;
+  }
+  return Math.max(256, Math.min(MAX_AGENT_TASK_OUTPUT_READ_BYTES, Math.floor(value)));
+}
+
+function outputCursor(value: number | undefined, totalBytes: number): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(totalBytes, Math.floor(value)));
+}
+
+function isUtf8ContinuationByte(value: number): boolean {
+  return (value & 0b1100_0000) === 0b1000_0000;
+}
+
+function sliceUtf8Buffer(
+  source: AgentTaskOutputSource,
+  data: Buffer,
+  requestedCursor: number,
+  maxBytes: number,
+): AgentTaskOutputSlice {
+  const totalBytes = data.length;
+  let cursor = outputCursor(requestedCursor, totalBytes);
+  while (cursor < totalBytes && isUtf8ContinuationByte(data[cursor])) cursor++;
+
+  let end = Math.min(totalBytes, cursor + maxBytes);
+  while (end < totalBytes && isUtf8ContinuationByte(data[end])) end--;
+
+  return {
+    source,
+    cursor,
+    nextCursor: end,
+    totalBytes,
+    hasMore: end < totalBytes,
+    text: data.subarray(cursor, end).toString("utf8"),
+  };
+}
+
+/**
+ * 每个任务都有独立的原始输出日志；它不进入面板或自动结果，只有按需读取工具
+ * 才会访问。jobId/taskId 始终经 safeStorageName 映射，不能控制真实路径。
+ */
+export function resetAgentTaskOutput(jobId: string, taskId: string): boolean {
+  try {
+    writeFileSync(taskOutputPath(jobId, taskId, true), "", "utf8");
+    return true;
+  } catch (error) {
+    console.warn("[agent-bus] 初始化子 Agent 原始输出失败:", error);
+    return false;
+  }
+}
+
+export function appendAgentTaskOutput(
+  jobId: string,
+  taskId: string,
+  text: string,
+): boolean {
+  if (!text) return true;
+  try {
+    appendFileSync(taskOutputPath(jobId, taskId, true), text, "utf8");
+    return true;
+  } catch (error) {
+    console.warn("[agent-bus] 追加子 Agent 原始输出失败:", error);
+    return false;
+  }
+}
+
+export function replaceAgentTaskOutput(
+  jobId: string,
+  taskId: string,
+  text: string,
+): boolean {
+  try {
+    writeFileSync(taskOutputPath(jobId, taskId, true), text, "utf8");
+    return true;
+  } catch (error) {
+    console.warn("[agent-bus] 写入子 Agent 原始输出失败:", error);
+    return false;
+  }
+}
+
+export function getAgentTaskOutputInfo(
+  jobId: string,
+  taskId: string,
+): AgentTaskOutputInfo {
+  const panel = getAgentTaskPanel(jobId, taskId);
+  const logPath = taskOutputPath(jobId, taskId);
+  try {
+    if (existsSync(logPath)) {
+      const byteLength = statSync(logPath).size;
+      if (byteLength > 0) {
+        return {
+          source: "log",
+          available: true,
+          byteLength,
+          characterLength: panel?.outputLength,
+        };
+      }
+    }
+  } catch {
+    // 原始日志不可读时，继续使用有界面板快照。
+  }
+
+  const snapshot = panel?.outputSnapshot;
+  if (!snapshot) {
+    return { source: "none", available: false, byteLength: 0 };
+  }
+  return {
+    source: "snapshot",
+    available: true,
+    byteLength: Buffer.byteLength(snapshot, "utf8"),
+    characterLength: panel?.outputLength ?? snapshot.length,
+  };
+}
+
+/**
+ * 从原始输出日志中按 UTF-8 字节游标读取一段。日志不存在时才降级读取面板快照，
+ * 因而主 Agent 不必为了展开某段结果而先加载完整会话存档。
+ */
+export function readAgentTaskOutput(
+  jobId: string,
+  taskId: string,
+  options: ReadAgentTaskOutputOptions = {},
+): AgentTaskOutputSlice {
+  const maxBytes = outputReadLimit(options.maxBytes);
+  const logPath = taskOutputPath(jobId, taskId);
+
+  try {
+    if (existsSync(logPath)) {
+      const totalBytes = statSync(logPath).size;
+      if (totalBytes > 0) {
+        let cursor = outputCursor(options.cursor, totalBytes);
+        if (cursor >= totalBytes) {
+          return {
+            source: "log",
+            cursor,
+            nextCursor: cursor,
+            totalBytes,
+            hasMore: false,
+            text: "",
+          };
+        }
+
+        const fd = openSync(logPath, "r");
+        try {
+          const probe = Buffer.allocUnsafe(Math.min(4, totalBytes - cursor));
+          const probeRead = readSync(fd, probe, 0, probe.length, cursor);
+          let probeIndex = 0;
+          while (
+            probeIndex < probeRead &&
+            isUtf8ContinuationByte(probe[probeIndex])
+          ) {
+            cursor++;
+            probeIndex++;
+          }
+
+          const readLength = Math.min(totalBytes - cursor, maxBytes + 4);
+          const buffer = Buffer.allocUnsafe(readLength);
+          const bytesRead = readSync(fd, buffer, 0, readLength, cursor);
+          let end = Math.min(maxBytes, bytesRead);
+          while (
+            cursor + end < totalBytes &&
+            end < bytesRead &&
+            isUtf8ContinuationByte(buffer[end])
+          ) {
+            end--;
+          }
+
+          return {
+            source: "log",
+            cursor,
+            nextCursor: cursor + end,
+            totalBytes,
+            hasMore: cursor + end < totalBytes,
+            text: buffer.subarray(0, end).toString("utf8"),
+          };
+        } finally {
+          closeSync(fd);
+        }
+      }
+    }
+  } catch (error) {
+    console.warn("[agent-bus] 读取子 Agent 原始输出失败:", error);
+  }
+
+  const snapshot = getAgentTaskPanel(jobId, taskId)?.outputSnapshot;
+  if (snapshot) {
+    return sliceUtf8Buffer(
+      "snapshot",
+      Buffer.from(snapshot, "utf8"),
+      options.cursor ?? 0,
+      maxBytes,
+    );
+  }
+  return {
+    source: "none",
+    cursor: 0,
+    nextCursor: 0,
+    totalBytes: 0,
+    hasMore: false,
+    text: "",
+  };
+}
+
 function writeJson(target: string, value: unknown): void {
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -402,12 +700,26 @@ function writeJson(target: string, value: unknown): void {
   }
 }
 
-function trimSnapshot(value: string | undefined, maxChars = 20_000): string | undefined {
+const AGENT_SAVE_OUTPUT_SNAPSHOT_CHARS = 20_000;
+export const TASK_PANEL_OUTPUT_SNAPSHOT_CHARS = 64_000;
+const MAX_TASK_STAGE_REPORTS = 40;
+const MAX_TASK_STAGE_CONCLUSION_CHARS = 8_000;
+const MAX_TASK_STAGE_DETAIL_CHARS = 12_000;
+
+function trimSnapshot(
+  value: string | undefined,
+  maxChars = AGENT_SAVE_OUTPUT_SNAPSHOT_CHARS,
+): string | undefined {
   if (!value) return undefined;
   if (value.length <= maxChars) return value;
-  const tail = Math.min(4_000, Math.floor(maxChars / 3));
-  const head = maxChars - tail;
-  return `${value.slice(0, head)}\n\n... [中间快照截断 ${value.length - maxChars} 字符] ...\n\n${value.slice(-tail)}`;
+  const markerPrefix = "\n\n... [中间快照截断 ";
+  const markerSuffix = " 字符] ...\n\n";
+  const marker = `${markerPrefix}${value.length}${markerSuffix}`;
+  const usable = Math.max(0, maxChars - marker.length);
+  const tail = Math.min(16_000, Math.floor(usable / 3));
+  const head = usable - tail;
+  const omitted = value.length - head - tail;
+  return `${value.slice(0, head)}${markerPrefix}${omitted}${markerSuffix}${value.slice(-tail)}`;
 }
 
 function defaultSaveId(jobId: string, taskId: string): string {
@@ -518,6 +830,9 @@ export function loadAgentState(saveId: string): AgentSaveState | null {
         reason: "manual",
       };
     }
+    if (parsed.taskPanel && !Array.isArray(parsed.taskPanel.stageReports)) {
+      parsed.taskPanel.stageReports = [];
+    }
     return parsed;
   } catch {
     return null;
@@ -564,9 +879,14 @@ export function listAgentSaves(): AgentSaveState[] {
 
 function persistAgentTaskPanel(panel: AgentTaskPanel): boolean {
   try {
+    const stageReports = ensureStageReports(panel);
     const snapshot: AgentTaskPanel = {
       ...panel,
-      outputSnapshot: trimSnapshot(panel.outputSnapshot),
+      outputSnapshot: trimSnapshot(
+        panel.outputSnapshot,
+        TASK_PANEL_OUTPUT_SNAPSHOT_CHARS,
+      ),
+      stageReports: stageReports.slice(-MAX_TASK_STAGE_REPORTS),
       notes: panel.notes.slice(-100),
       persistenceError: undefined,
     };
@@ -593,6 +913,7 @@ function createAgentTaskPanel(jobId: string, task: SubTask): AgentTaskPanel {
     objective: task.prompt.slice(0, 4_000),
     status: "queued",
     progress: 0,
+    stageReports: [],
     notes: (task.notes ?? []).slice(-20).map((note) => ({
       id: randomUUID(),
       text: note.slice(0, 4_000),
@@ -604,6 +925,8 @@ function createAgentTaskPanel(jobId: string, task: SubTask): AgentTaskPanel {
     updatedAt: now,
   };
   state.taskPanels.set(instanceKey(jobId, task.id), panel);
+  // 原始输出独立于轻量面板保存；失败不阻断任务，读取时会退回面板快照。
+  resetAgentTaskOutput(jobId, task.id);
   persistAgentTaskPanel(panel);
   return panel;
 }
@@ -612,13 +935,19 @@ export function getAgentTaskPanel(
   jobId: string,
   taskId: string,
 ): AgentTaskPanel | undefined {
-  return state.taskPanels.get(instanceKey(jobId, taskId));
+  const panel = state.taskPanels.get(instanceKey(jobId, taskId));
+  if (panel) ensureStageReports(panel);
+  return panel;
 }
 
 export function listAgentTaskPanels(jobId?: string): AgentTaskPanel[] {
   const panels = Array.from(state.taskPanels.values());
   return panels
     .filter((panel) => !jobId || panel.jobId === jobId)
+    .map((panel) => {
+      ensureStageReports(panel);
+      return panel;
+    })
     .sort((a, b) => a.createdAt - b.createdAt);
 }
 
@@ -640,8 +969,35 @@ export function updateAgentTaskPanel(
   if (update.summary !== undefined) {
     panel.summary = update.summary.trim().slice(0, 8_000) || undefined;
   }
+  if (update.conclusion?.trim()) {
+    const conclusion = update.conclusion
+      .trim()
+      .slice(0, MAX_TASK_STAGE_CONCLUSION_CHARS);
+    const detail = update.detail?.trim().slice(0, MAX_TASK_STAGE_DETAIL_CHARS);
+    panel.summary = conclusion;
+    const stageReports = ensureStageReports(panel);
+    stageReports.push({
+      id: randomUUID(),
+      conclusion,
+      detail: detail || undefined,
+      status: panel.status,
+      progress: panel.progress,
+      currentStep: panel.currentStep,
+      source: update.reportSource ?? "system",
+      createdAt: Date.now(),
+    });
+    if (stageReports.length > MAX_TASK_STAGE_REPORTS) {
+      panel.stageReports = stageReports.slice(-MAX_TASK_STAGE_REPORTS);
+    }
+  }
   if (update.outputSnapshot !== undefined) {
-    panel.outputSnapshot = trimSnapshot(update.outputSnapshot);
+    panel.outputSnapshot = trimSnapshot(
+      update.outputSnapshot,
+      TASK_PANEL_OUTPUT_SNAPSHOT_CHARS,
+    );
+  }
+  if (update.outputLength !== undefined && Number.isFinite(update.outputLength)) {
+    panel.outputLength = Math.max(0, Math.floor(update.outputLength));
   }
   if (update.lastTool !== undefined) {
     panel.lastTool = update.lastTool.trim().slice(0, 200) || undefined;
@@ -696,6 +1052,11 @@ function hydratePersistedTaskPanels(): void {
             readFileSync(join(dir, file.name), "utf-8"),
           ) as AgentTaskPanel;
           if (!panel.jobId || !panel.taskId || panel.version !== 1) continue;
+          // 兼容阶段报告加入前已落盘的 v1 面板。
+          panel.stageReports = Array.isArray(panel.stageReports)
+            ? panel.stageReports.slice(-MAX_TASK_STAGE_REPORTS)
+            : [];
+          panel.notes = Array.isArray(panel.notes) ? panel.notes.slice(-100) : [];
           if (
             panel.status === "queued" ||
             panel.status === "running" ||
@@ -770,13 +1131,21 @@ export function publishTaskResult(jobId: string, result: SubResult): void {
     result.errorCode === "timeout" || result.error === "timeout" ? "timed_out" :
     result.errorCode === "killed" ? "killed" :
     "failed";
+  const existingPanel = getAgentTaskPanel(jobId, result.id);
+  const finalConclusion = result.summary ?? existingPanel?.summary ?? (result.ok
+    ? (result.output ?? "任务已完成")
+    : (result.error ?? "任务失败"));
+  const hasTerminalReport = existingPanel?.stageReports.some(
+    (report) => report.status === panelStatus,
+  );
   updateAgentTaskPanel(jobId, result.id, {
     status: panelStatus,
     progress: result.ok ? 100 : undefined,
-    summary: result.ok
-      ? (result.output ?? "任务已完成")
-      : (result.error ?? "任务失败"),
+    summary: finalConclusion,
+    conclusion: hasTerminalReport ? undefined : finalConclusion,
+    reportSource: "system",
     outputSnapshot: result.output,
+    outputLength: result.outputLength,
     saveId: result.saveId,
   });
 

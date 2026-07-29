@@ -4,6 +4,26 @@
 
 import { type Api, type AssistantMessage, calculateCost } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai";
+import { estimateSerializedTokens } from "./token-estimate.js";
+
+export function createEstimatedUsage(
+  model: Model<Api>,
+  prompt: unknown,
+  completion: unknown,
+): AssistantMessage["usage"] {
+  const input = estimateSerializedTokens(prompt);
+  const output = estimateSerializedTokens(completion);
+  const usage: AssistantMessage["usage"] = {
+    input,
+    output,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: input + output,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  calculateCost(model, usage);
+  return usage;
+}
 
 export function parseOpenAIUsage(rawUsage: any, model: Model<Api>): AssistantMessage["usage"] {
   const promptTokens = rawUsage?.prompt_tokens ?? 0;

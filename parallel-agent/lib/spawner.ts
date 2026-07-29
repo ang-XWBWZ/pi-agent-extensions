@@ -10,48 +10,9 @@ import {
   getJob,
   cleanupJobs,
   type SubTask,
-  type SubResult,
 } from "../../lib/agent-bus.js";
-import { fmtNum } from "./helpers.js";
 import { resolveTaskConfig, forceThinkingSupport } from "./tier-resolver.js";
 import { runSingleAgent } from "./agent-runner.js";
-
-// ---- Job 统计 ----
-
-export interface JobStats {
-  input: number;
-  output: number;
-  cache: number;
-  cost: number;
-  ctxPct: number;
-  ctxWin: number;
-}
-
-export function computeJobStats(results: SubResult[]): JobStats {
-  return results.reduce((acc, r) => {
-    if (r.tokens) {
-      acc.input += r.tokens.input;
-      acc.output += r.tokens.output;
-      acc.cache += r.tokens.cache;
-      acc.cost += r.tokens.cost;
-      if (r.tokens.contextPercent !== null) {
-        acc.ctxPct = Math.max(acc.ctxPct, r.tokens.contextPercent);
-      }
-      acc.ctxWin = Math.max(acc.ctxWin, r.tokens.contextWindow);
-    }
-    return acc;
-  }, { input: 0, output: 0, cache: 0, cost: 0, ctxPct: 0, ctxWin: 0 });
-}
-
-export function formatJobNotificationLine(jobId: string, results: SubResult[], total: number, elapsed: string): string {
-  const okCount = results.filter((r) => r.ok).length;
-  const failCount = results.filter((r) => !r.ok).length;
-  const totalTokens = computeJobStats(results);
-  const statsPart = totalTokens.input > 0
-    ? ` | 📊 \u2191${fmtNum(totalTokens.input)} \u2193${fmtNum(totalTokens.output)} R${fmtNum(totalTokens.cache)} $${totalTokens.cost < 0.001 ? totalTokens.cost.toExponential(2) : totalTokens.cost.toFixed(3)} ${totalTokens.ctxPct > 0 ? totalTokens.ctxPct.toFixed(1) + "%" : "?%"}${totalTokens.ctxWin > 0 ? "/" + fmtNum(totalTokens.ctxWin) : ""}`
-    : "";
-  return `\u{1f916} [\u5b50\u4efb\u52a1\u5b8c\u6210] Job \`${jobId.slice(0, 8)}\` \u2014 \u2705 ${okCount} / \u274c ${failCount} / \u{1f4ca} ${total} (${elapsed}s)${statsPart}`;
-}
 
 // ---- 批量启动 ----
 
@@ -71,19 +32,24 @@ export function spawnAllBackground(
     let subModel: Model<any> | undefined = undefined;
     let subThinkingLevel: string | undefined = undefined;
 
-    // 优先级 1: task.model 精确指定
-    if (task.model) {
-      const [p, m] = task.model.split("/");
-      const found = modelRegistry.find(p, m);
-      if (found) {
-        subModel = found;
-        subThinkingLevel = (
-          task as Record<string, unknown>
-        ).thinkingLevel as string | undefined;
-      } else {
-        console.warn(
-          `[parallel-agent] 模型 ${task.model} 未找到，降级`,
-        );
+    // 优先级 1: task.provider + task.model 或 task.model 精确指定
+    const taskRecord = task as SubTask & { provider?: string };
+    const explicitProvider = taskRecord.provider;
+    if (explicitProvider || task.model) {
+      const p = explicitProvider ?? task.model!.split("/")[0];
+      const m = explicitProvider ? task.model! : task.model!.split("/").slice(1).join("/") || task.model!;
+      if (p && m) {
+        const found = modelRegistry.find(p, m);
+        if (found) {
+          subModel = found;
+          subThinkingLevel = (
+            task as Record<string, unknown>
+          ).thinkingLevel as string | undefined;
+        } else {
+          console.warn(
+            `[parallel-agent] 模型 ${p}/${m} 未找到，降级`,
+          );
+        }
       }
     }
 

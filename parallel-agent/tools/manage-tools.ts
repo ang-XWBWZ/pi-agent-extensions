@@ -1,11 +1,15 @@
 /**
  * manage-tools.ts — manage_tools 工具注册
+ *
+ * 使用共享 settings-io 单例，避免直接读写磁盘冲突。
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync, writeFileSync } from "node:fs";
-import { settingsPath } from "../lib/tier-resolver.js";
+import {
+  getSettings,
+  updateSettings,
+} from "../../lib/settings-io.js";
 
 export function registerManageTools(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -17,14 +21,8 @@ export function registerManageTools(pi: ExtensionAPI): void {
       "修改立即生效，无需 /reload。\n\n",
     promptSnippet: "Manage tool blacklist for sub-agents (add/remove/list/set)",
     promptGuidelines: [
-      "Use manage_tools to control which tools are banned from sub-agent sessions.",
-      "Blacklisted tools are completely hidden from sub-agents:",
-      "  1) Not registered in sub-agent session → cannot be called",
-      "  2) No description/promptGuidelines injected → agent doesn't know it exists",
-      "Changes take effect immediately, no /reload needed.",
-      "Use 'list' to see current config blacklist. Use 'add'/'remove' for incremental changes.",
-      "Recommended defaults: switch_model, manage_plan, manage_skills, manage_tools",
-      "These are management tools that sub-agents should not have access to.",
+      "Use manage_tools to inspect or intentionally change which tools are hidden from sub-agent sessions.",
+      "Prefer manage_tools incremental add/remove; use blacklist_set only from a known complete baseline.",
     ],
     parameters: Type.Object({
       action: Type.String({
@@ -39,14 +37,9 @@ export function registerManageTools(pi: ExtensionAPI): void {
 
       const { action, tools } = params;
 
-      const settingsPath_ = settingsPath();
-      let raw: Record<string, unknown> = {};
-      try {
-        raw = JSON.parse(readFileSync(settingsPath_, "utf-8"));
-      } catch { /* 空对象兜底 */ }
-
-      const section = (raw.tools || {}) as Record<string, unknown>;
-      const currentList: string[] = Array.isArray(section.blacklist)
+      // 通过共享缓存读取 tools 配置，不从磁盘直接读取
+      const section = getSettings().tools as Record<string, unknown> | undefined;
+      const currentList: string[] = section && Array.isArray(section.blacklist)
         ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
         : [];
 
@@ -55,15 +48,15 @@ export function registerManageTools(pi: ExtensionAPI): void {
           if (currentList.length === 0) {
             ctx.ui.notify("📋 tool 黑名单为空（安全网仍生效）", "info");
             return {
-              content: [{ type: "text", text: "📋 当前 tool blacklist 为空。\n安全网（始终阻塞）: spawn_agent, check_agent_results, control_agent" }],
-              details: { action, blacklist: [], safetyNet: ["spawn_agent", "check_agent_results", "control_agent"] },
+              content: [{ type: "text", text: "📋 当前 tool blacklist 为空。\n安全网（始终阻塞）: spawn_agent, check_agent_results, read_agent_output, control_agent" }],
+              details: { action, blacklist: [], safetyNet: ["spawn_agent", "check_agent_results", "read_agent_output", "control_agent"] },
             };
           }
           const lines = currentList.map((s) => `  🔴 ${s}`);
           ctx.ui.notify(`📋 tool 黑名单共 ${currentList.length} 条`, "info");
           return {
-            content: [{ type: "text", text: `📋 当前 tool blacklist (${currentList.length}):\n${lines.join("\n")}\n\n安全网（始终阻塞）: spawn_agent, check_agent_results, control_agent` }],
-            details: { action, blacklist: currentList, safetyNet: ["spawn_agent", "check_agent_results", "control_agent"] },
+            content: [{ type: "text", text: `📋 当前 tool blacklist (${currentList.length}):\n${lines.join("\n")}\n\n安全网（始终阻塞）: spawn_agent, check_agent_results, read_agent_output, control_agent` }],
+            details: { action, blacklist: currentList, safetyNet: ["spawn_agent", "check_agent_results", "read_agent_output", "control_agent"] },
           };
         }
 
@@ -80,8 +73,10 @@ export function registerManageTools(pi: ExtensionAPI): void {
             };
           }
           const newList = [...currentList, ...toAdd];
-          raw.tools = { blacklist: newList };
-          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          updateSettings((s) => {
+            s.tools = { blacklist: newList };
+            return s;
+          });
           ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 tool 到黑名单`, "warn");
           return {
             content: [{ type: "text", text: `🔴 已添加 ${toAdd.length} 个 tool 到黑名单:\n${toAdd.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.map((s) => `  🔴 ${s}`).join("\n")}` }],
@@ -102,8 +97,10 @@ export function registerManageTools(pi: ExtensionAPI): void {
             };
           }
           const newList = currentList.filter((s) => !toRemove.includes(s));
-          raw.tools = { blacklist: newList };
-          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          updateSettings((s) => {
+            s.tools = { blacklist: newList };
+            return s;
+          });
           ctx.ui.notify(`🟢 已从黑名单移除 ${toRemove.length} 个 tool`, "info");
           return {
             content: [{ type: "text", text: `🟢 已从黑名单移除 ${toRemove.length} 个 tool:\n${toRemove.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.length > 0 ? newList.map((s) => `  🔴 ${s}`).join("\n") : "  (空)"}` }],
@@ -116,8 +113,10 @@ export function registerManageTools(pi: ExtensionAPI): void {
             return { content: [{ type: "text", text: "blacklist_set 需要 tools 参数（传空数组 = 清空）" }], details: { error: "missing_tools" } };
           }
           const newList = tools.filter((s) => typeof s === "string");
-          raw.tools = { blacklist: newList };
-          writeFileSync(settingsPath_, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+          updateSettings((s) => {
+            s.tools = { blacklist: newList };
+            return s;
+          });
           ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖 tool 黑名单: ${newList.length} 条` : "🟢 已清空 tool 黑名单", newList.length > 0 ? "warn" : "info");
           return {
             content: [{ type: "text", text: newList.length > 0

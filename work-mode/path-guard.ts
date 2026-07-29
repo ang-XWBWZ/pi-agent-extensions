@@ -1,13 +1,21 @@
 /**
- * path-guard.ts — 受保护路径检测 & Glob 匹配工具
+ * path-guard.ts — 硬保护/提醒路径检测 & Glob 匹配工具
  */
 
 import { resolve, isAbsolute } from "node:path";
-import { PROTECTED_PATH_PATTERNS } from "./types.js";
+import {
+  ADVISORY_PATH_PATTERNS,
+  PROTECTED_PATH_PATTERNS,
+} from "./types.js";
 
 export function isProtectedPath(target: string): boolean {
   const normalized = target.replace(/\\/g, "/");
   return PROTECTED_PATH_PATTERNS.some((re) => re.test(normalized));
+}
+
+export function isAdvisoryPath(target: string): boolean {
+  const normalized = target.replace(/\\/g, "/");
+  return ADVISORY_PATH_PATTERNS.some((re) => re.test(normalized));
 }
 
 export function wildcardMatch(pattern: string, target: string): boolean {

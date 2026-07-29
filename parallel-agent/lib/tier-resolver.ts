@@ -1,10 +1,14 @@
 /**
  * tier-resolver.ts — 模型层级解析 + Skill/Tool 配置加载
+ *
+ * 自 v2 使用共享 settings-io 单例读配置，不再直接读磁盘。
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { SubTask } from "../../lib/agent-bus.js";
+import {
+  getSettings,
+  getSettingsSection,
+} from "../../lib/settings-io.js";
 
 // ---- 常量 ----
 
@@ -17,18 +21,7 @@ export const VALID_THINKING_LEVELS = [
   "xhigh",
 ] as const;
 
-// ---- settings 路径 ----
-
-export function settingsPath(): string {
-  return join(
-    process.env.USERPROFILE ?? ".",
-    ".pi",
-    "agent",
-    "settings.json",
-  );
-}
-
-// ---- 强制思考支持 ----
+// ---- 强制思考支持（与 model-switch/lib/types.ts 保持一致） ----
 
 export function forceThinkingSupport(model: unknown): void {
   if (!model || typeof model !== "object") return;
@@ -47,43 +40,33 @@ export function forceThinkingSupport(model: unknown): void {
   };
 }
 
-// ---- Skill 配置 ----
+// ---- Skill 配置（通过共享缓存，不读磁盘） ----
 
 export interface SkillConfig {
   blacklist: string[];
 }
 
 export function loadSkillConfig(): SkillConfig {
-  try {
-    const raw = JSON.parse(readFileSync(settingsPath(), "utf-8"));
-    const section = raw.skills as Record<string, unknown> | undefined;
-    if (!section || typeof section !== "object") return { blacklist: [] };
-    return {
-      blacklist: Array.isArray(section.blacklist)
-        ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
-        : [],
-    };
-  } catch {
-    return { blacklist: [] };
-  }
+  const section = getSettingsSection<Record<string, unknown> | undefined>("skills", undefined);
+  if (!section || typeof section !== "object") return { blacklist: [] };
+  return {
+    blacklist: Array.isArray(section.blacklist)
+      ? (section.blacklist as string[]).filter((s): s is string => typeof s === "string")
+      : [],
+  };
 }
 
-// ---- Tool 配置 ----
+// ---- Tool 配置（通过共享缓存） ----
 
 export function loadToolConfig(): string[] {
-  try {
-    const raw = JSON.parse(readFileSync(settingsPath(), "utf-8"));
-    const section = raw.tools as Record<string, unknown> | undefined;
-    if (!section || typeof section !== "object") return [];
-    const bl = section.blacklist;
-    if (!Array.isArray(bl)) return [];
-    return bl.filter((s): s is string => typeof s === "string");
-  } catch {
-    return [];
-  }
+  const section = getSettingsSection<Record<string, unknown> | undefined>("tools", undefined);
+  if (!section || typeof section !== "object") return [];
+  const bl = section.blacklist;
+  if (!Array.isArray(bl)) return [];
+  return bl.filter((s): s is string => typeof s === "string");
 }
 
-// ---- Task 层级解析 ----
+// ---- Task 层级解析（通过共享缓存） ----
 
 export interface TaskResolvedConfig {
   model: string;
@@ -97,33 +80,29 @@ export function resolveTaskConfig(
   const tier = task.tier?.toUpperCase();
   if (!tier || !["L0", "L1", "L2"].includes(tier)) return null;
 
-  try {
-    const raw = JSON.parse(readFileSync(settingsPath(), "utf-8"));
-    const tiers = raw.modelTiers as Record<string, unknown> | undefined;
-    if (!tiers || typeof tiers !== "object") return null;
+  const s = getSettings();
+  const tiers = s.modelTiers as Record<string, unknown> | undefined;
+  if (!tiers || typeof tiers !== "object") return null;
 
-    const cfg = tiers[tier] as Record<string, unknown> | undefined;
-    if (!cfg || !Array.isArray(cfg.models) || cfg.models.length === 0)
-      return null;
-
-    const firstModel = cfg.models[0] as {
-      provider: string;
-      model: string;
-    };
-    const model = `${firstModel.provider}/${firstModel.model}`;
-
-    const rawThink =
-      (task.thinkingLevel as string) ?? (cfg.thinkingLevel as string);
-    if (
-      rawThink &&
-      VALID_THINKING_LEVELS.includes(
-        rawThink as (typeof VALID_THINKING_LEVELS)[number],
-      )
-    ) {
-      return { model, thinkingLevel: rawThink };
-    }
-    return { model };
-  } catch {
+  const cfg = tiers[tier] as Record<string, unknown> | undefined;
+  if (!cfg || !Array.isArray(cfg.models) || cfg.models.length === 0)
     return null;
+
+  const firstModel = cfg.models[0] as {
+    provider: string;
+    model: string;
+  };
+  const model = `${firstModel.provider}/${firstModel.model}`;
+
+  const rawThink =
+    (task.thinkingLevel as string) ?? (cfg.thinkingLevel as string);
+  if (
+    rawThink &&
+    VALID_THINKING_LEVELS.includes(
+      rawThink as (typeof VALID_THINKING_LEVELS)[number],
+    )
+  ) {
+    return { model, thinkingLevel: rawThink };
   }
+  return { model };
 }

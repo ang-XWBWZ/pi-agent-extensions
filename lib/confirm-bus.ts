@@ -8,6 +8,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { enqueueFrontend, registerFrontendProcessor } from "./agent-bus.js";
+import { getExecutionContext, isPreauthorizedContext } from "./execution-context.js";
 
 // ---- 全局单例 ----
 
@@ -23,7 +24,7 @@ const globalBus: EventEmitter = ((globalThis as Record<string, unknown>).__pi_co
 
 export interface ConfirmRequest {
   reqId: string;
-  type: "path" | "bash";
+  type: "path" | "bash" | "error_recovery";
   label: string;
   target: string;
   options: string[];
@@ -38,12 +39,17 @@ export interface ConfirmResponse {
 // ---- 发射请求 ----
 
 export function requestConfirm(
-  type: "path" | "bash",
+  type: "path" | "bash" | "error_recovery",
   label: string,
   target: string,
   options: string[],
   timeoutMs: number = 60_000,
 ): Promise<string | undefined> {
+  const ctx = getExecutionContext();
+  if (isPreauthorizedContext(ctx)) {
+    return Promise.resolve(options[0]);
+  }
+
   const reqId = randomUUID();
   return new Promise((resolve) => {
     const timer = setTimeout(() => {

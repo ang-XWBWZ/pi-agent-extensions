@@ -1,8 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { randomUUID } from "node:crypto";
 import {
-  clearExecutionContext,
+  auditTextPreview,
+  compactAuditValue,
+  redactAuditText,
+} from "./lib/audit-sanitize.js";
+import {
   getExecutionContext,
   setExecutionContext,
 } from "./lib/execution-context.js";
@@ -12,6 +15,7 @@ import {
   createWorkGoal,
   finishWorkGoal,
   getActiveWorkGoal,
+  getWorkGoal,
 } from "./lib/work-goal-store.js";
 import type { ExecutionContext, WorkGoalLog, WorkGoalState } from "./lib/workflow-types.js";
 
@@ -25,6 +29,7 @@ const WORK_GOAL_TOOLS = new Set([
 ]);
 
 interface PendingToolCall {
+  goalId: string;
   toolName: string;
   message: string;
   startedAt: number;
@@ -68,7 +73,10 @@ function summarizeWorkGoal(goal: WorkGoalState): string {
 }
 
 function activeWorkGoalOrMessage() {
-  const goal = getActiveWorkGoal();
+  const current = getExecutionContext();
+  const goal =
+    (current.goalId ? getWorkGoal(current.goalId) : null) ??
+    getActiveWorkGoal();
   if (!goal) {
     return {
       content: [{ type: "text", text: "No active Work goal." }],
@@ -85,49 +93,37 @@ function shouldRecordGenericTool(toolName: string): boolean {
   return ctx.ledger === "work_goal";
 }
 
-function compact(value: unknown, limit = 500): string {
-  let text: string;
-  if (typeof value === "string") {
-    text = value;
-  } else {
-    try {
-      text = JSON.stringify(value);
-    } catch {
-      text = String(value);
-    }
-  }
-  if (!text) return "";
-  return text.length > limit ? text.slice(0, limit) + "...[truncated]" : text;
-}
-
 function toolMessage(toolName: string, input: unknown): string {
   const record = input as Record<string, unknown> | undefined;
   const command = record?.command;
-  if (typeof command === "string" && command.trim()) return command.trim();
+  if (typeof command === "string" && command.trim()) {
+    return redactAuditText(command.trim());
+  }
   const path = record?.path;
-  if (typeof path === "string" && path.trim()) return `${toolName} ${path.trim()}`;
+  if (typeof path === "string" && path.trim()) {
+    return redactAuditText(`${toolName} ${path.trim()}`);
+  }
   const tasks = record?.tasks;
   if (Array.isArray(tasks)) return `${toolName} ${tasks.length} task(s)`;
-  return `${toolName} ${compact(input)}`.trim();
+  return `${toolName} ${compactAuditValue(input, 500)}`.trim();
 }
 
 function resultPreview(event: { content?: Array<{ type: string; text?: string }> }): string | undefined {
-  const text = event.content
-    ?.filter((block) => block.type === "text")
-    .map((block) => block.text ?? "")
-    .join("\n");
-  if (!text) return undefined;
-  return text.length > 2000 ? text.slice(0, 2000) + "\n...[truncated]" : text;
+  return auditTextPreview(event.content, 2000);
 }
 
 export default function (pi: ExtensionAPI) {
   pi.on("tool_call", (event, ctx) => {
     if (!shouldRecordGenericTool(event.toolName)) return;
-    const goal = getActiveWorkGoal();
+    const executionContext = getExecutionContext();
+    const goal = executionContext.goalId
+      ? getWorkGoal(executionContext.goalId)
+      : getActiveWorkGoal();
     if (!goal || goal.status !== "active") return;
 
     const message = toolMessage(event.toolName, (event as { input?: unknown }).input);
     pendingToolCalls.set(event.toolCallId, {
+      goalId: goal.id,
       toolName: event.toolName,
       message,
       startedAt: Date.now(),
@@ -139,7 +135,10 @@ export default function (pi: ExtensionAPI) {
       cwd: ctx?.cwd,
       metadata: {
         toolName: event.toolName,
-        inputPreview: compact((event as { input?: unknown }).input),
+        inputPreview: compactAuditValue(
+          (event as { input?: unknown }).input,
+          500,
+        ),
       },
     });
   });
@@ -149,8 +148,8 @@ export default function (pi: ExtensionAPI) {
     if (!pending) return;
     pendingToolCalls.delete(event.toolCallId);
 
-    const goal = getActiveWorkGoal();
-    if (!goal || goal.status !== "active") return;
+    const goal = getWorkGoal(pending.goalId);
+    if (!goal) return;
 
     appendWorkGoalLog(goal.id, {
       type: event.isError ? "command_failed" : "command_finished",
@@ -168,51 +167,68 @@ export default function (pi: ExtensionAPI) {
     name: "work_goal_start",
     label: "work_goal_start",
     description:
-      "Start a Work goal ledger. This is not a separate mode; it records autonomous Work execution and preauthorizes auto context inheritance.",
-    promptSnippet: "Start autonomous Work with a goal ledger for a concrete goal",
+      "Start an audit ledger for the current Work authorization. It records execution but never grants or expands permissions.",
+    promptSnippet: "Start an audit ledger without changing Work authorization",
     promptGuidelines: [
-      "Use when: Work is ready, the goal is concrete, and the user wants autonomous execution with an auditable ledger.",
-      "Do not use when: the agent is still in Chat/Plan, requirements are unresolved, or the task does not need autonomous execution.",
-      "Phase policy: Plan may propose using a ledger; only Work should start it.",
-      "Workflow: confirm Work Contract -> start ledger -> execute -> record evidence -> finish or abort.",
-      "Conflict policy: manage_requirements confirms the goal; manage_plan tracks intended steps; this ledger records actual execution.",
-      "Failure / fallback: if the goal becomes unclear or unsafe, abort the ledger and return to Plan.",
+      "Use work_goal_start only in WORK when a concrete task benefits from a detailed audit ledger.",
+      "work_goal_start records the current authorization and must never be used to enable auto execution.",
     ],
     parameters: Type.Object({
       goal: Type.String({ description: "Goal to execute toward" }),
       title: Type.Optional(Type.String({ description: "Short target title" })),
     }),
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
+      const current = getExecutionContext();
+      if (current.phase !== "work") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "work_goal_start is available only in WORK and cannot change the current authorization.",
+            },
+          ],
+          details: { error: "wrong_phase", phase: current.phase },
+        };
+      }
+      const active = getActiveWorkGoal();
+      if (active?.status === "active") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `已有活动 Work goal: ${active.title}。请先 finish 或 abort，避免审计链被静默替换。`,
+            },
+          ],
+          details: { error: "active_goal_exists", goal: active },
+        };
+      }
       const goal = createWorkGoal({
-        goal: params.goal,
-        title: params.title,
+        goal: redactAuditText(params.goal),
+        title: params.title ? redactAuditText(params.title) : undefined,
         phase: "work",
-        autonomy: "auto",
+        autonomy: current.autonomy,
       });
       const execCtx: ExecutionContext = {
-        sessionId: randomUUID(),
-        phase: "work",
-        autonomy: "auto",
+        ...current,
         ledger: "work_goal",
         goalId: goal.id,
-        approval: {
-          interactive: false,
-          preauthorized: true,
-          inheritToChildren: true,
-        },
         runtime: {
           cwd: ctx?.cwd ?? process.cwd(),
-          startedAt: Date.now(),
+          startedAt: current.runtime.startedAt,
         },
       };
       setExecutionContext(execCtx);
+      pi.appendEntry("work-goal-state", {
+        goalId: goal.id,
+        active: true,
+      });
       appendWorkGoalLog(goal.id, {
         type: "work_goal_started",
         message: goal.goal,
         metadata: {
           title: goal.title,
-          preauthorized: true,
-          inheritToChildren: true,
+          preauthorized: execCtx.approval.preauthorized,
+          inheritToChildren: execCtx.approval.inheritToChildren,
         },
       });
       ctx?.ui?.setStatus?.("work-goal", `GOAL: ${goal.title}`);
@@ -223,9 +239,9 @@ export default function (pi: ExtensionAPI) {
             text: [
               `Work goal created: ${goal.title}`,
               "Work ledger: enabled",
-              "Autonomy: auto",
-              "Authorization: preauthorized",
-              "Child inheritance: enabled",
+              `Autonomy: ${execCtx.autonomy}`,
+              `Authorization: ${execCtx.approval.preauthorized ? "preauthorized" : "guarded"}`,
+              `Child inheritance: ${execCtx.approval.inheritToChildren ? "enabled" : "disabled"}`,
               "",
               "Commands and key results will be written to the target log.",
             ].join("\n"),
@@ -244,7 +260,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute() {
       const goal = activeWorkGoalOrMessage();
-      if (!("logs" in goal)) return goal;
+      if (!("logs" in goal)) return goal as any;
       const recent = goal.logs.slice(-10).map(formatLog);
       return {
         content: [
@@ -278,7 +294,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_tcid, params) {
       const goal = activeWorkGoalOrMessage();
-      if (!("logs" in goal)) return goal;
+      if (!("logs" in goal)) return goal as any;
       const limit =
         params.limit != null && Number.isFinite(params.limit) && params.limit > 0
           ? Math.floor(params.limit)
@@ -309,14 +325,25 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
       const goal = activeWorkGoalOrMessage();
-      if (!("logs" in goal)) return goal;
-      const summary = params.summary?.trim() || summarizeWorkGoal(goal);
+      if (!("logs" in goal)) return goal as any;
+      const summary = redactAuditText(
+        params.summary?.trim() || summarizeWorkGoal(goal),
+      );
       appendWorkGoalLog(goal.id, {
         type: "work_goal_finished",
         message: summary,
       });
       const finished = finishWorkGoal(goal.id, summary);
-      clearExecutionContext();
+      const current = getExecutionContext();
+      setExecutionContext({
+        ...current,
+        ledger: "off",
+        goalId: undefined,
+      });
+      pi.appendEntry("work-goal-state", {
+        goalId: goal.id,
+        active: false,
+      });
       ctx?.ui?.setStatus?.("work-goal", "");
       return {
         content: [
@@ -333,17 +360,29 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "work_goal_abort",
     label: "work_goal_abort",
-    description: "Abort the active Work goal ledger and clear autonomous execution context.",
-    promptSnippet: "Abort current Work goal ledger",
+    description:
+      "Abort the active Work goal ledger without changing the current Work authorization.",
+    promptSnippet: "Abort current Work goal ledger without changing authorization",
     parameters: Type.Object({
       reason: Type.Optional(Type.String({ description: "Abort reason" })),
     }),
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
       const goal = activeWorkGoalOrMessage();
-      if (!("logs" in goal)) return goal;
-      const reason = params.reason?.trim() || "Work goal aborted";
+      if (!("logs" in goal)) return goal as any;
+      const reason = redactAuditText(
+        params.reason?.trim() || "Work goal aborted",
+      );
       const aborted = abortWorkGoal(goal.id, reason);
-      clearExecutionContext();
+      const current = getExecutionContext();
+      setExecutionContext({
+        ...current,
+        ledger: "off",
+        goalId: undefined,
+      });
+      pi.appendEntry("work-goal-state", {
+        goalId: goal.id,
+        active: false,
+      });
       ctx?.ui?.setStatus?.("work-goal", "");
       return {
         content: [{ type: "text", text: `Work goal aborted: ${goal.title}\n${reason}` }],
