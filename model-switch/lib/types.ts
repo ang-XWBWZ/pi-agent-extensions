@@ -5,7 +5,7 @@
 // ---- 思考等级 ----
 
 export const VALID_THINKING_LEVELS = [
-  "off", "minimal", "low", "medium", "high", "xhigh",
+  "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ] as const;
 export type ThinkingLevel = (typeof VALID_THINKING_LEVELS)[number];
 
@@ -46,7 +46,7 @@ export const KEY_TIERS = "modelTiers";
 
 export function thinkingLabel(level: string): string {
   const m: Record<string, string> = {
-    off: "关", minimal: "极简", low: "低", medium: "中", high: "高", xhigh: "最大",
+    off: "关", minimal: "极简", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最大",
   };
   return m[level] ?? level;
 }
@@ -67,5 +67,6 @@ export function forceThinkingSupport(model: unknown): void {
     medium: hasReasoning ? (m.thinkingLevelMap?.medium ?? "medium") : undefined,
     high: hasReasoning ? (m.thinkingLevelMap?.high ?? "high") : undefined,
     xhigh: hasReasoning ? (m.thinkingLevelMap?.xhigh ?? "xhigh") : undefined,
+    max: hasReasoning ? (m.thinkingLevelMap?.max ?? "max") : undefined,
   };
 }

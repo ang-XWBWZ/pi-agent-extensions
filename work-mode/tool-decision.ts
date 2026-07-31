@@ -49,10 +49,6 @@ const READ_TOOLS = new Set([
   "find",
   "ls",
   "context",
-  "wiki_read_search",
-  "wiki_read_entry",
-  "wiki_read_chunks",
-  "wiki_read_sources",
   "work_goal_status",
   "work_goal_log",
   "check_agent_results",
@@ -67,14 +63,6 @@ const PROGRESS_TOOLS = new Set([
   "work_goal_abort",
 ]);
 const PERSISTENT_TOOLS = new Set([
-  "wiki_edit_create",
-  "wiki_edit_modify",
-  "wiki_edit_move",
-  "wiki_edit_rename",
-  "wiki_DANGER_load",
-  "wiki_DANGER_refresh",
-  "wiki_DANGER_compile",
-  "wiki_DANGER_store",
   "manage_providers",
 ]);
 const DESTRUCTIVE_COMMAND =
@@ -92,7 +80,8 @@ const AUTO_CONFIRM_TOOLS = new Set([
   "manage_tools",
   "manage_skills",
   "long_attention_config_ps",
-  "wiki_DANGER_semantic",
+  "mcp_manage",
+  "mcp_call",
 ]);
 
 function inputOf(event: { input?: unknown }): Record<string, unknown> {
@@ -145,6 +134,45 @@ function hasUnverifiableCommandPath(command: string): boolean {
   );
 }
 
+function isToolEffect(value: unknown): value is ToolEffect {
+  return value === "read" || value === "progress" || value === "workspace_write"
+    || value === "persistent" || value === "destructive" || value === "unknown";
+}
+
+interface McpPolicyRegistry {
+  classifyCall?: (server: string, tool: string, argumentsValue: unknown) => unknown;
+  isAlwaysAllowed?: (server: string) => unknown;
+}
+
+function mcpPolicyRegistry(): McpPolicyRegistry | undefined {
+  return (globalThis as Record<string, unknown>).__pi_mcp_policy_registry as McpPolicyRegistry | undefined;
+}
+
+function classifyMcpCall(input: Record<string, unknown>): ToolEffect {
+  const server = typeof input.server === "string" ? input.server.trim() : "";
+  const tool = typeof input.tool === "string" ? input.tool.trim() : "";
+  // Keep the no-argument static classification conservative and explicit for
+  // prompt-policy validation. Real MCP calls always provide server and tool.
+  if (!server || !tool) return "persistent";
+
+  try {
+    const effect = mcpPolicyRegistry()?.classifyCall?.(server, tool, input.arguments);
+    return isToolEffect(effect) ? effect : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function isAlwaysAllowedMcpCall(input: Record<string, unknown>): boolean {
+  const server = typeof input.server === "string" ? input.server.trim() : "";
+  if (!server) return false;
+  try {
+    return mcpPolicyRegistry()?.isAlwaysAllowed?.(server) === true;
+  } catch {
+    return false;
+  }
+}
+
 export function classifyCommandRisk(command: string): CommandRisk {
   const value = command.trim();
   if (!value) return "unknown";
@@ -183,13 +211,18 @@ export function classifyCustomToolEffect(
   input: Record<string, unknown> = {},
 ): ToolEffect {
   const action = typeof input.action === "string" ? input.action : "";
-  const path = typeof input.path === "string" ? input.path.trim() : "";
 
-  if (toolName === "wiki_read_chunks") {
-    return action === "reset" || action === "unlock" ? "persistent" : "read";
+  if (toolName === "mcp_manage") {
+    if (!action || action === "list" || action === "status" || action === "tools") return "read";
+    if (action === "disconnect") return "progress";
+    if (action === "remove") return "destructive";
+    return "persistent";
   }
-  if (toolName === "wiki_DANGER_unload") {
-    return path ? "destructive" : "read";
+  if (toolName === "mcp_call") {
+    return classifyMcpCall(input);
+  }
+  if (toolName === "mcp_discover") {
+    return "read";
   }
 
   if (READ_TOOLS.has(toolName)) return "read";
@@ -233,10 +266,6 @@ export function classifyCustomToolEffect(
     if (action === "save") return "persistent";
     return "progress";
   }
-  if (toolName === "wiki_DANGER_semantic") {
-    return action ? "persistent" : "read";
-  }
-
   return "unknown";
 }
 
@@ -254,6 +283,12 @@ function describeCustomTarget(
     "model",
     "tier",
     "name",
+    "server",
+    "tool",
+    "uri",
+    "command",
+    "cwd",
+    "policy",
     "id",
     "stepId",
     "relPath",
@@ -583,6 +618,16 @@ function decideToolCallBase(
           `${event.toolName} is not a read-only PLAN operation.`,
           target,
         );
+  }
+
+  // A server-level always-allow rule is an explicit local preference, but it
+  // cannot promote a phase or turn unknown/destructive actions into safe ones.
+  if (
+    event.toolName === "mcp_call" &&
+    effect === "persistent" &&
+    isAlwaysAllowedMcpCall(input)
+  ) {
+    return allow(effect, target);
   }
 
   if (effect === "progress" || effect === "workspace_write") {

@@ -181,7 +181,7 @@ function extractKeywords(message: string): string[] {
     [/删除|delete|remove|清理|clear|覆盖|overwrite/, "destructive"],
     [/provider|供应商|openai|anthropic|模型/, "provider"],
     [/parallel-agent|sub-agent|子\s*agent|子进程|通信|结果汇报/, "parallel-agent"],
-    [/wiki|知识库|语义搜索|semantic/, "wiki"],
+    [/mcp|pwiki|知识库|语义搜索|semantic/, "mcp"],
     [/计划|plan|work|需求|requirements/, "workflow"],
   ];
   for (const [re, kw] of pairs) if (re.test(text)) kws.add(kw);

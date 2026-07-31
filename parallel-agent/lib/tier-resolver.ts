@@ -19,6 +19,7 @@ export const VALID_THINKING_LEVELS = [
   "medium",
   "high",
   "xhigh",
+  "max",
 ] as const;
 
 // ---- 强制思考支持（与 model-switch/lib/types.ts 保持一致） ----
@@ -37,6 +38,7 @@ export function forceThinkingSupport(model: unknown): void {
     medium: hasReasoning ? (m.thinkingLevelMap?.medium ?? "medium") : undefined,
     high: hasReasoning ? (m.thinkingLevelMap?.high ?? "high") : undefined,
     xhigh: hasReasoning ? (m.thinkingLevelMap?.xhigh ?? "xhigh") : undefined,
+    max: hasReasoning ? (m.thinkingLevelMap?.max ?? "max") : undefined,
   };
 }
 

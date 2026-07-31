@@ -39,7 +39,7 @@ export function registerSwitchModel(
       model: Type.Optional(Type.String({ description: "模型 ID" })),
       tier: Type.Optional(Type.String({ description: "L0|L1|L2" })),
       action: Type.Optional(Type.String({ description: "add_to_tier|remove_from_tier|set_tier_thinking|show_tier_config" })),
-      thinkingLevel: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh" })),
+      thinkingLevel: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh|max" })),
     }),
     async execute(_id, params, _sig, _up, ctx) {
       if (params.action) {

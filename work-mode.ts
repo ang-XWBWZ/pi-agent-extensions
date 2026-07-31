@@ -13,6 +13,7 @@ import {
   formatWorkContract,
   setupRequirementsFeature,
 } from "./work-mode/requirements-feature.js";
+import { setupRequirementsContinuity } from "./work-mode/requirements-continuity.js";
 import { getExecutionContext, setExecutionContext } from "./lib/execution-context.js";
 
 // ============================================================
@@ -93,6 +94,7 @@ export default function (pi: ExtensionAPI) {
       setPhase("plan", ctx);
     },
   });
+  setupRequirementsContinuity(pi);
 
   setupCore(pi, s, {
     resetForNewTurn: () => {

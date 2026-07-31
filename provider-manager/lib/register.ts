@@ -28,6 +28,7 @@ export function buildModelConfigs(
         medium: isReasoning ? "medium" : undefined,
         high: isReasoning ? "high" : undefined,
         xhigh: isReasoning ? "xhigh" : undefined,
+        max: isReasoning ? "max" : undefined,
       },
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },

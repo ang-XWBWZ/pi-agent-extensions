@@ -32,7 +32,7 @@ import {
   convertMessagesForUpstream,
   createEstimatedUsage,
 } from "./message-utils.js";
-import { estimateSerializedTokens } from "./token-estimate.js";
+import { resolveRequestMaxTokens } from "./token-estimate.js";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
@@ -95,7 +95,6 @@ export function createOpenAITolerantStream() {
           model: model.id,
           messages,
           stream: true,
-          max_tokens: options?.maxTokens || model.maxTokens || 4096,
         };
         if (compat?.supportsUsageInStreaming !== false) {
           reqBody.stream_options = { include_usage: true };
@@ -131,19 +130,9 @@ export function createOpenAITolerantStream() {
           }));
         }
 
-        const estimatedInputTokens = estimateSerializedTokens({
-          messages: reqBody.messages,
-          tools: reqBody.tools,
-        });
-        const requestedOutputTokens = Number(reqBody.max_tokens) || 0;
-        if (
-          model.contextWindow > 0
-          && estimatedInputTokens + requestedOutputTokens > model.contextWindow
-        ) {
-          throw new Error(
-            `context_length_exceeded: estimated prompt ${estimatedInputTokens} tokens plus max output ${requestedOutputTokens} exceeds model context window ${model.contextWindow}`,
-          );
-        }
+        // Use a fixed 32K normal-turn cap. Pair it with Pi's
+        // compaction.reserveTokens=32768; do not derive another estimate-based boundary.
+        reqBody.max_tokens = resolveRequestMaxTokens(model, options?.maxTokens);
 
         const baseUrl = model.baseUrl.replace(/\/+$/, "");
         let url = baseUrl;

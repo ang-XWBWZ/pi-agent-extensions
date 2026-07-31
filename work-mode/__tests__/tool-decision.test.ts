@@ -112,15 +112,16 @@ test("PLAN allows recognized read-only diagnostics and denies side effects", () 
     "deny",
   );
   assert.equal(
-    decision(profile("plan"), "wiki_read_chunks", { action: "reset" }).action,
+    decision(profile("plan"), "mcp_manage", { action: "list" }).action,
+    "allow",
+  );
+  assert.equal(
+    decision(profile("plan"), "mcp_manage", { action: "add", name: "pwiki" }).action,
     "deny",
   );
   assert.equal(
-    decision(profile("plan"), "wiki_read_entry", {
-      source: "D:\\outside\\notes",
-      path: "topic.md",
-    }).action,
-    "ask",
+    decision(profile("plan"), "mcp_call", { server: "pwiki", tool: "wiki_search" }).action,
+    "deny",
   );
   assert.equal(
     decision(profile("plan"), "manage_requirements", {
@@ -182,7 +183,7 @@ test("CHAT is conversation-only, including read tools", () => {
     decision(profile("chat"), "read", { path: "D:\\repo\\README.md" }).action,
     "deny",
   );
-  assert.equal(decision(profile("chat"), "wiki_read_sources").action, "deny");
+  assert.equal(decision(profile("chat"), "mcp_manage", { action: "list" }).action, "deny");
   assert.match(formatProfileForPrompt(profile("chat")), /do not call tools/i);
   assert.doesNotMatch(formatProfileForPrompt(profile("chat")), /routine scoped work/i);
 });
@@ -257,18 +258,13 @@ test("AUTO does not bypass destructive, protected, unknown, or outside-workspace
   });
   assert.notEqual(agentsShellWrite.action, "deny");
   assert.match(agentsShellWrite.warning ?? "", /\.agents/);
-  const agentsCustomTool = decision(auto, "wiki_DANGER_load", {
-    path: "D:\\repo\\.agents",
-  });
-  assert.notEqual(agentsCustomTool.action, "deny");
-  assert.match(agentsCustomTool.warning ?? "", /\.agents/);
   assert.equal(
     decision(auto, "read", { path: "D:\\outside\\notes.txt" }).action,
     "ask",
   );
   assert.equal(decision(auto, "project_unknown_mutation").action, "ask");
   assert.equal(
-    decision(auto, "wiki_DANGER_load", { path: "D:\\outside\\notes" }).action,
+    decision(auto, "mcp_call", { server: "unknown", tool: "unknown_write" }).action,
     "ask",
   );
   assert.equal(
@@ -300,17 +296,13 @@ test("custom tool effects cover persistent and destructive extension tools", () 
     classifyCustomToolEffect("manage_providers", { action: "register" }),
     "persistent",
   );
-  assert.equal(
-    classifyCustomToolEffect("wiki_DANGER_unload", { path: "D:\\notes" }),
-    "destructive",
-  );
-  assert.equal(classifyCustomToolEffect("wiki_DANGER_unload"), "read");
-  assert.equal(classifyCustomToolEffect("wiki_read_chunks"), "read");
+  assert.equal(classifyCustomToolEffect("mcp_manage", { action: "list" }), "read");
+  assert.equal(classifyCustomToolEffect("mcp_manage", { action: "add" }), "persistent");
+  assert.equal(classifyCustomToolEffect("mcp_manage", { action: "remove" }), "destructive");
+  assert.equal(classifyCustomToolEffect("mcp_manage", { action: "disconnect" }), "progress");
+  assert.equal(classifyCustomToolEffect("mcp_call"), "persistent");
+  assert.equal(classifyCustomToolEffect("mcp_discover", { action: "resource" }), "read");
   assert.equal(classifyCustomToolEffect("read_agent_output"), "read");
-  assert.equal(
-    classifyCustomToolEffect("wiki_read_chunks", { action: "reset" }),
-    "persistent",
-  );
   assert.equal(
     classifyCustomToolEffect("manage_plan", {
       action: "clear",
@@ -347,13 +339,84 @@ test("custom tool effects cover persistent and destructive extension tools", () 
   assert.equal(classifyCustomToolEffect("project_write_config"), "unknown");
 });
 
+test("MCP calls use only the locally installed server policy registry", () => {
+  const globals = globalThis as Record<string, unknown>;
+  const previous = globals.__pi_mcp_policy_registry;
+  globals.__pi_mcp_policy_registry = {
+    classifyCall: (server: string, tool: string) =>
+      server === "pwiki" && tool === "wiki_search"
+        ? "read"
+      : server === "pwiki" && tool === "wiki_modify_entry"
+        ? "persistent"
+        : server === "trusted" && tool === "save"
+          ? "persistent"
+          : server === "trusted" && tool === "erase"
+            ? "destructive"
+          : "unknown",
+    isAlwaysAllowed: (server: string) => server === "trusted",
+  };
+  try {
+    assert.equal(
+      classifyCustomToolEffect("mcp_call", { server: "pwiki", tool: "wiki_search" }),
+      "read",
+    );
+    assert.equal(
+      decision(profile("plan"), "mcp_call", { server: "pwiki", tool: "wiki_search" }).action,
+      "allow",
+    );
+    assert.equal(
+      decision(profile("work", "never_ask"), "mcp_call", {
+        server: "pwiki",
+        tool: "wiki_modify_entry",
+      }).action,
+      "ask",
+    );
+    assert.equal(
+      decision(profile("work"), "mcp_call", {
+        server: "trusted",
+        tool: "save",
+      }).action,
+      "allow",
+    );
+    assert.equal(
+      decision(profile("plan"), "mcp_call", {
+        server: "trusted",
+        tool: "save",
+      }).action,
+      "deny",
+    );
+    assert.equal(
+      decision(profile("work", "never_ask"), "mcp_call", {
+        server: "trusted",
+        tool: "unknown",
+      }).action,
+      "ask",
+    );
+    assert.equal(
+      decision(profile("work", "never_ask"), "mcp_call", {
+        server: "trusted",
+        tool: "erase",
+      }).action,
+      "ask",
+    );
+    assert.equal(
+      classifyCustomToolEffect("mcp_call", { server: "other", tool: "wiki_search" }),
+      "unknown",
+    );
+  } finally {
+    if (previous === undefined) delete globals.__pi_mcp_policy_registry;
+    else globals.__pi_mcp_policy_registry = previous;
+  }
+});
+
 test("destructive tool confirmations expose the exact target and cannot be remembered", () => {
-  const unload = decision(profile("work", "never_ask"), "wiki_DANGER_unload", {
-    path: "D:\\notes",
+  const remove = decision(profile("work", "never_ask"), "mcp_manage", {
+    action: "remove",
+    name: "pwiki",
   });
-  assert.equal(unload.action, "ask");
-  assert.match(unload.target ?? "", /D:\\notes/);
-  assert.equal(unload.confirm?.remember, false);
+  assert.equal(remove.action, "ask");
+  assert.match(remove.target ?? "", /name=pwiki/);
+  assert.equal(remove.confirm?.remember, false);
 
   const kill = decision(profile("work"), "control_agent", {
     action: "kill",

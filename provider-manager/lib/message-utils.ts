@@ -8,10 +8,14 @@ import { estimateSerializedTokens } from "./token-estimate.js";
 
 export function createEstimatedUsage(
   model: Model<Api>,
-  prompt: unknown,
+  request: unknown,
   completion: unknown,
 ): AssistantMessage["usage"] {
-  const input = estimateSerializedTokens(prompt);
+  // The fallback must describe the whole outbound request, including the
+  // system prompt and tool schemas. Otherwise Pi sees only conversation
+  // history and reaches an upstream context limit long before its own native
+  // compaction threshold.
+  const input = estimateSerializedTokens(request);
   const output = estimateSerializedTokens(completion);
   const usage: AssistantMessage["usage"] = {
     input,
@@ -26,17 +30,27 @@ export function createEstimatedUsage(
 }
 
 export function parseOpenAIUsage(rawUsage: any, model: Model<Api>): AssistantMessage["usage"] {
-  const promptTokens = rawUsage?.prompt_tokens ?? 0;
-  const outputTokens = rawUsage?.completion_tokens ?? 0;
-  const cacheReadTokens = rawUsage?.prompt_tokens_details?.cached_tokens ?? rawUsage?.prompt_cache_hit_tokens ?? 0;
-  const cacheWriteTokens = rawUsage?.prompt_tokens_details?.cache_write_tokens ?? 0;
+  const tokenCount = (value: unknown): number => {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  };
+  const promptTokens = tokenCount(rawUsage?.prompt_tokens);
+  const outputTokens = tokenCount(rawUsage?.completion_tokens);
+  const cacheReadTokens = tokenCount(
+    rawUsage?.prompt_tokens_details?.cached_tokens ?? rawUsage?.prompt_cache_hit_tokens,
+  );
+  const cacheWriteTokens = tokenCount(rawUsage?.prompt_tokens_details?.cache_write_tokens);
   const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+  const computedTotal = input + outputTokens + cacheReadTokens + cacheWriteTokens;
   const usage: AssistantMessage["usage"] = {
     input,
     output: outputTokens,
     cacheRead: cacheReadTokens,
     cacheWrite: cacheWriteTokens,
-    totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
+    // Some OpenAI-compatible gateways include reserved output capacity or
+    // billing-only fields in total_tokens. Pi's native OpenAI adapter derives
+    // the context total from components, so do the same here.
+    totalTokens: computedTotal,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
   calculateCost(model, usage);

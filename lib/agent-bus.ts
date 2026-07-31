@@ -301,7 +301,7 @@ export interface AgentInstance {
   model?: string;
   /** 模型层级 (L0/L1/L2) */
   tier?: string;
-  /** 思考深度 (off/minimal/low/medium/high/xhigh) */
+  /** 思考深度 (off/minimal/low/medium/high/xhigh/max) */
   thinkingLevel?: string;
   /** 累计输入 token 数 */
   inputTokens: number;

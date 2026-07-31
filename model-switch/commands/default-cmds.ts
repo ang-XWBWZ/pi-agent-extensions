@@ -28,7 +28,7 @@ export function registerDefaultCmds(
 ): void {
 
   pi.registerCommand("thinking", {
-    description: "设置/查看思考深度: /thinking [off|...|xhigh]",
+    description: "设置/查看思考深度: /thinking [off|...|xhigh|max]",
     handler: async (args, ctx) => {
       const { currentThinking } = getState();
       const input = args.trim().toLowerCase();

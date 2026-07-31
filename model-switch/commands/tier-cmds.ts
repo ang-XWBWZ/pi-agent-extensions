@@ -70,7 +70,7 @@ export function registerTierCmds(
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/);
       if (parts.length < 3) {
-        ctx.ui.notify("用法: /tier-add <L0|L1|L2> <provider> <model> [--thinking off|...|xhigh]", "error");
+        ctx.ui.notify("用法: /tier-add <L0|L1|L2> <provider> <model> [--thinking off|...|xhigh|max]", "error");
         return;
       }
       const tier = parts[0].toUpperCase();
@@ -144,10 +144,10 @@ export function registerTierCmds(
   });
 
   pi.registerCommand("tier-set-thinking", {
-    description: "设置层级默认思考: /tier-set-thinking <L0|L1|L2> <off|...|xhigh>",
+    description: "设置层级默认思考: /tier-set-thinking <L0|L1|L2> <off|...|xhigh|max>",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/);
-      if (parts.length < 2) { ctx.ui.notify("用法: /tier-set-thinking <L0|L1|L2> <off|...|xhigh>", "error"); return; }
+      if (parts.length < 2) { ctx.ui.notify("用法: /tier-set-thinking <L0|L1|L2> <off|...|xhigh|max>", "error"); return; }
       const tier = parts[0].toUpperCase();
       if (!["L0", "L1", "L2"].includes(tier)) { ctx.ui.notify("层级必须是 L0/L1/L2", "error"); return; }
       if (!isValidThinkingLevel(parts[1])) { ctx.ui.notify(`无效等级: ${parts[1]}`, "error"); return; }

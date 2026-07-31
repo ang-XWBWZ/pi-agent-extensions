@@ -11,6 +11,7 @@
  *   medium  → "medium"
  *   high    → "high"
  *   xhigh   → "max"
+ *   max     → "max"
  *   off     → thinking: { type: "disabled" }
  */
 
@@ -29,7 +30,7 @@ import type {
 import {
   createEstimatedUsage,
 } from "./message-utils.js";
-import { estimateSerializedTokens } from "./token-estimate.js";
+import { resolveRequestMaxTokens } from "./token-estimate.js";
 
 // ---- 思考等级 → effort ----
 
@@ -41,6 +42,7 @@ const PI_TO_EFFORT: Record<string, ClaudeEffort> = {
   medium: "medium",
   high: "high",
   xhigh: "max",
+  max: "max",
 };
 
 // ---- sanitization：移除与 extended thinking 冲突的参数 ----
@@ -199,7 +201,6 @@ export function createAnthropicStream() {
         const reqBody: Record<string, unknown> = {
           model: model.id,
           messages,
-          max_tokens: options?.maxTokens || (model as any).maxTokens || 4096,
           stream: true,
           ...(context.systemPrompt?.trim() ? { system: context.systemPrompt } : {}),
         };
@@ -226,20 +227,9 @@ export function createAnthropicStream() {
           }));
         }
 
-        const estimatedInputTokens = estimateSerializedTokens({
-          system: reqBody.system,
-          messages: reqBody.messages,
-          tools: reqBody.tools,
-        });
-        const requestedOutputTokens = Number(reqBody.max_tokens) || 0;
-        if (
-          model.contextWindow > 0
-          && estimatedInputTokens + requestedOutputTokens > model.contextWindow
-        ) {
-          throw new Error(
-            `context_length_exceeded: estimated prompt ${estimatedInputTokens} tokens plus max output ${requestedOutputTokens} exceeds model context window ${model.contextWindow}`,
-          );
-        }
+        // Anthropic requires max_tokens. Use the fixed 32K normal-turn cap
+        // and pair it with Pi's compaction.reserveTokens=32768.
+        reqBody.max_tokens = resolveRequestMaxTokens(model, options?.maxTokens);
 
         const baseUrl = (model as any).baseUrl.replace(/\/+$/, "");
         let url = baseUrl;
@@ -470,11 +460,7 @@ export function createAnthropicStream() {
         } else {
           output.usage = createEstimatedUsage(
             model,
-            {
-              system: reqBody.system,
-              messages: reqBody.messages,
-              tools: reqBody.tools,
-            },
+            { system: reqBody.system, messages: reqBody.messages, tools: reqBody.tools },
             output.content,
           );
         }
