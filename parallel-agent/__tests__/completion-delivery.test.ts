@@ -15,5 +15,6 @@ test("sub-agent completion does not create queued user messages", () => {
   assert.match(spawnAgent, /customType:\s*"sub-agent-results"/);
   assert.match(spawnAgent, /display:\s*false/);
   assert.match(spawnAgent, /deliverAs:\s*"followUp",\s*triggerTurn:\s*true/);
-  assert.match(widget, /bus\.on\(Events\.JOB_COMPLETE,\s*onEvent\)/);
+  assert.match(widget, /Events\.JOB_COMPLETE/);
+  assert.match(widget, /for \(const eventName of genericEvents\) bus\.on\(eventName, onVisibleEvent\)/);
 });

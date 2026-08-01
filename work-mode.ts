@@ -39,7 +39,6 @@ export default function (pi: ExtensionAPI) {
     isSubAgent,
     planSteps: [] as PlanStep[],
     planFullText: "",
-    planPanelExpanded: false,
     pathAllowlist: new Set<string>(),
     cmdAllowlist: new Set<string>(),
     actionAllowlist: new Set<string>(),

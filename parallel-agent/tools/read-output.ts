@@ -11,6 +11,7 @@ import {
   getAgentTaskPanel,
   readAgentTaskOutput,
 } from "../../lib/agent-bus.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 
 export function registerReadAgentOutput(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -42,6 +43,20 @@ export function registerReadAgentOutput(pi: ExtensionAPI): void {
         }),
       ),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "read_agent_output", [
+        { name: "jobId", value: args.jobId, tone: "accent" },
+        { name: "taskId", value: args.taskId, tone: "accent" },
+        { name: "cursor", value: args.cursor, tone: "muted" },
+        { name: "maxBytes", value: args.maxBytes, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 12,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal) {
       if (signal?.aborted) throw new Error("读取子 Agent 输出已取消");
       if (!Number.isFinite(params.cursor ?? 0) || (params.cursor ?? 0) < 0) {

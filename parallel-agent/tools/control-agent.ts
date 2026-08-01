@@ -22,6 +22,7 @@ import {
   type AgentTaskPanel,
   type AgentTaskStageReport,
 } from "../../lib/agent-bus.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 
 function compactText(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars)}…`;
@@ -90,6 +91,21 @@ export function registerControlAgent(pi: ExtensionAPI): void {
       stageOffset: Type.Optional(Type.Number({ description: "仅 status 使用；0 为最新阶段，1 为上一个阶段，用于展开该阶段的详细控制面板" })),
       input: Type.Optional(Type.String({ description: "消息内容（send/resume 操作时使用）" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "control_agent", [
+        { name: "action", value: args.action, tone: "warning" },
+        { name: "jobId", value: args.jobId, tone: "accent" },
+        { name: "taskId", value: args.taskId, tone: "accent" },
+        { name: "stageOffset", value: args.stageOffset, tone: "muted" },
+        { name: "input", value: args.input, maxLength: 140 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 10,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("操作已取消");
       const { action, jobId, taskId, input } = params;

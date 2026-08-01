@@ -6,6 +6,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { sendMessage } from "../../lib/agent-bus.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 import { subAgentIdentity } from "../lib/helpers.js";
 
 export function registerSendMessage(pi: ExtensionAPI): void {
@@ -24,6 +25,19 @@ export function registerSendMessage(pi: ExtensionAPI): void {
       type: Type.Optional(StringEnum(["info", "request", "response", "error"] as const)),
       payload: Type.String({ description: "消息内容" }),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "send_agent_message", [
+        { name: "to", value: args.to, tone: "accent" },
+        { name: "type", value: args.type, tone: "warning" },
+        { name: "payload", value: args.payload, maxLength: 160 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 4,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("操作已取消");
       let fromId = "main";

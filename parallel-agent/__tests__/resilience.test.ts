@@ -279,6 +279,27 @@ test("child task protocol is registered and timeout checkpoints precede abort", 
   assert.match(runner, /errorCode === "timeout"[\s\S]*saveAgentState[\s\S]*session\.abort/);
 });
 
+test("sub-agent sessions do not poll or own the parent TUI widget", () => {
+  const entry = readFileSync(join(parallelAgentRoot, "..", "parallel-agent.ts"), "utf8");
+  const runner = readFileSync(
+    join(parallelAgentRoot, "lib", "agent-runner.ts"),
+    "utf8",
+  );
+  const widget = readFileSync(join(parallelAgentRoot, "lib", "widget.ts"), "utf8");
+
+  assert.match(runner, /__pi_parallel_agent_suppress_widget = true/);
+  assert.match(runner, /delete \(globalThis as Record<string, unknown>\)\s*\.__pi_parallel_agent_suppress_widget/);
+  assert.match(entry, /suppressSubAgentWidget[\s\S]*__pi_parallel_agent_suppress_widget/);
+  assert.match(entry, /if \(!suppressSubAgentWidget\) setupWidget\(pi\)/);
+  assert.doesNotMatch(widget, /setInterval\s*\(/);
+  assert.match(widget, /scheduleWidgetExpiry\(\)/);
+  assert.match(widget, /if \(!widgetTui\) return/);
+  assert.match(widget, /let widgetRenderNow = 0/);
+  assert.match(widget, /visibleStatusSignatures\.get\(key\) === signature/);
+  assert.match(widget, /visiblePanelSignatures\.get\(key\) === signature/);
+  assert.match(widget, /setTimeout\(\(\) =>/);
+});
+
 test("GitHub distribution keeps the same resilience contract", () => {
   const distRoot = join(workspaceRoot, "github特供版", "github-dist");
   const entry = readFileSync(join(distRoot, "parallel-agent.ts"), "utf8");
@@ -299,4 +320,26 @@ test("GitHub distribution keeps the same resilience contract", () => {
   assert.match(runner, /errorCode === "timeout"[\s\S]*saveAgentState[\s\S]*session\.abort/);
   assert.match(runner, /__pi_default_mode/);
   assert.doesNotMatch(runner, /__pi_default_phase/);
+});
+
+test("GitHub distribution keeps the event-driven sub-agent widget contract", () => {
+  const distRoot = join(workspaceRoot, "github特供版", "github-dist");
+  const entry = readFileSync(join(distRoot, "parallel-agent.ts"), "utf8");
+  const runner = readFileSync(
+    join(distRoot, "parallel-agent", "lib", "agent-runner.ts"),
+    "utf8",
+  );
+  const widget = readFileSync(
+    join(distRoot, "parallel-agent", "lib", "widget.ts"),
+    "utf8",
+  );
+
+  assert.match(runner, /__pi_parallel_agent_suppress_widget = true/);
+  assert.match(entry, /if \(!suppressSubAgentWidget\) setupWidget\(pi\)/);
+  assert.doesNotMatch(widget, /setInterval\s*\(/);
+  assert.match(widget, /scheduleWidgetExpiry\(\)/);
+  assert.match(widget, /if \(!widgetTui\) return/);
+  assert.match(widget, /let widgetRenderNow = 0/);
+  assert.match(widget, /visibleStatusSignatures\.get\(key\) === signature/);
+  assert.match(widget, /visiblePanelSignatures\.get\(key\) === signature/);
 });

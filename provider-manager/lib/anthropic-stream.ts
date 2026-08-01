@@ -31,6 +31,11 @@ import {
   createEstimatedUsage,
 } from "./message-utils.js";
 import { resolveRequestMaxTokens } from "./token-estimate.js";
+import {
+  awaitWithAbort,
+  cancelReader,
+  createRequestAbortError,
+} from "./abortable-request.js";
 
 // ---- 思考等级 → effort ----
 
@@ -44,6 +49,17 @@ const PI_TO_EFFORT: Record<string, ClaudeEffort> = {
   xhigh: "max",
   max: "max",
 };
+
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+function resolveStreamIdleTimeoutMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  }
+  // Pi maps disabled httpIdleTimeoutMs=0 to max int32 before it reaches providers.
+  if (value >= 2_000_000_000) return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  return Math.floor(value);
+}
 
 // ---- sanitization：移除与 extended thinking 冲突的参数 ----
 
@@ -190,6 +206,11 @@ export function createAnthropicStream() {
         timestamp: Date.now(),
       };
 
+      let abortReason: "user" | "idle" | null = null;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let idleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let removeAbortListener: (() => void) | undefined;
       try {
         const apiKey = options?.apiKey;
         if (!apiKey) {
@@ -239,12 +260,23 @@ export function createAnthropicStream() {
         }
 
         const controller = new AbortController();
+        idleTimeoutMs = resolveStreamIdleTimeoutMs(options?.timeoutMs);
+        const abortWith = (reason: "user" | "idle") => {
+          abortReason = abortReason ?? reason;
+          controller.abort();
+          cancelReader(reader);
+        };
+        const refreshIdleTimer = () => {
+          if (timeoutId) clearTimeout(timeoutId);
+          timeoutId = setTimeout(() => abortWith("idle"), idleTimeoutMs);
+        };
         if (options?.signal) {
           if (options.signal.aborted) throw new Error("Request was aborted");
-          options.signal.addEventListener("abort", () => controller.abort());
+          const onUserAbort = () => abortWith("user");
+          options.signal.addEventListener("abort", onUserAbort, { once: true });
+          removeAbortListener = () => options.signal?.removeEventListener("abort", onUserAbort);
         }
-        const timeoutMs = (options as any)?.timeoutMs || 120000;
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        refreshIdleTimer();
 
         const reqHeaders: Record<string, string> = {
           "Content-Type": "application/json",
@@ -254,20 +286,27 @@ export function createAnthropicStream() {
           ...(options?.headers || {}),
         };
 
-        const response = await fetch(url, {
-          method: "POST",
-          headers: reqHeaders,
-          body: JSON.stringify(reqBody),
-          signal: controller.signal,
-        });
+        const response = await awaitWithAbort(
+          () => fetch(url, {
+            method: "POST",
+            headers: reqHeaders,
+            body: JSON.stringify(reqBody),
+            signal: controller.signal,
+          }),
+          controller.signal,
+        );
 
+        refreshIdleTimer();
         if (!response.ok) {
-          const errText = await response.text().catch(() => "Unknown error");
+          const errText = await awaitWithAbort(
+            () => response.text().catch(() => "Unknown error"),
+            controller.signal,
+          );
           throw new Error(`API request failed: ${response.status} - ${errText.slice(0, 500)}`);
         }
         if (!response.body) throw new Error("No response body");
 
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
 
@@ -284,14 +323,20 @@ export function createAnthropicStream() {
         let cacheReadTokens = 0;
         let cacheWriteTokens = 0;
 
+        let processedSseFrame = false;
+        let sawTerminalEvent = false;
         while (true) {
           if (options?.signal?.aborted) throw new Error("Request was aborted");
-          const { done, value } = await reader.read();
+          const { done, value } = await awaitWithAbort(
+            () => reader!.read(),
+            controller.signal,
+          );
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           const events = buffer.split("\n\n");
           buffer = events.pop() || "";
 
+          processedSseFrame = false;
           for (const raw of events) {
             const trimmed = raw.trim();
             if (!trimmed) continue;
@@ -299,7 +344,11 @@ export function createAnthropicStream() {
             const dataLine = trimmed.split("\n").find((l) => l.startsWith("data: "));
             if (!dataLine) continue;
             const jsonStr = dataLine.slice(6);
-            if (jsonStr === "[DONE]") continue;
+            if (jsonStr === "[DONE]") {
+              processedSseFrame = true;
+              sawTerminalEvent = true;
+              break;
+            }
 
             let data: any;
             try {
@@ -310,6 +359,18 @@ export function createAnthropicStream() {
             if (!data || typeof data !== "object") continue;
 
             const eventType = data.type;
+
+            if (eventType === "ping") continue;
+            if (eventType === "error") {
+              throw new Error(data.error?.message || "Anthropic-compatible stream error");
+            }
+            if (eventType === "message_stop") {
+              processedSseFrame = true;
+              sawTerminalEvent = true;
+              break;
+            }
+            if (!eventType) continue;
+            processedSseFrame = true;
 
             if (eventType === "message_start") {
               if (data.message?.usage) {
@@ -443,9 +504,17 @@ export function createAnthropicStream() {
               continue;
             }
           }
+          if (processedSseFrame) {
+            refreshIdleTimer();
+          }
+          if (sawTerminalEvent) {
+            cancelReader(reader);
+            break;
+          }
         }
 
-        clearTimeout(timeoutId);
+        if (controller.signal.aborted) throw createRequestAbortError();
+        if (timeoutId) clearTimeout(timeoutId);
 
         output.usage = {
           input: inputTokens,
@@ -477,14 +546,26 @@ export function createAnthropicStream() {
         outer.push({ type: "done", reason: mapped as any, message: output });
         outer.end();
       } catch (err: any) {
-        const msg = err?.message || String(err);
-        const aborted = err?.name === "AbortError" || msg === "Request was aborted";
+        if (timeoutId) clearTimeout(timeoutId);
+        const rawMsg = err?.message || String(err);
+        const idleTimedOut = abortReason === "idle";
+        const userAborted = abortReason === "user" || rawMsg === "Request was aborted";
+        const msg = idleTimedOut
+          ? `Anthropic-compatible stream idle timeout after ${idleTimeoutMs}ms`
+          : rawMsg;
         outer.push({
           type: "error",
-          reason: aborted ? "aborted" : "error",
-          error: { ...output, stopReason: aborted ? "aborted" : "error", errorMessage: msg },
+          reason: userAborted && !idleTimedOut ? "aborted" : "error",
+          error: {
+            ...output,
+            stopReason: userAborted && !idleTimedOut ? "aborted" : "error",
+            errorMessage: msg,
+          },
         });
         outer.end();
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        removeAbortListener?.();
       }
     })();
 

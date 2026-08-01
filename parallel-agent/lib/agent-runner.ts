@@ -273,6 +273,8 @@ export function runSingleAgent(
           (globalThis as Record<string, unknown>).__pi_default_phase =
             task.phase || "work";
           (globalThis as Record<string, unknown>).__pi_is_sub_agent = true;
+          (globalThis as Record<string, unknown>)
+            .__pi_parallel_agent_suppress_widget = true;
 
           try {
             const sm = SessionManager.inMemory();
@@ -292,6 +294,8 @@ export function runSingleAgent(
           } finally {
             delete (globalThis as Record<string, unknown>).__pi_default_phase;
             delete (globalThis as Record<string, unknown>).__pi_is_sub_agent;
+            delete (globalThis as Record<string, unknown>)
+              .__pi_parallel_agent_suppress_widget;
           }
         };
         const sessionPromise = sessionChain.then(createSession, createSession);

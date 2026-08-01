@@ -13,6 +13,7 @@ import {
   type AgentJob,
   type AgentTaskPanel,
 } from "../../lib/agent-bus.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 import { formatJobAlreadyInjectedNotice, formatJobPreview } from "../lib/result-format.js";
 
 // ---- 格式化输出 ----
@@ -121,6 +122,19 @@ export function registerCheckResults(pi: ExtensionAPI): void {
       wait: Type.Optional(Type.Boolean({ description: "是否阻塞等待完成（默认 false）" })),
       timeout: Type.Optional(Type.Number({ description: "等待超时秒（默认 300）" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "check_agent_results", [
+        { name: "jobId", value: args.jobId, tone: "accent" },
+        { name: "wait", value: args.wait, tone: "warning" },
+        { name: "timeout", value: args.timeout, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 8,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("操作已取消");
 

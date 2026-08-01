@@ -6,6 +6,11 @@ import {
   redactAuditText,
 } from "./lib/audit-sanitize.js";
 import {
+  isToolResultError,
+  renderStructuredToolCall,
+  renderToolResult,
+} from "./lib/tui-render.js";
+import {
   getExecutionContext,
   setExecutionContext,
 } from "./lib/execution-context.js";
@@ -177,6 +182,18 @@ export default function (pi: ExtensionAPI) {
       goal: Type.String({ description: "Goal to execute toward" }),
       title: Type.Optional(Type.String({ description: "Short target title" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "work_goal_start", [
+        { name: "goal", value: args.goal, tone: "accent", maxLength: 180 },
+        { name: "title", value: args.title, tone: "toolOutput", maxLength: 120 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 6,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
       const current = getExecutionContext();
       if (current.phase !== "work") {
@@ -258,6 +275,15 @@ export default function (pi: ExtensionAPI) {
     description: "Show the current Work goal ledger status and recent logs.",
     promptSnippet: "Show current Work goal ledger status",
     parameters: Type.Object({}),
+    renderCall(_args, theme, context) {
+      return renderStructuredToolCall(theme, context, "work_goal_status", []);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 8,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute() {
       const goal = activeWorkGoalOrMessage();
       if (!("logs" in goal)) return goal as any;
@@ -292,6 +318,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       limit: Type.Optional(Type.Number({ description: "Recent log count" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "work_goal_log", [
+        { name: "limit", value: args.limit, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 10,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_tcid, params) {
       const goal = activeWorkGoalOrMessage();
       if (!("logs" in goal)) return goal as any;
@@ -323,6 +360,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       summary: Type.Optional(Type.String({ description: "Optional human summary" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "work_goal_finish", [
+        { name: "summary", value: args.summary, tone: "toolOutput", maxLength: 180 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 6,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
       const goal = activeWorkGoalOrMessage();
       if (!("logs" in goal)) return goal as any;
@@ -366,6 +414,17 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       reason: Type.Optional(Type.String({ description: "Abort reason" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "work_goal_abort", [
+        { name: "reason", value: args.reason, tone: "warning", maxLength: 180 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 6,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
       const goal = activeWorkGoalOrMessage();
       if (!("logs" in goal)) return goal as any;

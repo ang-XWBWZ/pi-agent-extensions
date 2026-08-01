@@ -33,6 +33,11 @@ import {
   createEstimatedUsage,
 } from "./message-utils.js";
 import { resolveRequestMaxTokens } from "./token-estimate.js";
+import {
+  awaitWithAbort,
+  cancelReader,
+  createRequestAbortError,
+} from "./abortable-request.js";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
@@ -72,6 +77,8 @@ export function createOpenAITolerantStream() {
       let abortReason: "user" | "idle" | null = null;
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
       let idleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let removeAbortListener: (() => void) | undefined;
 
       try {
         const apiKey = options?.apiKey;
@@ -146,6 +153,7 @@ export function createOpenAITolerantStream() {
         const abortWith = (reason: "user" | "idle") => {
           abortReason = abortReason ?? reason;
           controller.abort();
+          cancelReader(reader);
         };
         const refreshIdleTimer = () => {
           if (timeoutId) clearTimeout(timeoutId);
@@ -153,7 +161,9 @@ export function createOpenAITolerantStream() {
         };
         if (options?.signal) {
           if (options.signal.aborted) throw new Error("Request was aborted");
-          options.signal.addEventListener("abort", () => abortWith("user"), { once: true });
+          const onUserAbort = () => abortWith("user");
+          options.signal.addEventListener("abort", onUserAbort, { once: true });
+          removeAbortListener = () => options.signal?.removeEventListener("abort", onUserAbort);
         }
         refreshIdleTimer();
 
@@ -169,29 +179,38 @@ export function createOpenAITolerantStream() {
           reqHeaders["x-session-affinity"] = reqHeaders["x-session-affinity"] ?? cacheSessionId;
         }
 
-        let response = await fetch(url, {
-          method: "POST",
-          headers: reqHeaders,
-          body: JSON.stringify(reqBody),
-          signal: controller.signal,
-        });
+        let response = await awaitWithAbort(
+          () => fetch(url, {
+            method: "POST",
+            headers: reqHeaders,
+            body: JSON.stringify(reqBody),
+            signal: controller.signal,
+          }),
+          controller.signal,
+        );
         refreshIdleTimer();
 
         let responseErrorText: string | undefined;
         if (!response.ok) {
-          responseErrorText = await response.text().catch(() => "Unknown error");
+          responseErrorText = await awaitWithAbort(
+            () => response.text().catch(() => "Unknown error"),
+            controller.signal,
+          );
           const usageOptionRejected =
             reqBody.stream_options
             && (response.status === 400 || response.status === 422)
             && /stream[_ ]?options|include[_ ]?usage/i.test(responseErrorText);
           if (usageOptionRejected) {
             delete reqBody.stream_options;
-            response = await fetch(url, {
-              method: "POST",
-              headers: reqHeaders,
-              body: JSON.stringify(reqBody),
-              signal: controller.signal,
-            });
+            response = await awaitWithAbort(
+              () => fetch(url, {
+                method: "POST",
+                headers: reqHeaders,
+                body: JSON.stringify(reqBody),
+                signal: controller.signal,
+              }),
+              controller.signal,
+            );
             responseErrorText = undefined;
             refreshIdleTimer();
           }
@@ -199,12 +218,15 @@ export function createOpenAITolerantStream() {
 
         if (!response.ok) {
           const errText = responseErrorText
-            ?? await response.text().catch(() => "Unknown error");
+            ?? await awaitWithAbort(
+              () => response.text().catch(() => "Unknown error"),
+              controller.signal,
+            );
           throw new Error(`API request failed: ${response.status} - ${errText.slice(0, 500)}`);
         }
         if (!response.body) throw new Error("No response body");
 
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
         let hasFinishReason = false;
@@ -290,19 +312,28 @@ export function createOpenAITolerantStream() {
           delete fallbackBody.stream_options;
           const fallbackHeaders = { ...reqHeaders, Accept: "application/json" };
           refreshIdleTimer();
-          const fallbackResponse = await fetch(url, {
-            method: "POST",
-            headers: fallbackHeaders,
-            body: JSON.stringify(fallbackBody),
-            signal: controller.signal,
-          });
+          const fallbackResponse = await awaitWithAbort(
+            () => fetch(url, {
+              method: "POST",
+              headers: fallbackHeaders,
+              body: JSON.stringify(fallbackBody),
+              signal: controller.signal,
+            }),
+            controller.signal,
+          );
           refreshIdleTimer();
           if (!fallbackResponse.ok) {
-            const errText = await fallbackResponse.text().catch(() => "Unknown error");
+            const errText = await awaitWithAbort(
+              () => fallbackResponse.text().catch(() => "Unknown error"),
+              controller.signal,
+            );
             throw new Error(`API request failed: ${fallbackResponse.status} - ${errText.slice(0, 500)}`);
           }
 
-          const data: any = await fallbackResponse.json();
+          const data: any = await awaitWithAbort(
+            () => fallbackResponse.json(),
+            controller.signal,
+          );
           refreshIdleTimer();
           if (data.usage) {
             output.usage = parseOpenAIUsage(data.usage, model);
@@ -346,6 +377,7 @@ export function createOpenAITolerantStream() {
                 : null);
         };
 
+        let processedSseFrame = false;
         const processSseFrame = (raw: string) => {
           const trimmed = raw.trim();
           if (!trimmed) return;
@@ -358,6 +390,7 @@ export function createOpenAITolerantStream() {
           const payload = dataLines.join("\n");
           if (payload === "[DONE]") {
             sawDoneMarker = true;
+            processedSseFrame = true;
             return;
           }
 
@@ -366,11 +399,14 @@ export function createOpenAITolerantStream() {
 
           if (data.usage) {
             output.usage = parseOpenAIUsage(data.usage, model);
+            processedSseFrame = true;
           }
 
           if (!data.choices?.length) return;
           const choice = data.choices[0];
           if (!choice) return;
+          if (!choice.finish_reason && !choice.delta) return;
+          processedSseFrame = true;
 
           if (choice.finish_reason) {
             hasFinishReason = true;
@@ -414,17 +450,34 @@ export function createOpenAITolerantStream() {
 
         while (true) {
           if (options?.signal?.aborted) throw new Error("Request was aborted");
-          const { done, value } = await reader.read();
+          const { done, value } = await awaitWithAbort(
+            () => reader!.read(),
+            controller.signal,
+          );
           if (done) break;
-          refreshIdleTimer();
           buffer += decoder.decode(value, { stream: true });
           const events = buffer.split(/\r?\n\r?\n/);
           buffer = events.pop() || "";
 
+          processedSseFrame = false;
+          let reachedTerminalFrame = false;
           for (const raw of events) {
             processSseFrame(raw);
+            if (sawDoneMarker || hasFinishReason) {
+              reachedTerminalFrame = true;
+              break;
+            }
+          }
+          if (processedSseFrame) {
+            refreshIdleTimer();
+          }
+          if (reachedTerminalFrame) {
+            cancelReader(reader);
+            break;
           }
         }
+
+        if (controller.signal.aborted) throw createRequestAbortError();
 
         const tail = decoder.decode();
         if (tail) buffer += tail;
@@ -539,6 +592,9 @@ export function createOpenAITolerantStream() {
           },
         });
         outer.end();
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        removeAbortListener?.();
       }
     })();
 

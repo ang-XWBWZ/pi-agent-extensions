@@ -14,6 +14,7 @@ import {
   type AgentJob,
 } from "../../lib/agent-bus.js";
 import { getExecutionContext } from "../../lib/execution-context.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 import { loadToolConfig } from "../lib/tier-resolver.js";
 import { spawnAllBackground } from "../lib/spawner.js";
 import { formatJobFullResult } from "../lib/result-format.js";
@@ -77,6 +78,22 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
       timeout: Type.Optional(Type.Number({ description: "单任务超时秒（默认 60）" })),
       autoInject: Type.Optional(Type.Boolean({ description: "完成后自动推送结果到主对话（默认 true）" })),
     }),
+    renderCall(args, theme, context) {
+      const taskIds = Array.isArray(args.tasks)
+        ? args.tasks.map((task) => task.id).join(", ")
+        : undefined;
+      return renderStructuredToolCall(theme, context, "spawn_agent", [
+        { name: "tasks", value: taskIds, tone: "accent", maxLength: 180 },
+        { name: "timeout", value: args.timeout, tone: "muted" },
+        { name: "autoInject", value: args.autoInject, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 8,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const total = params.tasks.length;
       const timeoutSeconds = params.timeout ?? 60;

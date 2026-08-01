@@ -10,6 +10,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { redactAuditText } from "../lib/audit-sanitize.js";
 import type { ConversationPhase } from "./types.js";
+import {
+  isToolResultError,
+  renderStructuredToolCall,
+  renderToolResult,
+} from "../lib/tui-render.js";
 
 export interface WorkContract {
   objective: string;
@@ -234,6 +239,30 @@ export function setupRequirementsFeature(
         }),
       ),
     }),
+
+    renderCall(args, theme, context) {
+      const count = (value: unknown) => Array.isArray(value) ? `${value.length} items` : undefined;
+      return renderStructuredToolCall(theme, context, "manage_requirements", [
+        { name: "action", value: args.action, tone: "warning" },
+        { name: "objective", value: args.objective, tone: "accent", maxLength: 160 },
+        { name: "scope", value: count(args.scope), tone: "muted" },
+        { name: "outOfScope", value: count(args.outOfScope), tone: "muted" },
+        { name: "constraints", value: count(args.constraints), tone: "muted" },
+        { name: "assumptions", value: count(args.assumptions), tone: "muted" },
+        { name: "acceptance", value: count(args.acceptance), tone: "muted" },
+        { name: "risks", value: count(args.risks), tone: "muted" },
+        { name: "steps", value: count(args.steps), tone: "muted" },
+        { name: "workContract", value: args.workContract, maxLength: 140 },
+        { name: "openQuestions", value: count(args.openQuestions), tone: "warning" },
+        { name: "force", value: args.force, tone: "warning" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 8,
+        isError: isToolResultError(result, context),
+      });
+    },
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("aborted");

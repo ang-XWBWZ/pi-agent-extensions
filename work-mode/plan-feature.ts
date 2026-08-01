@@ -7,13 +7,12 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Text, Container } from "@earendil-works/pi-tui";
 import { redactAuditText } from "../lib/audit-sanitize.js";
+import { getToolsExpandedState, renderStructuredToolCall, renderToolResult, setToolsExpandedState } from "../lib/tui-render.js";
 import {
   type ConversationPhase,
   type PlanStep,
   MAX_PLAN_STEPS,
-  DEFAULT_VISIBLE_STEPS,
 } from "./types.js";
 import { renderPlanPanel, nextStepId, resetStepIdCounter } from "./plan-parser.js";
 import { securityReview, formatSecurityReview } from "./security-reviewer.js";
@@ -29,7 +28,6 @@ export interface PlanState {
   isSubAgent: boolean;
   planSteps: PlanStep[];
   planFullText: string;
-  planPanelExpanded: boolean;
 }
 
 interface PlanEntry {
@@ -67,7 +65,7 @@ export function setupPlanFeature(
     }
     ctx.ui.setWidget("plan-panel", (_tui, theme) => ({
       render: (_width: number) =>
-        renderPlanPanel(s.planSteps, theme, s.planPanelExpanded),
+        renderPlanPanel(s.planSteps, theme, getToolsExpandedState(pi)),
       invalidate: () => _tui.requestRender?.(),
     }));
   }
@@ -75,7 +73,6 @@ export function setupPlanFeature(
   function clearState() {
     s.planSteps = [];
     s.planFullText = "";
-    s.planPanelExpanded = false;
     resetStepIdCounter(0);
   }
 
@@ -106,7 +103,6 @@ export function setupPlanFeature(
       updatedAt: Date.now(),
     }));
     s.planFullText = fullText;
-    s.planPanelExpanded = s.planSteps.length <= DEFAULT_VISIBLE_STEPS;
     updatePlanPanel(ctx);
     persistPlan(false);
   }
@@ -183,17 +179,17 @@ export function setupPlanFeature(
   });
 
   pi.registerCommand("plan-expand", {
-    description: "展开计划面板显示全部步骤",
+    description: "展开全部工具输出与计划面板",
     handler: async (_a, ctx) => {
-      s.planPanelExpanded = true;
+      setToolsExpandedState(pi, true);
       updatePlanPanel(ctx);
     },
   });
 
   pi.registerCommand("plan-collapse", {
-    description: "折叠计划面板",
+    description: "折叠工具输出与计划面板",
     handler: async (_a, ctx) => {
-      s.planPanelExpanded = false;
+      setToolsExpandedState(pi, false);
       updatePlanPanel(ctx);
     },
   });
@@ -271,44 +267,25 @@ export function setupPlanFeature(
     }),
 
     renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      const action = typeof args.action === "string" ? args.action : "?";
-      const detail =
-        action === "set_steps"
-            ? ` ${args.steps?.length ?? 0}步`
-          : action === "advance"
-            ? ` → ${args.status ?? "?"}`
-            : action === "set_step_status"
-              ? ` #${args.stepId} → ${args.status}`
-              : args.stepId != null
-                ? ` #${args.stepId}`
-                : "";
-      text.setText(
-        theme.fg("toolTitle", theme.bold(`manage_plan: ${action}${detail}`)),
-      );
-      return text;
+      return renderStructuredToolCall(theme, context, "manage_plan", [
+        { name: "action", value: args.action, tone: "accent" },
+        { name: "stepId", value: args.stepId, tone: "accent" },
+        { name: "status", value: args.status, tone: "warning" },
+        { name: "steps", value: Array.isArray(args.steps) ? `${args.steps.length} steps` : undefined, tone: "muted" },
+        { name: "text", value: args.text },
+        { name: "evidence", value: args.evidence, maxLength: 140 },
+        { name: "force", value: args.force, tone: "warning" },
+      ]);
     },
 
     renderResult(result, options, theme, context) {
-      const output =
-        result.content
-          ?.flatMap((item) => (item.type === "text" ? [item.text ?? ""] : []))
-          .join("\n")
-          .trim() ?? "";
-      if (!output) {
-        return (context.lastComponent as Container) ?? new Container();
-      }
-      const container =
-        (context.lastComponent as Container) ?? new Container();
-      container.clear();
-      const shown = options.expanded
-        ? output
-        : output.split("\n")[0].slice(0, 120) +
-          (output.includes("\n") || output.length > 120
-            ? theme.fg("muted", " … (Ctrl+O 展开)")
-            : "");
-      container.addChild(new Text(shown, 0, 0));
-      return container;
+      const details = result.details as Record<string, unknown> | undefined;
+      const failed = context.isError || typeof details?.error === "string";
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 3,
+        isError: failed,
+        emptyText: failed ? "Plan update failed without textual output." : undefined,
+      });
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

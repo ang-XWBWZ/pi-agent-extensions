@@ -11,6 +11,7 @@ import {
   type AgentTaskPanel,
   type AgentTaskPanelStatus,
 } from "../../lib/agent-bus.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 import { subAgentIdentity } from "../lib/helpers.js";
 
 const CHILD_SETTABLE_STATUSES = new Set<AgentTaskPanelStatus>([
@@ -102,6 +103,24 @@ export function registerUpdateAgentTask(pi: ExtensionAPI): void {
         Type.String({ description: "追加一条持久化任务备注，不覆盖旧备注" }),
       ),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "update_agent_task", [
+        { name: "jobId", value: args.jobId, tone: "accent" },
+        { name: "taskId", value: args.taskId, tone: "accent" },
+        { name: "status", value: args.status, tone: "warning" },
+        { name: "progress", value: args.progress, tone: "muted" },
+        { name: "currentStep", value: args.currentStep, maxLength: 120 },
+        { name: "conclusion", value: args.conclusion ?? args.summary, maxLength: 160 },
+        { name: "detail", value: args.detail ? "provided" : undefined, tone: "muted" },
+        { name: "note", value: args.note, maxLength: 120 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 7,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("任务面板更新已取消");
 

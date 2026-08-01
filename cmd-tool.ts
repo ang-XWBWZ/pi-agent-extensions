@@ -4,15 +4,14 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, execSync } from "node:child_process";
-import { Text } from "@earendil-works/pi-tui";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getExecutionContext, withPiExecutionEnv } from "./lib/execution-context.js";
 import { afterCommand, beforeCommand } from "./lib/work-goal-recorder.js";
+import { renderCommandToolCall, renderToolResult } from "./lib/tui-render.js";
 
 /** 跨平台进程树清理（与 pi 内核 shell.ts 的 killProcessTree 等价）*/
 function killProcessTree(pid: number): void {
@@ -127,96 +126,50 @@ export default function (pi: ExtensionAPI) {
       const state = context.state as {
         startedAt?: number;
         endedAt?: number;
-        interval?: ReturnType<typeof setInterval>;
       };
       if (context.executionStarted && state.startedAt === undefined) {
         state.startedAt = Date.now();
         state.endedAt = undefined;
       }
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      const command =
-        typeof args.command === "string" ? args.command : "";
-      const timeout = args.timeout;
-      const timeoutSuffix = timeout
-        ? theme.fg("muted", ` (timeout ${timeout}s)`)
-        : "";
-      text.setText(
-        theme.fg("toolTitle", theme.bold(`> ${command}`)) + timeoutSuffix
-      );
-      return text;
+      return renderCommandToolCall(theme, context, ">", args.command, [
+        { name: "timeout", value: args.timeout, tone: "muted" },
+        { name: "codepage", value: args.codepage, tone: "muted" },
+      ]);
     },
 
     renderResult(result, options, theme, context) {
       const state = context.state as {
         startedAt?: number;
         endedAt?: number;
-        interval?: ReturnType<typeof setInterval>;
       };
-
       state.endedAt ??= Date.now();
-
-      // Extract text output — strip \r (Windows cmd.exe uses \r\n,
-      // and \r causes TUI padding spaces to overwrite line text)
-      const rawOutput =
-        result.content
-          ?.filter((c: { type: string; text?: string }) => c.type === "text")
-          .map((c: { type: string; text?: string }) => (c.text ?? "").replace(/\r/g, ""))
-          .join("\n")
-          .trim() ?? "";
-
-      const exitCode = (result.details as any)?.exitCode;
-      const hasError =
-        context.isError || (exitCode !== undefined && exitCode !== 0);
-
-      // Format all output as a single string — matches grep/read pattern
-      let text = "";
-
-      if (rawOutput) {
-        const styledLines = rawOutput
-          .split("\n")
-          .map((line) => theme.fg("toolOutput", line));
-
-        if (options.expanded || hasError) {
-          text += "\n" + styledLines.join("\n");
-        } else {
-          if (styledLines.length <= CMD_PREVIEW_LINES) {
-            text += "\n" + styledLines.join("\n");
-          } else {
-            const preview = styledLines.slice(-CMD_PREVIEW_LINES);
-            const skipped = styledLines.length - CMD_PREVIEW_LINES;
-            const hint =
-              theme.fg("muted", `... (${skipped} earlier lines,`) +
-              ` ${keyHint("app.tools.expand", "to expand")})`;
-            text += "\n" + hint + "\n" + preview.join("\n");
-          }
-        }
-
-        if (hasError && exitCode !== undefined) {
-          text += "\n" + theme.fg("error", `Command exited with code ${exitCode}`);
-        }
-      } else if (hasError) {
-        text += "\n" + theme.fg("error", `Command exited with code ${exitCode}`);
-      }
-
-      // Truncation warning
       const details = result.details as Record<string, unknown> | undefined;
+      const exitCode = details?.exitCode as number | undefined;
+      const cancelled = details?.cancelled === true;
+      const timedOut = details?.timedOut === true;
+      const hasError =
+        context.isError || (exitCode !== undefined && exitCode !== 0) || cancelled || timedOut;
+      const annotations: Array<{ text: string; tone: "muted" | "warning" | "error" }> = [];
+      if (cancelled) annotations.push({ text: "Command cancelled by user", tone: "warning" });
+      else if (timedOut) annotations.push({ text: "Command timed out", tone: "warning" });
+      else if (hasError && exitCode !== undefined) annotations.push({ text: `Command exited with code ${exitCode}`, tone: "error" });
       if (details?.truncated) {
         const fullPath = details.fullOutputPath as string | undefined;
-        text += "\n" + theme.fg("warning",
-          fullPath
-            ? `[Output truncated. Full output: ${fullPath}]`
-            : "[Output truncated]");
+        annotations.push({
+          text: fullPath ? `Output truncated. Full output: ${fullPath}` : "Output truncated",
+          tone: "warning",
+        });
       }
-
-      // Duration
       if (state.startedAt !== undefined) {
         const endTime = state.endedAt ?? Date.now();
-        text += "\n" + theme.fg("muted", `Took ${formatDuration(endTime - state.startedAt)}`);
+        annotations.push({ text: `Took ${formatDuration(endTime - state.startedAt)}`, tone: "muted" });
       }
-
-      const component = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      component.setText(text);
-      return component;
+      return renderToolResult(result, options, theme, context, {
+        previewLines: CMD_PREVIEW_LINES,
+        isError: hasError,
+        emptyText: hasError ? "Command failed — no output" : undefined,
+        annotations,
+      });
     },
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {

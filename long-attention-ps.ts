@@ -7,8 +7,8 @@
  */
 
 import { Type } from "typebox";
-import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { renderStructuredToolCall, renderToolResult } from "./lib/tui-render.js";
 
 type PsPriority = "low" | "medium" | "high" | "critical";
 type PsType =
@@ -399,10 +399,17 @@ export default function (pi: ExtensionAPI) {
       };
     },
     renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      const preview = String(args.message ?? "").slice(0, 40);
-      text.setText(theme.fg("toolTitle", theme.bold(`long_attention_add_ps("${preview}${preview.length >= 40 ? "…" : ""}")`)));
-      return text;
+      return renderStructuredToolCall(theme, context, "long_attention_add_ps", [
+        { name: "message", value: args.message, maxLength: 120 },
+        { name: "type", value: args.type, tone: "accent" },
+        { name: "priority", value: args.priority, tone: "warning" },
+        { name: "expires", value: args.expires, tone: "muted" },
+        { name: "phase", value: args.phase, tone: "muted" },
+        { name: "mode", value: args.mode, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, { previewLines: 4 });
     },
   });
 
@@ -427,9 +434,10 @@ export default function (pi: ExtensionAPI) {
       };
     },
     renderCall(_args, theme, context) {
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      text.setText(theme.fg("toolTitle", theme.bold("long_attention_list_ps()")));
-      return text;
+      return renderStructuredToolCall(theme, context, "long_attention_list_ps", []);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, { previewLines: 6 });
     },
   });
 
@@ -451,9 +459,12 @@ export default function (pi: ExtensionAPI) {
       return { content: [{ type: "text", text: `🧠 已清理 ${before - st.items.length} 条 PS，剩余 ${st.items.length} 条` }], details: { cleared: before - st.items.length } };
     },
     renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      text.setText(theme.fg("toolTitle", theme.bold(`long_attention_clear_ps(${args.scope ?? "all"})`)));
-      return text;
+      return renderStructuredToolCall(theme, context, "long_attention_clear_ps", [
+        { name: "scope", value: args.scope ?? "all", tone: "warning" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, { previewLines: 4 });
     },
   });
 
@@ -482,9 +493,13 @@ export default function (pi: ExtensionAPI) {
       return { content: [{ type: "text", text: `✅ ${key}: ${old} → ${next}` }], details: { key, old, next } };
     },
     renderCall(args, theme, context) {
-      const text = (context.lastComponent as Text) ?? new Text("", 0, 0);
-      text.setText(theme.fg("toolTitle", theme.bold(`long_attention_config_ps(${args.key ?? "?"})`)));
-      return text;
+      return renderStructuredToolCall(theme, context, "long_attention_config_ps", [
+        { name: "key", value: args.key, tone: "accent" },
+        { name: "value", value: args.value, maxLength: 140 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, { previewLines: 5 });
     },
   });
 

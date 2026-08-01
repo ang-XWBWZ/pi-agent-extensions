@@ -10,6 +10,7 @@ import {
   getSettings,
   updateSettings,
 } from "../../lib/settings-io.js";
+import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 
 export function registerManageSkills(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -31,6 +32,18 @@ export function registerManageSkills(pi: ExtensionAPI): void {
         description: "skill 名称列表（blacklist_add/remove/set 时必填）",
       })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "manage_skills", [
+        { name: "action", value: args.action, tone: "warning" },
+        { name: "skills", value: args.skills, tone: "accent", maxLength: 160 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 6,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("操作已取消");
 

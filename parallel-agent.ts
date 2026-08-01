@@ -33,6 +33,11 @@ import { registerUpdateAgentTask } from "./parallel-agent/tools/update-task.js";
 import { registerReadAgentOutput } from "./parallel-agent/tools/read-output.js";
 
 export default function (pi: ExtensionAPI) {
+  // SDK 子 Agent 没有交互式 UI。若仍注册这个全局 widget，它们会驱动
+  // 父会话的 TUI 重绘，并在销毁时清掉父会话的 TUI 引用。
+  const suppressSubAgentWidget =
+    (globalThis as Record<string, unknown>)
+      .__pi_parallel_agent_suppress_widget === true;
 
   // ---- 用 globalThis 收子进程消息 + steer 推送（不依赖 pi 实例，重载后仍有效） ----
   const STEER_KEY = "__pi_pending_steer_msgs";
@@ -82,7 +87,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ---- 子 Agent 状态面板 Widget ----
-  setupWidget(pi);
+  if (!suppressSubAgentWidget) setupWidget(pi);
 
   // ---- 工具注册 ----
   registerUpdateAgentTask(pi);

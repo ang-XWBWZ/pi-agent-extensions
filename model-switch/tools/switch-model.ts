@@ -8,6 +8,11 @@ import type { ThinkingLevel, TierKey, TierConfig } from "../lib/types.js";
 import { isValidThinkingLevel, TIER_DEFAULTS, thinkingLabel, forceThinkingSupport, KEY_PROVIDER, KEY_MODEL, KEY_TIER } from "../lib/types.js";
 import { readAllTiers, writeAllTiers, resolveTierModel, getCurrentTier } from "../lib/tier-config.js";
 import { updateSettings } from "../../lib/settings-io.js";
+import {
+  isToolResultError,
+  renderStructuredToolCall,
+  renderToolResult,
+} from "../../lib/tui-render.js";
 
 export function registerSwitchModel(
   pi: ExtensionAPI,
@@ -41,6 +46,22 @@ export function registerSwitchModel(
       action: Type.Optional(Type.String({ description: "add_to_tier|remove_from_tier|set_tier_thinking|show_tier_config" })),
       thinkingLevel: Type.Optional(Type.String({ description: "off|minimal|low|medium|high|xhigh|max" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "switch_model", [
+        { name: "action", value: args.action, tone: "warning" },
+        { name: "tier", value: args.tier, tone: "accent" },
+        { name: "provider", value: args.provider, tone: "accent" },
+        { name: "model", value: args.model, tone: "accent", maxLength: 160 },
+        { name: "thinkingLevel", value: args.thinkingLevel, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 12,
+        isError: isToolResultError(result, context),
+      });
+    },
+
     async execute(_id, params, _sig, _up, ctx) {
       if (params.action) {
         const config = readAllTiers();

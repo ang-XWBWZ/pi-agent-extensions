@@ -17,6 +17,11 @@ import {
 } from "../lib/discovery.js";
 import { updateCustomModelLimits } from "../lib/model-limits.js";
 import { buildModelConfigs, registerCustomProvider } from "../lib/register.js";
+import {
+  isToolResultError,
+  renderStructuredToolCall,
+  renderToolResult,
+} from "../../lib/tui-render.js";
 
 type OpenAIApiMode = "chat-completions" | "responses";
 type StreamCompatMode = "builtin" | "finish-reason-fallback";
@@ -60,6 +65,29 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       streamCompatMode: Type.Optional(Type.String({ description: "builtin | finish-reason-fallback" })),
       anthropicThinkingMode: Type.Optional(Type.String({ description: "Claude thinking mode: builtin | adaptive_effort (recommended)" })),
     }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "manage_providers", [
+        { name: "action", value: args.action ?? "list", tone: "warning" },
+        { name: "provider", value: args.provider, tone: "accent" },
+        { name: "model", value: args.model, tone: "accent" },
+        { name: "baseUrl", value: args.baseUrl, tone: "accent", maxLength: 180 },
+        { name: "apiKey", value: args.apiKey, sensitive: true },
+        { name: "apiStyle", value: args.apiStyle, tone: "muted" },
+        { name: "openaiApiMode", value: args.openaiApiMode, tone: "muted" },
+        { name: "testModel", value: args.testModel, tone: "accent" },
+        { name: "contextWindow", value: args.contextWindow, tone: "muted" },
+        { name: "maxTokens", value: args.maxTokens, tone: "muted" },
+        { name: "reasoningModels", value: args.reasoningModels, tone: "accent", maxLength: 140 },
+        { name: "streamCompatMode", value: args.streamCompatMode, tone: "muted" },
+        { name: "anthropicThinkingMode", value: args.anthropicThinkingMode, tone: "muted" },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, {
+        previewLines: 10,
+        isError: isToolResultError(result, context),
+      });
+    },
     async execute(_id, params, _sig, _up, ctx) {
       const action = params.action || "list";
 
