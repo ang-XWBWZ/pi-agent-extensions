@@ -4,29 +4,118 @@
 
 import { type Api, type AssistantMessage, calculateCost } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai";
-import { estimateSerializedTokens } from "./token-estimate.js";
 
-export function createEstimatedUsage(
-  model: Model<Api>,
-  request: unknown,
-  completion: unknown,
-): AssistantMessage["usage"] {
-  // The fallback must describe the whole outbound request, including the
-  // system prompt and tool schemas. Otherwise Pi sees only conversation
-  // history and reaches an upstream context limit long before its own native
-  // compaction threshold.
-  const input = estimateSerializedTokens(request);
-  const output = estimateSerializedTokens(completion);
-  const usage: AssistantMessage["usage"] = {
-    input,
-    output,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: input + output,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+/** Fixed output headroom included in custom-provider context occupancy. */
+export const CUSTOM_PROVIDER_CONTEXT_RESERVE_TOKENS = 1_024;
+
+function serializeForTokenEstimate(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+/**
+ * Estimate tokens from the exact local payload representation. ASCII follows
+ * Pi's chars/4 convention; CJK and other BMP text count as one token per
+ * character, while astral symbols use two tokens conservatively.
+ */
+export function estimateLocalPayloadTokens(value: unknown): number {
+  const serialized = serializeForTokenEstimate(value);
+  let tokens = 0;
+  for (const char of serialized) {
+    const codePoint = char.codePointAt(0) ?? 0;
+    if (codePoint <= 0x7f) tokens += 0.25;
+    else if (codePoint > 0xffff) tokens += 2;
+    else tokens += 1;
+  }
+  return Math.ceil(tokens);
+}
+
+function estimateLocalReplyTokens(content: unknown): number {
+  if (!Array.isArray(content)) return estimateLocalPayloadTokens(content);
+
+  let tokens = 0;
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      tokens += estimateLocalPayloadTokens(block);
+      continue;
+    }
+    const typedBlock = block as Record<string, unknown>;
+    if (typedBlock.type === "text") {
+      tokens += estimateLocalPayloadTokens(typedBlock.text);
+    } else if (typedBlock.type === "thinking") {
+      tokens += estimateLocalPayloadTokens(typedBlock.thinking);
+    } else if (typedBlock.type === "toolCall") {
+      tokens += estimateLocalPayloadTokens({
+        name: typedBlock.name,
+        arguments: typedBlock.arguments,
+      });
+    } else {
+      tokens += estimateLocalPayloadTokens(typedBlock);
+    }
+  }
+  return tokens;
+}
+
+export interface CustomProviderContextUsage {
+  sentTokens: number;
+  replyTokens: number;
+  reserveTokens: number;
+  totalTokens: number;
+}
+
+/** Local sent payload + provider reply (or local fallback) + fixed 1K reserve. */
+export function calculateCustomProviderContextUsage(
+  sentPayload: unknown,
+  replyContent: unknown,
+  reportedReplyTokens: unknown,
+): CustomProviderContextUsage {
+  const sentTokens = estimateLocalPayloadTokens(sentPayload);
+  const parsedReplyTokens = typeof reportedReplyTokens === "number"
+    ? reportedReplyTokens
+    : Number(reportedReplyTokens);
+  const replyTokens = Number.isFinite(parsedReplyTokens) && parsedReplyTokens > 0
+    ? Math.floor(parsedReplyTokens)
+    : estimateLocalReplyTokens(replyContent);
+  const reserveTokens = CUSTOM_PROVIDER_CONTEXT_RESERVE_TOKENS;
+  return {
+    sentTokens,
+    replyTokens,
+    reserveTokens,
+    totalTokens: sentTokens + replyTokens + reserveTokens,
   };
-  calculateCost(model, usage);
-  return usage;
+}
+
+/**
+ * Apply local context accounting while preserving provider-reported cache and
+ * cost data. The local sent amount is partitioned into uncached input plus the
+ * reported cache components so cache is never added twice to occupancy.
+ */
+export function applyCustomProviderContextUsage(
+  usage: AssistantMessage["usage"],
+  sentPayload: unknown,
+  replyContent: unknown,
+): AssistantMessage["usage"] {
+  const local = calculateCustomProviderContextUsage(
+    sentPayload,
+    replyContent,
+    usage.output,
+  );
+  const cacheRead = Number.isFinite(usage.cacheRead) && usage.cacheRead > 0
+    ? usage.cacheRead
+    : 0;
+  const cacheWrite = Number.isFinite(usage.cacheWrite) && usage.cacheWrite > 0
+    ? usage.cacheWrite
+    : 0;
+  return {
+    ...usage,
+    input: Math.max(0, local.sentTokens - cacheRead - cacheWrite),
+    output: local.replyTokens,
+    totalTokens: local.totalTokens,
+  };
 }
 
 export function parseOpenAIUsage(rawUsage: any, model: Model<Api>): AssistantMessage["usage"] {
@@ -41,16 +130,15 @@ export function parseOpenAIUsage(rawUsage: any, model: Model<Api>): AssistantMes
   );
   const cacheWriteTokens = tokenCount(rawUsage?.prompt_tokens_details?.cache_write_tokens);
   const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-  const computedTotal = input + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const reportedTotal = tokenCount(rawUsage?.total_tokens);
   const usage: AssistantMessage["usage"] = {
     input,
     output: outputTokens,
     cacheRead: cacheReadTokens,
     cacheWrite: cacheWriteTokens,
-    // Some OpenAI-compatible gateways include reserved output capacity or
-    // billing-only fields in total_tokens. Pi's native OpenAI adapter derives
-    // the context total from components, so do the same here.
-    totalTokens: computedTotal,
+    // Preserve the provider's context statistic without reconstructing it.
+    // Pi natively falls back to the component fields when this remains zero.
+    totalTokens: reportedTotal,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
   calculateCost(model, usage);

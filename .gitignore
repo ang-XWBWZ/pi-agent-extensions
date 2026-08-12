@@ -1,0 +1,6 @@
+mcp/node_modules/
+node_modules/
+*.log
+*.tsbuildinfo
+.env
+.env.*

@@ -30,9 +30,9 @@ import {
   parseToolArguments,
   finalizeToolCallBlock,
   convertMessagesForUpstream,
-  createEstimatedUsage,
+  applyCustomProviderContextUsage,
 } from "./message-utils.js";
-import { resolveRequestMaxTokens } from "./token-estimate.js";
+import { resolveRequestMaxTokens } from "./request-limits.js";
 import {
   awaitWithAbort,
   cancelReader,
@@ -560,13 +560,11 @@ export function createOpenAITolerantStream() {
         else if (finishReason === "tool_calls") mapped = "toolUse";
         else if (finishReason === "end" || finishReason === "stop") mapped = "stop";
 
-        if (output.usage.totalTokens <= 0) {
-          output.usage = createEstimatedUsage(
-            model,
-            { messages: reqBody.messages, tools: reqBody.tools },
-            output.content,
-          );
-        }
+        output.usage = applyCustomProviderContextUsage(
+          output.usage,
+          { messages: reqBody.messages, tools: reqBody.tools },
+          output.content,
+        );
 
         output.stopReason = mapped as any;
         outer.push({ type: "done", reason: mapped as any, message: output });

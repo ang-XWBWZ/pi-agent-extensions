@@ -27,10 +27,8 @@ import type {
   SimpleStreamOptions,
   Context,
 } from "@earendil-works/pi-ai";
-import {
-  createEstimatedUsage,
-} from "./message-utils.js";
-import { resolveRequestMaxTokens } from "./token-estimate.js";
+import { applyCustomProviderContextUsage } from "./message-utils.js";
+import { resolveRequestMaxTokens } from "./request-limits.js";
 import {
   awaitWithAbort,
   cancelReader,
@@ -521,18 +519,19 @@ export function createAnthropicStream() {
           output: outputTokens,
           cacheRead: cacheReadTokens,
           cacheWrite: cacheWriteTokens,
-          totalTokens: inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
+          // Anthropic does not report a total. Keep it unset and let Pi's
+          // native context accounting consume the provider components.
+          totalTokens: 0,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         };
-        if (output.usage.totalTokens > 0) {
+        if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheWriteTokens > 0) {
           calculateCost(model, output.usage);
-        } else {
-          output.usage = createEstimatedUsage(
-            model,
-            { system: reqBody.system, messages: reqBody.messages, tools: reqBody.tools },
-            output.content,
-          );
         }
+        output.usage = applyCustomProviderContextUsage(
+          output.usage,
+          { system: reqBody.system, messages: reqBody.messages, tools: reqBody.tools },
+          output.content,
+        );
 
         let mapped: string = "stop";
         if (!stopReason) {
