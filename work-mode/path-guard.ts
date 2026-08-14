@@ -30,13 +30,19 @@ export function wildcardMatch(pattern: string, target: string): boolean {
 
 export function isUnder(base: string, target: string): boolean {
   const b = (base.endsWith("/") ? base : base + "/").replace(/\\/g, "/");
-  const t = (isAbsolute(target) ? target : resolve(base, target)).replace(/\\/g, "/");
+  const isWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(target);
+  const t = (isAbsolute(target) || isWindowsAbsolute ? target : resolve(base, target)).replace(/\\/g, "/");
   return t.toLowerCase().startsWith(b.toLowerCase());
 }
 
 export function resolvePath(base: string, p: string): string {
   const clean = p.replace(/^@/, "");
-  return isAbsolute(clean) ? clean : resolve(base, clean);
+  // node:path on a POSIX host does not recognize Windows drive paths, but
+  // cmd/powershell inputs can still carry them while the extension is tested
+  // or hosted cross-platform.
+  return isAbsolute(clean) || /^[a-zA-Z]:[\\/]/.test(clean)
+    ? clean
+    : resolve(base, clean);
 }
 
 export function guessPathPattern(raw: string): string {

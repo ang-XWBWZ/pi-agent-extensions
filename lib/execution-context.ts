@@ -46,6 +46,7 @@ function createDefaultContext(): ExecutionContext {
       interactive: !preauthorized,
       preauthorized,
       inheritToChildren: boolFromEnv(process.env.PI_INHERIT_APPROVAL),
+      autoAll: boolFromEnv(process.env.PI_AUTO_ALL),
     },
     runtime: {
       cwd: process.cwd(),
@@ -79,6 +80,7 @@ export function initializeExecutionContext(input: {
   cwd: string;
   ledger?: LedgerPolicy;
   goalId?: string;
+  autoAll?: boolean;
 }): ExecutionContext {
   const autonomy = input.phase === "work" ? input.autonomy ?? "guarded" : "guarded";
   const preauthorized = autonomy === "auto";
@@ -92,6 +94,7 @@ export function initializeExecutionContext(input: {
       interactive: !preauthorized,
       preauthorized,
       inheritToChildren: preauthorized,
+      autoAll: input.autoAll === true,
     },
     runtime: {
       cwd: input.cwd,
@@ -121,6 +124,18 @@ export function autonomyForSessionStart(
     : "guarded";
 }
 
+/** Full command authorization follows AUTO only when the parent explicitly
+ * enabled inheritance; a root session never restores this from stale state. */
+export function autoAllForSessionStart(
+  isSubAgent: boolean,
+  inherited = getExecutionContext(),
+): boolean {
+  return isSubAgent &&
+    inherited.autonomy === "auto" &&
+    inherited.approval.inheritToChildren &&
+    inherited.approval.autoAll === true;
+}
+
 export function withPiExecutionEnv(
   env: NodeJS.ProcessEnv,
   ctx = getExecutionContext(),
@@ -133,5 +148,6 @@ export function withPiExecutionEnv(
     PI_GOAL_ID: ctx.goalId ?? "",
     PI_PREAUTHORIZED: ctx.approval.preauthorized ? "true" : "false",
     PI_INHERIT_APPROVAL: ctx.approval.inheritToChildren ? "true" : "false",
+    PI_AUTO_ALL: ctx.approval.autoAll ? "true" : "false",
   };
 }

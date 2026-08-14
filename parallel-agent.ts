@@ -65,7 +65,7 @@ export default function (pi: ExtensionAPI) {
   }>;
 
   // ---- context 事件注入待收消息 + steer 消息 ----
-  pi.on("context", (_event, _ctx) => {
+  pi.on("context", (event, _ctx) => {
     const steerQ = (globalThis as Record<string, unknown>)[STEER_KEY] as string[];
     const hasSteer = steerQ && steerQ.length > 0;
     const hasMsgs = pendingMsgs.length > 0;
@@ -80,10 +80,15 @@ export default function (pi: ExtensionAPI) {
       const lines = batch.map((m) => `[${m.from}] ${m.payload}`);
       parts.push(`[agent-message]\n${lines.join("\n")}`);
     }
-    _event.messages.push({
-      role: "user",
-      content: parts.join("\n"),
-    } as any);
+    return {
+      messages: [
+        ...event.messages,
+        {
+          role: "user",
+          content: parts.join("\n"),
+        } as any,
+      ],
+    };
   });
 
   // ---- 子 Agent 状态面板 Widget ----

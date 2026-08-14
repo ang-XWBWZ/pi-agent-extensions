@@ -3,6 +3,7 @@ import { registerBusInput, registerBusUI, type BusUI } from "../lib/confirm-bus.
 import { getWorkGoal } from "../lib/work-goal-store.js";
 import {
   autonomyForSessionStart,
+  autoAllForSessionStart,
   getExecutionContext,
   initializeExecutionContext,
   setExecutionContext,
@@ -13,6 +14,7 @@ import {
   workflowPromptForPhase,
 } from "./types.js";
 import { formatProfileForPrompt, profileFromPhase } from "./execution-profile.js";
+import { getAutoFlashModel, registerAutoFlashCommand } from "./auto-flash.js";
 
 export interface CoreState {
   phase: ConversationPhase;
@@ -63,7 +65,7 @@ export function setupCore(
     const executionContext = getExecutionContext();
     ctx.ui.setStatus(
       "work-mode",
-      `${s.phase.toUpperCase()} · ${executionContext.autonomy.toUpperCase()}`,
+      `${s.phase.toUpperCase()} · ${executionContext.approval.autoAll ? "AUTO_ALL" : executionContext.autonomy.toUpperCase()}`,
     );
     ctx.ui.setStatus("work-auth", "");
   }
@@ -72,6 +74,7 @@ export function setupCore(
     phase: ConversationPhase,
     autonomy: "guarded" | "auto",
     ctx: ExtensionContext,
+    autoAll = false,
   ) {
     s.phase = phase;
     const current = getExecutionContext();
@@ -84,9 +87,10 @@ export function setupCore(
         interactive: autonomy !== "auto",
         preauthorized: autonomy === "auto",
         inheritToChildren: autonomy === "auto",
+        autoAll,
       },
     });
-    pi.appendEntry("work-phase-state", { phase, autonomy });
+    pi.appendEntry("work-phase-state", { phase, autonomy, autoAll });
     updateStatus(ctx);
   }
 
@@ -94,7 +98,7 @@ export function setupCore(
     const labels: Record<ConversationPhase, string> = {
       chat: "CHAT phase - conversation and clarification",
       plan: "PLAN phase - requirement confirmation",
-      work: `WORK phase - ${getExecutionContext().autonomy} authorization`,
+      work: `WORK phase - ${getExecutionContext().approval.autoAll ? "auto_all" : getExecutionContext().autonomy} authorization`,
     };
     ctx.ui.notify(labels[s.phase], "info");
   }
@@ -137,6 +141,7 @@ export function setupCore(
       cwd: ctx.cwd,
       ledger: restoredGoal?.status === "active" ? "work_goal" : "off",
       goalId: restoredGoal?.status === "active" ? restoredGoal.id : undefined,
+      autoAll: autoAllForSessionStart(s.isSubAgent, inheritedContext),
     });
     ctx.ui.setStatus(
       "work-goal",
@@ -184,12 +189,31 @@ export function setupCore(
   });
 
   pi.registerCommand("auto", {
-    description: "WORK phase - autonomous authorization",
+    description: "WORK phase - AI-reviewed command authorization; use /auto_flash to configure the reviewer",
     handler: async (_a, ctx) => {
       applyProfile("work", "auto", ctx);
-      ctx.ui.notify("WORK phase - autonomous authorization", "info");
+      const model = getAutoFlashModel();
+      ctx.ui.notify(
+        model
+          ? `WORK phase - AUTO AI 审批（${model.provider}/${model.model}）`
+          : "WORK phase - AUTO AI 审批；尚未配置 AUTO_FLASH，请执行 /auto_flash <provider>/<model>",
+        model ? "info" : "warning",
+      );
     },
   });
+
+  pi.registerCommand("auto_all", {
+    description: "WORK phase - explicitly authorize all non-protected command calls; use auto_all=true",
+    handler: async (_a, ctx) => {
+      applyProfile("work", "auto", ctx, true);
+      ctx.ui.notify(
+        "WORK phase - AUTO_ALL 全同意已启用；cmd/powershell 需传 auto_all=true 和 purpose，受保护路径仍硬拦截，不调用 AI 审批。",
+        "warning",
+      );
+    },
+  });
+
+  registerAutoFlashCommand(pi);
 
   pi.registerCommand("yolo", {
     description: "Compatibility alias for /auto",

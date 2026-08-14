@@ -5,20 +5,14 @@
  * 不发送任何消息，不污染对话上下文。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { estimateTokens as estimatePiTokens } from "@earendil-works/pi-agent-core";
 import { Box, Text, matchesKey, Key, type Component } from "@earendil-works/pi-tui";
 
 // ---- helpers ----
 
-/** 粗略估算 token 数（1 token ≈ 4 英文字符 ≈ 1.5 中文字符） */
+/** Keep the breakdown on Pi's native chars/4 estimator. */
 function estimateTokens(text: string): number {
-  let tokens = 0;
-  for (const char of text) {
-    const code = char.codePointAt(0) ?? 0;
-    if (code >= 0x4e00) tokens += 1 / 1.5;        // CJK
-    else if (char === " " || char === "\n") tokens += 1 / 6;
-    else tokens += 1 / 4;                           // ASCII/其他
-  }
-  return Math.round(tokens);
+  return estimatePiTokens({ role: "user", content: text, timestamp: 0 } as any);
 }
 
 function fmt(n: number): string {

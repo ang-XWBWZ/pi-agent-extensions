@@ -179,6 +179,16 @@ export default function (pi: ExtensionAPI) {
             "Timeout in seconds (default: 60, no upper cap; 0/负数自动兜底到 60)",
         }),
       ),
+      purpose: Type.Optional(
+        Type.String({
+          description: "用途说明，供审批人员判断命令是否符合当前任务",
+        }),
+      ),
+      auto_all: Type.Optional(
+        Type.Boolean({
+          description: "请求 AUTO_ALL 全放行；只有用户显式执行 /auto_all 后才生效",
+        }),
+      ),
     }),
 
     // ============================================================
@@ -196,6 +206,8 @@ export default function (pi: ExtensionAPI) {
       }
       return renderCommandToolCall(theme, context, "PS>", args.command, [
         { name: "timeout", value: args.timeout, tone: "muted" },
+        { name: "purpose", value: args.purpose, tone: "accent", maxLength: 120 },
+        { name: "auto_all", value: args.auto_all, tone: "warning" },
       ]);
     },
 

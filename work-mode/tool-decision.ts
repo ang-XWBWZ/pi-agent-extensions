@@ -28,8 +28,17 @@ export interface ConfirmDecision {
   target: string;
   allowlist: "path" | "cmd" | "action";
   confirmedLabel: string;
+  purpose?: string;
   remember?: boolean;
   onEdit?: (edited: string) => boolean;
+}
+
+export interface AutoFlashDecision {
+  command: string;
+  toolName?: string;
+  purpose?: string;
+  cwd: string;
+  effect: ToolEffect;
 }
 
 export interface ToolDecision {
@@ -39,6 +48,7 @@ export interface ToolDecision {
   warning?: string;
   target?: string;
   confirm?: ConfirmDecision;
+  flashReview?: AutoFlashDecision;
 }
 
 const SHELL_TOOLS = new Set(["bash", "cmd", "powershell"]);
@@ -91,6 +101,13 @@ function inputOf(event: { input?: unknown }): Record<string, unknown> {
 function commandOf(event: { input?: unknown }): string {
   const command = inputOf(event).command;
   return typeof command === "string" ? command.trim() : "";
+}
+
+function purposeOf(event: { input?: unknown }): string | undefined {
+  const purpose = inputOf(event).purpose;
+  if (typeof purpose !== "string") return undefined;
+  const value = purpose.replace(/\s+/g, " ").trim();
+  return value ? value.slice(0, 240) : undefined;
 }
 
 function pathOf(
@@ -329,6 +346,18 @@ function allow(effect: ToolEffect, target?: string): ToolDecision {
   return { action: "allow", effect, target };
 }
 
+function allowWithFlash(
+  effect: ToolEffect,
+  target: string,
+  request: AutoFlashDecision,
+): ToolDecision {
+  return { action: "allow", effect, target, flashReview: request };
+}
+
+function usesAiApproval(profile: ExecutionProfile): boolean {
+  return profile.approval === "never_ask" && profile.autoAll !== true;
+}
+
 function ask(
   effect: ToolEffect,
   type: ConfirmDecision["type"],
@@ -337,6 +366,7 @@ function ask(
   allowlist: ConfirmDecision["allowlist"],
   onEdit?: (edited: string) => boolean,
   remember = true,
+  purpose?: string,
 ): ToolDecision {
   return {
     action: "ask",
@@ -348,6 +378,7 @@ function ask(
       target,
       allowlist,
       confirmedLabel: `${label} confirmed`,
+      purpose,
       remember,
       onEdit,
     },
@@ -373,6 +404,7 @@ function decideFileCall(
   const mutation = FILE_MUTATION_TOOLS.has(event.toolName);
   const targetPath = pathOf(event, ctx.cwd);
   const effect: ToolEffect = mutation ? "workspace_write" : "read";
+  const purpose = purposeOf(event);
 
   if (mutation && targetPath && isProtectedPath(targetPath)) {
     return deny(
@@ -396,6 +428,15 @@ function decideFileCall(
     );
   }
   if (!targetPath) {
+    if (usesAiApproval(profile)) {
+      return allowWithFlash("unknown", event.toolName, {
+        command: event.toolName,
+        toolName: event.toolName,
+        purpose,
+        cwd: ctx.cwd,
+        effect: "unknown",
+      });
+    }
     return ask(
       "unknown",
       "action",
@@ -404,15 +445,28 @@ function decideFileCall(
       "action",
       undefined,
       false,
+      purpose,
     );
   }
   if (targetPath && !isUnder(ctx.cwd, targetPath)) {
+    if (usesAiApproval(profile)) {
+      return allowWithFlash(effect, targetPath, {
+        command: targetPath,
+        toolName: event.toolName,
+        purpose,
+        cwd: ctx.cwd,
+        effect,
+      });
+    }
     return ask(
       effect,
       "path",
       mutation ? "Outside-workspace write" : "Outside-workspace read",
       targetPath,
       "path",
+      undefined,
+      true,
+      purpose,
     );
   }
   return allow(effect, targetPath);
@@ -424,8 +478,11 @@ function decideShellCall(
   ctx: ExtensionContext,
 ): ToolDecision {
   const command = commandOf(event);
+  const input = inputOf(event);
+  const purpose = purposeOf(event);
   const risk = classifyCommandRisk(command);
   const paths = referencedCommandPaths(command, ctx.cwd);
+  const unverifiablePath = hasUnverifiableCommandPath(command);
   const protectedPathIsMetadataOnly =
     splitCommand(command).length > 0 &&
     splitCommand(command).every((part) => /^git\s+(?:add|status|diff)\b/i.test(part));
@@ -463,7 +520,7 @@ function decideShellCall(
         command,
       );
     }
-    if (hasUnverifiableCommandPath(command)) {
+    if (unverifiablePath) {
       return deny(
         "unknown",
         "PLAN cannot verify an environment-expanded path.",
@@ -477,8 +534,36 @@ function decideShellCall(
           "Outside-workspace terminal read",
           outsideTarget,
           "path",
+          undefined,
+          true,
+          purpose,
         )
       : allow("read", command);
+  }
+  // AUTO_ALL is explicit user consent: protected paths were checked above,
+  // and every other command skips the ordinary approval/reviewer gate.
+  if (profile.autoAll && (input.auto_all === true || event.toolName === "bash")) {
+    return allow(effect, command);
+  }
+
+  // AUTO is AI approval. Safe in-workspace reads/routine work and the
+  // existing scoped-persistence allowlist continue without a redundant model
+  // round trip; every boundary that would otherwise ask a person is reviewed
+  // by AUTO_FLASH instead.
+  if (usesAiApproval(profile)) {
+    const safeScopedCommand =
+      !outsideTarget &&
+      !unverifiablePath &&
+      (risk === "read" || risk === "routine" ||
+        (risk === "persistent" && isAutoScopedPersistentCommand(command)));
+    if (safeScopedCommand) return allow(effect, command);
+    return allowWithFlash(effect, command, {
+      command,
+      toolName: event.toolName,
+      purpose,
+      cwd: ctx.cwd,
+      effect,
+    });
   }
   if (risk === "destructive") {
     return ask(
@@ -492,6 +577,7 @@ function decideShellCall(
         return true;
       },
       false,
+      purpose,
     );
   }
   if (outsideTarget) {
@@ -501,9 +587,12 @@ function decideShellCall(
       "Outside-workspace terminal action",
       outsideTarget,
       "path",
+      undefined,
+      true,
+      purpose,
     );
   }
-  if (hasUnverifiableCommandPath(command)) {
+  if (unverifiablePath) {
     return ask(
       "unknown",
       "command",
@@ -515,6 +604,7 @@ function decideShellCall(
         return true;
       },
       false,
+      purpose,
     );
   }
   if (risk === "read" || risk === "routine") return allow(effect, command);
@@ -536,6 +626,7 @@ function decideShellCall(
       return true;
     },
     risk === "persistent",
+    purpose,
   );
 }
 
@@ -570,6 +661,7 @@ function decideToolCallBase(
   }
 
   const input = inputOf(event);
+  const purpose = purposeOf(event);
   const effect = classifyCustomToolEffect(event.toolName, input);
   const target = describeCustomTarget(event.toolName, input);
   const path = customPath(input, ctx.cwd);
@@ -590,6 +682,9 @@ function decideToolCallBase(
           "Outside-workspace tool read",
           path,
           "path",
+          undefined,
+          true,
+          purpose,
         )
       : allow(effect, target);
   }
@@ -608,6 +703,7 @@ function decideToolCallBase(
         "action",
         undefined,
         false,
+        purpose,
       );
     }
     return effect === "progress" &&
@@ -618,6 +714,40 @@ function decideToolCallBase(
           `${event.toolName} is not a read-only PLAN operation.`,
           target,
         );
+  }
+
+  if (path && isProtectedPath(path) && effect !== "read") {
+    return deny(
+      "destructive",
+      `Protected paths cannot be modified by ${event.toolName}: ${path}`,
+      path,
+    );
+  }
+
+  if (profile.autoAll) {
+    return allow(effect, target);
+  }
+
+  if (usesAiApproval(profile)) {
+    if (effect === "read" || effect === "progress" || effect === "workspace_write") {
+      if (path && !isUnder(ctx.cwd, path)) {
+        return allowWithFlash(effect, path, {
+          command: target,
+          toolName: event.toolName,
+          purpose,
+          cwd: ctx.cwd,
+          effect,
+        });
+      }
+      return allow(effect, target);
+    }
+    return allowWithFlash(effect, target, {
+      command: target,
+      toolName: event.toolName,
+      purpose,
+      cwd: ctx.cwd,
+      effect,
+    });
   }
 
   // A server-level always-allow rule is an explicit local preference, but it
@@ -642,6 +772,7 @@ function decideToolCallBase(
       "action",
       undefined,
       false,
+      purpose,
     );
   }
   if (path && !isUnder(ctx.cwd, path)) {
@@ -651,6 +782,9 @@ function decideToolCallBase(
       "Outside-workspace tool action",
       path,
       "path",
+      undefined,
+      true,
+      purpose,
     );
   }
   if (
@@ -670,6 +804,9 @@ function decideToolCallBase(
     "Persistent tool action",
     target,
     "action",
+    undefined,
+    true,
+    purpose,
   );
 }
 

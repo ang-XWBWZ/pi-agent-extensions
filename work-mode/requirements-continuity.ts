@@ -443,15 +443,35 @@ export function setupRequirementsContinuity(pi: ExtensionAPI): void {
 
   pi.on("context", (event, ctx) => {
     const checkpoint = currentCheckpoint(ctx.sessionManager.getBranch(), latest);
+    const existingAnchor = event.messages.find((message) => {
+      const record = asRecord(message);
+      return record?.role === "user" &&
+        typeof record.content === "string" &&
+        record.content.startsWith(REQUIREMENTS_CONTINUITY_MARKER);
+    });
     const messages = removeExistingAnchor(event.messages);
     if (!checkpoint) {
       return messages.length === event.messages.length ? undefined : { messages };
     }
-    messages.push({
-      role: "user",
-      content: buildContinuityAnchor(checkpoint),
-      timestamp: Date.now(),
-    });
-    return { messages: messages as typeof event.messages };
+    const content = buildContinuityAnchor(checkpoint);
+    if (
+      existingAnchor &&
+      asRecord(existingAnchor)?.content === content &&
+      messages.length === event.messages.length - 1
+    ) {
+      return;
+    }
+    return {
+      messages: [
+        ...messages,
+        {
+          role: "user",
+          content,
+          timestamp: typeof asRecord(existingAnchor)?.timestamp === "number"
+            ? asRecord(existingAnchor)?.timestamp
+            : 0,
+        } as any,
+      ] as typeof event.messages,
+    };
   });
 }

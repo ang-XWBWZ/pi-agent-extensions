@@ -18,6 +18,7 @@ export interface PhaseEntry {
   data: {
     phase: ConversationPhase;
     autonomy?: "guarded" | "auto";
+    autoAll?: boolean;
   };
 }
 

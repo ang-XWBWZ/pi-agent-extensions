@@ -564,11 +564,16 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const currentText = formatPs(st, selected);
+    const existingText = existingIdx >= 0 && typeof event.messages[existingIdx]?.content === "string"
+      ? event.messages[existingIdx]?.content
+      : undefined;
+    if (existingText === currentText) return;
+
     for (const it of selected) {
       coolDownAfterInject(st, it);
     }
 
-    const currentText = formatPs(st, selected);
     const cleaned = existingIdx >= 0
       ? [...event.messages.slice(0, existingIdx), ...event.messages.slice(existingIdx + 1)]
       : [...event.messages];

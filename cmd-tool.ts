@@ -120,6 +120,16 @@ export default function (pi: ExtensionAPI) {
           description: "Code page for cmd.exe output encoding (defaults to system code page; use 936 for GBK on Chinese Windows)",
         })
       ),
+      purpose: Type.Optional(
+        Type.String({
+          description: "用途说明，供审批人员判断命令是否符合当前任务",
+        }),
+      ),
+      auto_all: Type.Optional(
+        Type.Boolean({
+          description: "请求 AUTO_ALL 全放行；只有用户显式执行 /auto_all 后才生效",
+        }),
+      ),
     }),
 
     renderCall(args, theme, context) {
@@ -134,6 +144,8 @@ export default function (pi: ExtensionAPI) {
       return renderCommandToolCall(theme, context, ">", args.command, [
         { name: "timeout", value: args.timeout, tone: "muted" },
         { name: "codepage", value: args.codepage, tone: "muted" },
+        { name: "purpose", value: args.purpose, tone: "accent", maxLength: 120 },
+        { name: "auto_all", value: args.auto_all, tone: "warning" },
       ]);
     },
 

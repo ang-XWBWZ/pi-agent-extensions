@@ -15,6 +15,7 @@ import {
 import { getExecutionContext } from "../lib/execution-context.js";
 import { type ConversationPhase, type PlanStep } from "./types.js";
 import { confirmAndRemember } from "./confirm-dialog.js";
+import { reviewWithAutoFlash } from "./auto-flash.js";
 import { profileFromPhase } from "./execution-profile.js";
 import {
   decideToolCall,
@@ -29,7 +30,6 @@ export interface PermissionState {
   pathAllowlist: Set<string>;
   cmdAllowlist: Set<string>;
   actionAllowlist: Set<string>;
-  confirmedCalls: Map<string, string>;
 }
 
 export interface PermissionCallbacks {
@@ -52,7 +52,21 @@ async function applyDecision(
   if (decision.warning) {
     ctx.ui.notify(decision.warning, "warning");
   }
-  if (decision.action === "allow") return;
+  if (decision.action === "allow") {
+    if (decision.flashReview) {
+      const review = await reviewWithAutoFlash(ctx, decision.flashReview);
+      if (!review.allow) {
+        return {
+          block: true,
+          reason: review.reason,
+        };
+      }
+      if (!review.skipped) {
+        ctx.ui.notify(`AUTO_FLASH 已通过${review.modelRef ? `（${review.modelRef}）` : ""}：${review.reason}`, "info");
+      }
+    }
+    return;
+  }
 
   if (decision.action === "deny") {
     return {
@@ -74,6 +88,7 @@ async function applyDecision(
     decision.confirm.type,
     decision.confirm.label,
     decision.confirm.target,
+    decision.confirm.purpose,
     state.isSubAgent,
     decision.confirm.onEdit,
     decision.confirm.remember !== false,
@@ -84,11 +99,11 @@ async function applyDecision(
       reason: `${event.toolName} was denied by the user`,
     };
   }
-  if (approved === "dialog") {
-    state.confirmedCalls.set(
-      event.toolCallId,
-      decision.confirm.confirmedLabel,
-    );
+  if (typeof approved === "object") {
+    return {
+      block: true,
+      reason: `${event.toolName} was denied by the user: ${approved.reason}`,
+    };
   }
 }
 
@@ -184,21 +199,4 @@ export function setupPermissionGuard(
     );
   });
 
-  pi.on("tool_result", (event) => {
-    const label = state.confirmedCalls.get(event.toolCallId);
-    if (!label) return;
-    state.confirmedCalls.delete(event.toolCallId);
-    const index = event.content.findIndex(
-      (item: { type: string }) => item.type === "text",
-    );
-    if (index >= 0) {
-      const item = event.content[index];
-      if (item.type === "text") {
-        event.content[index] = {
-          ...item,
-          text: `[${label}]\n${item.text}`,
-        };
-      }
-    }
-  });
 }

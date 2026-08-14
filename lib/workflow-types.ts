@@ -63,6 +63,8 @@ export interface ExecutionContext {
     interactive: boolean;
     preauthorized: boolean;
     inheritToChildren: boolean;
+    /** Explicit user-enabled full command authorization for this session. */
+    autoAll?: boolean;
   };
   runtime: {
     cwd: string;

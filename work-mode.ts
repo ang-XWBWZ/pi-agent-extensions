@@ -14,6 +14,7 @@ import {
   setupRequirementsFeature,
 } from "./work-mode/requirements-feature.js";
 import { setupRequirementsContinuity } from "./work-mode/requirements-continuity.js";
+import { registerAutoFlashCommand } from "./work-mode/auto-flash.js";
 import { getExecutionContext, setExecutionContext } from "./lib/execution-context.js";
 
 // ============================================================
@@ -21,6 +22,8 @@ import { getExecutionContext, setExecutionContext } from "./lib/execution-contex
 // ============================================================
 
 export default function (pi: ExtensionAPI) {
+  registerAutoFlashCommand(pi);
+
   // ---- Shared state ----
   const initialExecutionContext = getExecutionContext();
   const isSubAgent = !!((globalThis as Record<string, unknown>).__pi_is_sub_agent);
@@ -42,7 +45,6 @@ export default function (pi: ExtensionAPI) {
     pathAllowlist: new Set<string>(),
     cmdAllowlist: new Set<string>(),
     actionAllowlist: new Set<string>(),
-    confirmedCalls: new Map<string, string>(),
   };
 
   resetStepIdCounter(0);
@@ -53,10 +55,11 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry("work-phase-state", {
       phase: s.phase,
       autonomy: executionContext.autonomy,
+      autoAll: executionContext.approval.autoAll,
     });
     ctx.ui.setStatus(
       "work-mode",
-      `${s.phase.toUpperCase()} · ${executionContext.autonomy.toUpperCase()}`,
+      `${s.phase.toUpperCase()} · ${executionContext.approval.autoAll ? "AUTO_ALL" : executionContext.autonomy.toUpperCase()}`,
     );
   }
 
@@ -73,6 +76,7 @@ export default function (pi: ExtensionAPI) {
         interactive: autonomy !== "auto",
         preauthorized: autonomy === "auto",
         inheritToChildren: autonomy === "auto",
+        autoAll: false,
       },
     });
     persist(ctx);
@@ -97,7 +101,6 @@ export default function (pi: ExtensionAPI) {
 
   setupCore(pi, s, {
     resetForNewTurn: () => {
-      s.confirmedCalls.clear();
     },
   });
 

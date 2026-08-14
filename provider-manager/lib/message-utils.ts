@@ -3,10 +3,11 @@
  */
 
 import { type Api, type AssistantMessage, calculateCost } from "@earendil-works/pi-ai";
+import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
-/** Fixed output headroom included in custom-provider context occupancy. */
-export const CUSTOM_PROVIDER_CONTEXT_RESERVE_TOKENS = 1_024;
+/** Retained as a compatibility export; Pi's native estimate has no fixed reserve. */
+export const CUSTOM_PROVIDER_CONTEXT_RESERVE_TOKENS = 0;
 
 function serializeForTokenEstimate(value: unknown): string {
   if (typeof value === "string") return value;
@@ -17,47 +18,48 @@ function serializeForTokenEstimate(value: unknown): string {
   }
 }
 
-/**
- * Estimate tokens from the exact local payload representation. ASCII follows
- * Pi's chars/4 convention; CJK and other BMP text count as one token per
- * character, while astral symbols use two tokens conservatively.
- */
+/** Estimate an arbitrary payload through Pi's native AgentMessage estimator. */
 export function estimateLocalPayloadTokens(value: unknown): number {
-  const serialized = serializeForTokenEstimate(value);
-  let tokens = 0;
-  for (const char of serialized) {
-    const codePoint = char.codePointAt(0) ?? 0;
-    if (codePoint <= 0x7f) tokens += 0.25;
-    else if (codePoint > 0xffff) tokens += 2;
-    else tokens += 1;
-  }
-  return Math.ceil(tokens);
+  return estimateTokens({
+    role: "user",
+    content: serializeForTokenEstimate(value),
+    timestamp: 0,
+  } as any);
 }
 
 function estimateLocalReplyTokens(content: unknown): number {
   if (!Array.isArray(content)) return estimateLocalPayloadTokens(content);
-
-  let tokens = 0;
-  for (const block of content) {
+  const normalized = content.map((block) => {
     if (!block || typeof block !== "object") {
-      tokens += estimateLocalPayloadTokens(block);
-      continue;
+      return { type: "text", text: serializeForTokenEstimate(block) };
     }
     const typedBlock = block as Record<string, unknown>;
-    if (typedBlock.type === "text") {
-      tokens += estimateLocalPayloadTokens(typedBlock.text);
-    } else if (typedBlock.type === "thinking") {
-      tokens += estimateLocalPayloadTokens(typedBlock.thinking);
-    } else if (typedBlock.type === "toolCall") {
-      tokens += estimateLocalPayloadTokens({
-        name: typedBlock.name,
-        arguments: typedBlock.arguments,
-      });
-    } else {
-      tokens += estimateLocalPayloadTokens(typedBlock);
+    if (typedBlock.type === "text" && typeof typedBlock.text === "string") {
+      return { type: "text", text: typedBlock.text };
     }
-  }
-  return tokens;
+    if (typedBlock.type === "thinking" && typeof typedBlock.thinking === "string") {
+      return { type: "thinking", thinking: typedBlock.thinking, thinkingSignature: typedBlock.thinkingSignature as string | undefined };
+    }
+    if (typedBlock.type === "toolCall") {
+      return {
+        type: "toolCall",
+        id: String(typedBlock.id ?? ""),
+        name: String(typedBlock.name ?? "tool"),
+        arguments: typedBlock.arguments ?? {},
+      };
+    }
+    return { type: "text", text: serializeForTokenEstimate(typedBlock) };
+  });
+  return estimateTokens({
+    role: "assistant",
+    content: normalized,
+    api: "custom-provider",
+    provider: "custom-provider",
+    model: "custom-provider",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: 0,
+  } as any);
 }
 
 export interface CustomProviderContextUsage {
@@ -67,7 +69,7 @@ export interface CustomProviderContextUsage {
   totalTokens: number;
 }
 
-/** Local sent payload + provider reply (or local fallback) + fixed 1K reserve. */
+/** Local sent payload + provider reply, following Pi's chars/4 estimator. */
 export function calculateCustomProviderContextUsage(
   sentPayload: unknown,
   replyContent: unknown,
@@ -80,7 +82,7 @@ export function calculateCustomProviderContextUsage(
   const replyTokens = Number.isFinite(parsedReplyTokens) && parsedReplyTokens > 0
     ? Math.floor(parsedReplyTokens)
     : estimateLocalReplyTokens(replyContent);
-  const reserveTokens = CUSTOM_PROVIDER_CONTEXT_RESERVE_TOKENS;
+  const reserveTokens = 0;
   return {
     sentTokens,
     replyTokens,
@@ -90,9 +92,9 @@ export function calculateCustomProviderContextUsage(
 }
 
 /**
- * Apply local context accounting while preserving provider-reported cache and
- * cost data. The local sent amount is partitioned into uncached input plus the
- * reported cache components so cache is never added twice to occupancy.
+ * Apply local context accounting while preserving provider-reported cache,
+ * total, and cost data. Pi's native context calculation is used for the
+ * fallback total when the provider does not report one.
  */
 export function applyCustomProviderContextUsage(
   usage: AssistantMessage["usage"],
@@ -110,11 +112,14 @@ export function applyCustomProviderContextUsage(
   const cacheWrite = Number.isFinite(usage.cacheWrite) && usage.cacheWrite > 0
     ? usage.cacheWrite
     : 0;
-  return {
+  const nextUsage = {
     ...usage,
     input: Math.max(0, local.sentTokens - cacheRead - cacheWrite),
     output: local.replyTokens,
-    totalTokens: local.totalTokens,
+  };
+  return {
+    ...nextUsage,
+    totalTokens: calculateContextTokens(nextUsage as any) || local.totalTokens,
   };
 }
 
