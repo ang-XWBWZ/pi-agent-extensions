@@ -1,68 +1,129 @@
 # Pi Agent Extensions
 
-> 给 pi coding agent 装上工程化能力：并行子 Agent、Windows 双引擎、受控工作流、上下文观测、模型管理和 MCP 接入。
+> 中文说明在前，English documentation follows.
 
-这是面向 GitHub 的公开发布目录。它是从主开发树筛选出的可直接安装版本，不包含工作区笔记、内部报告、私有 Pwiki 数据、测试夹具或凭据。扩展通过 pi 的 Extension API 工作，不修改 pi 内核。
+Pi Agent Extensions gives [pi coding agent](https://github.com/badlogic/pi-mono) a
+structured runtime for parallel work, guarded execution, model routing,
+Windows command execution, context tracking, and local MCP integration.
 
-## 能力概览
+This directory is the public GitHub distribution. It contains the runnable
+extension source and the public Pwiki usage skill, but not private workspaces,
+internal reports, local indexes, test fixtures, or credentials. The extensions
+use pi's Extension API and do not modify pi's core.
 
-| 模块 | 主要能力 | 入口 |
+## 中文说明
+
+### 这是什么
+
+这是面向 pi coding agent 的工程化扩展集合，重点是把“能执行工具”变成
+“按阶段、按授权、可观察、可恢复地执行工作”。扩展保持 TypeScript 源码形态，
+由 pi 在加载时解析；安装后执行 /reload 即可重新加载。
+
+### 当前能力
+
+| 模块 | 能力 | 主要入口 |
 | --- | --- | --- |
-| 并行 Agent | 后台派发、轮询、输出读取、消息通信、暂停/恢复/终止、存档与任务面板 | `parallel-agent.ts` |
-| 工作流与安全 | Chat / Plan / Work / Auto 阶段，Work Contract，计划面板，路径保护，脱敏审计 | `work-mode.ts` |
-| Windows 命令 | 通过 `cmd.exe` 和 PowerShell 执行命令，处理代码页、超时、截断和进程树 | `cmd-tool.ts`、`powershell-tool.ts` |
-| 模型与供应商 | 模型热切换、层级与思考深度、OpenAI/Anthropic 兼容供应商注册和发现 | `model-switch.ts`、`provider-manager.ts` |
-| 上下文与记忆 | Token 状态、上下文明细、长程注意力提醒和工作目标记录 | `context-usage.ts`、`token-stats.ts`、`long-attention-ps.ts`、`work-goal-mode.ts` |
-| MCP Bridge | 管理本机 stdio MCP Server，读取目录，按策略调用工具 | `mcp/` |
+| 工作阶段与授权 | CHAT / PLAN / WORK，受控授权、AUTO AI 审批、AUTO_ALL 显式全同意、Work Contract、计划和安全评审 | work-mode.ts、work-mode/ |
+| AUTO_FLASH | 为 /auto 配置 AI 安全审批模型；审批失败、模型错误和中止会显式返回，不会伪装成普通 JSON 拒绝 | work-mode/auto-flash.ts |
+| 并行 Agent | 派发独立子任务、轮询/等待结果、读取输出、消息通信、暂停/恢复/终止、阶段面板、超时恢复记录 | parallel-agent.ts、parallel-agent/ |
+| 模型与层级 | 直接切换 provider/model，维护 L0/L1/L2 模型层级，设置默认思考深度 | model-switch.ts、model-switch/ |
+| 自定义供应商 | 注册和恢复自定义 provider，发现模型，兼容 OpenAI 风格和 Anthropic 流式响应，处理供应商流结束字段差异 | provider-manager.ts、provider-manager/ |
+| Windows 命令 | 通过 cmd.exe 和 PowerShell 执行命令，支持代码页、超时、输出截断、进程树清理和目的说明 | cmd-tool.ts、powershell-tool.ts |
+| 上下文与长程注意力 | 查看 token/context 状态，记录和管理阶段性提醒，维护工作目标及可恢复状态 | context-usage.ts、token-stats.ts、long-attention-ps.ts、work-goal-mode.ts |
+| MCP Bridge | 管理本机 stdio MCP Server，发现工具/提示/资源，按策略调用工具并区分只读、持久化和破坏性操作 | mcp/ |
 
-常用工具包括 `spawn_agent`、`check_agent_results`、`read_agent_output`、`control_agent`、`send_agent_message`、`manage_plan`、`manage_providers`、`switch_model`、`work_goal_*`、`mcp_manage`、`mcp_discover` 和 `mcp_call`。具体 schema 以运行中的 pi 注册结果为准。
+常见工具包括：
 
-## 安装
+spawn_agent、check_agent_results、read_agent_output、control_agent、
+send_agent_message、update_agent_task、manage_skills、manage_tools、
+manage_plan、manage_requirements、work_goal_*、manage_providers、
+switch_model、mcp_manage、mcp_discover 和 mcp_call。
 
-### 直接安装公开版本
+实际注册的 schema 以当前 pi 运行时为准。
 
-需要先安装并能正常运行 [pi coding agent](https://github.com/badlogic/pi-mono)。然后把本仓库克隆到 pi 的扩展目录：
+### 授权模型
+
+| 阶段/模式 | 行为 |
+| --- | --- |
+| CHAT | 只对话和澄清，不执行仓库副作用。命令：/chat |
+| PLAN | 只读调查、需求确认和计划维护，不执行实现副作用。命令：/plan |
+| WORK | 受控执行，普通操作可继续，敏感、未知、破坏性或受保护操作仍需处理。命令：/work |
+| AUTO | 在 WORK 中使用配置的 AI 审批模型处理需要审批的命令边界。命令：/auto |
+| AUTO_ALL | 用户明确同意所有非保护性命令调用；仍不绕过受保护路径和硬安全边界。命令：/auto_all |
+
+AUTO 不是 AUTO_ALL 的别名，也不会自动授予更高权限。使用 /auto 前先配置
+审批模型：
+
+```text
+/auto_flash <provider>/<model>
+```
+
+也可以只执行 /auto_flash 从当前可用模型中选择，或执行 /auto_flash off
+关闭审批模型。未配置审批模型时，/auto 会提示并拒绝需要 AI 审批的边界；
+/auto_all 仍是独立的显式全同意模式。cmd 和 powershell 在 AUTO_ALL 下还
+要求调用参数包含 auto_all=true 与 purpose。
+
+### 安装公开版本
+
+先安装并确认 [pi coding agent](https://github.com/badlogic/pi-mono) 可以正常运行，
+然后将仓库克隆到 pi 的扩展目录：
 
 ```bash
 git clone https://github.com/ang-XWBWZ/pi-agent-extensions.git ~/.pi/agent/extensions
 ```
 
-如果扩展目录已经存在，可以把仓库内容复制到该目录，保留已有的个人配置；不要把 `mcp/node_modules` 等运行时依赖提交回仓库。
+已有目录可以更新：
 
-安装或更新后，在 pi 中执行：
+```bash
+cd ~/.pi/agent/extensions
+git pull --ff-only
+```
+
+回到 pi 执行：
 
 ```text
 /reload
 ```
 
-### 启用 MCP Bridge
+如果只使用普通扩展，不需要安装 MCP Bridge 的依赖。不要把本地
+mcp/node_modules、配置文件、运行时状态或个人凭据提交回仓库。
 
-MCP Bridge 依赖 Node.js 和官方 SDK。进入扩展目录安装运行时依赖：
+### MCP Bridge
+
+MCP Bridge 依赖 Node.js 和官方 MCP SDK，默认管理本机 stdio Server：
 
 ```bash
 cd ~/.pi/agent/extensions/mcp
 npm install --omit=dev --ignore-scripts
 ```
 
-然后重新加载 pi。Bridge 默认只启动本机 stdio Server，配置文件位于：
+配置文件默认位于 ~/.pi/agent/mcp-servers.json，也可以用 PI_MCP_CONFIG
+指定路径。推荐的首次检查顺序是：
 
 ```text
-~/.pi/agent/mcp-servers.json
+mcp_manage(action="list")
+mcp_manage(action="status", name="example")
+mcp_manage(action="tools", name="example")
+mcp_discover(action="catalog", server="example")
+mcp_discover(action="tool", server="example", name="tool_name")
+mcp_call(server="example", tool="tool_name", arguments={})
 ```
 
-也可以通过 `PI_MCP_CONFIG` 指定其他配置路径。首次接入外部 Server 时，建议先用 `mcp_manage(action="tools")` 和 `mcp_discover(action="catalog")` 检查其真实能力，再执行 `mcp_call`。
+先用 mcp_manage 查看服务器和真实工具 schema，再调用 mcp_call。Bridge
+不会把环境变量值回显；服务器策略支持 strict 和 Pwiki 专用的 pwiki。
+未知或破坏性操作不会因为服务器被设为 always-allow 就自动绕过确认。
 
-## 接入 Pwiki
+### Pwiki 知识库接入
 
-Pwiki 是独立的知识库项目，不再内嵌到本仓库的扩展代码中。需要在终端使用 Pwiki CLI 或通过 MCP 给 pi 使用时，可直接安装公开 npm 包：
+Pwiki 是独立项目，不包含在本仓库的扩展代码中。需要 CLI 或 MCP 时安装公开包：
 
 ```bash
 npm install -g @llangtop/pwiki-cli @llangtop/pwiki-mcp
 ```
 
-Pwiki 当前发布包要求 Node.js 22 或更高版本。只使用扩展而不接入 Pwiki 时，不需要安装这些包。
+当前 Pwiki 包要求 Node.js 22 或更高版本。只使用扩展时不需要安装 Pwiki。
 
-安装 `@llangtop/pwiki-mcp` 后，在 pi 对话中配置一个已审查的 Server：
+安装 @llangtop/pwiki-mcp 后，可在 pi 中配置一个经过审查的 Server：
 
 ```text
 mcp_manage(
@@ -74,73 +135,74 @@ mcp_manage(
 )
 ```
 
-接着按顺序确认服务和工具：
+仓库中的 skills/pi-wiki/SKILL.md 是 Pwiki 操作纪律：搜索优先使用只读工具，
+编辑、刷新、语义模型和编译操作按风险分级，禁止绕过 wiki 工具直接操作索引和
+向量文件。它是使用说明，不是 Pwiki Server 本身。
+
+### 常用工作流
+
+#### 受控实现
 
 ```text
-mcp_manage(action="tools", name="pwiki")
-mcp_discover(action="catalog", server="pwiki")
-mcp_discover(action="tool", server="pwiki", name="wiki_status")
-mcp_call(server="pwiki", tool="wiki_status", arguments={})
+/chat             只讨论
+/plan             只读调查和需求确认
+/work             受控执行
+/auto_flash ...   配置 AUTO 审批模型
+/auto             AI 审批模式
+/auto_all         显式全同意非保护性命令
+/security-review  启动安全评审
 ```
 
-`policy="pwiki"` 会把搜索和读取视为只读，把条目/索引修改视为持久化操作，把卸载数据源视为破坏性操作。Chat 和 Plan 阶段不会因为该策略自动获得写权限。
+/yolo 只是 /auto 的兼容别名。执行阶段仍受运行时授权、路径保护和工具
+安全网约束。
 
-## 常用工作流
+#### 并行工作
 
-### 受控开发
+使用 spawn_agent 派发有明确目标、范围、允许/禁止工具和停止条件的独立任务；
+用 check_agent_results 轮询或等待，用 read_agent_output 读取输出，用
+control_agent 管理生命周期，用 update_agent_task 写入阶段进度和结论。
+已完成结果可以自动注入，但仍应使用任务面板和结果工具确认状态。
+
+#### 模型路由
+
+switch_model 支持直接切换 provider/model、查看当前模型，以及维护 L0/L1/L2
+层级。命令行辅助命令包括：
 
 ```text
-/chat    只讨论，不执行仓库操作
-/plan    只读调查并形成 Work Contract
-/work    执行已接受的计划
-/auto    在已授权范围内连续执行
-/security-review
+/tier
+/tier-add <L0|L1|L2> <provider> <model> [--thinking <level>]
+/tier-remove <L0|L1|L2> [<provider> <model>]
+/tier-set-thinking <L0|L1|L2> <off|minimal|low|medium|high|xhigh|max>
+/tier-config
 ```
 
-`/yolo` 保留为 `/auto` 的兼容别名。Work 阶段仍会拦截破坏性、未知、越界和受保护路径操作；Auto 不是绕过安全边界的开关。
+#### Windows 命令
 
-### 并行拆分
+Windows 用户使用 cmd 或 powershell 工具，并明确命令目的、超时和所需代码页。
+Linux/macOS 用户继续使用 pi 原生 bash，不需要为本扩展额外安装 PowerShell。
 
-主 Agent 可以把独立工作拆给后台子 Agent：
-
-```text
-spawn_agent          派发一个或多个任务
-check_agent_results   轮询或等待结果
-read_agent_output     按游标读取完整原始输出
-update_agent_task     更新任务状态、进度和结论
-control_agent         查看、暂停、恢复、终止或存档
-```
-
-子 Agent 的状态、面板和输出写入当前用户的 pi 状态目录；仓库本身不会携带这些运行时数据。
-
-### Windows 中文命令
-
-在 Windows 上，扩展提供两个工具：
-
-- `cmd`：适合 `dir`、`type`、`where` 等轻量命令；可指定代码页，例如 `936`。
-- `powershell`：适合结构化输出、中文搜索和复杂脚本；使用编码命令降低 ANSI 代码页造成的乱码风险。
-
-Linux/macOS 用户继续使用 pi 原生 `bash`；不需要为了本扩展额外安装 PowerShell。只有当你的实际任务需要运行 PowerShell 脚本时，才单独安装对应运行时。
-
-## 目录结构
+### 目录与公开边界
 
 ```text
 .
 ├── *.ts                    # pi 顶层扩展入口
 ├── lib/                    # 执行上下文、审计、消息总线和 TUI 辅助
-├── parallel-agent/         # 子 Agent 调度、通信、任务和输出工具
-├── model-switch/           # 模型层级、默认值和热切换工具
-├── provider-manager/       # 自定义供应商、发现和流式兼容层
-├── work-mode/              # 阶段、计划、权限和安全评审
-├── mcp/                    # 独立的 stdio MCP Bridge 包
-└── skills/pi-wiki/         # Pwiki MCP 的使用纪律和操作流程
+├── parallel-agent/         # 子 Agent、任务面板和输出管理
+├── model-switch/           # 模型层级和思考深度
+├── provider-manager/       # 自定义供应商、发现和流式兼容
+├── work-mode/              # 阶段、授权、计划、路径保护和安全评审
+├── mcp/                    # 独立的 stdio MCP Bridge
+└── skills/pi-wiki/         # Pwiki 使用纪律和工具流程
 ```
 
-GitHub 特供版不包含开发树中的测试目录、报告/笔记、完整 Pwiki 工程和本地索引数据。仓库根目录若保留公开的 `AGENTS.md` / `SYSTEM.md`，它们只用于贡献协作，不会被 pi 作为运行时扩展加载。发布目录中的 TypeScript 保持源码形态，由 pi 在加载扩展时解析。
+GitHub 特供版只包含公开运行时代码、MCP Bridge、Pwiki 使用 skill、README 和
+.gitignore。开发树中的测试目录、报告/笔记、完整 Pwiki 工程、本地索引、
+node_modules 和凭据不属于公开分发内容。仓库根目录如果保留 AGENTS.md 或
+SYSTEM.md，它们只服务于贡献协作，不会被 pi 当作扩展加载。
 
-## 更新与排错
+### 更新与排错
 
-更新代码后：
+更新后重新安装 MCP 依赖并执行 /reload：
 
 ```bash
 cd ~/.pi/agent/extensions
@@ -149,19 +211,19 @@ cd mcp
 npm install --omit=dev --ignore-scripts
 ```
 
-回到 pi 执行 `/reload`。如果工具没有出现，优先检查：
+如果工具没有出现，依次检查：
 
-1. 当前目录是否确实是 `~/.pi/agent/extensions`；
-2. pi 是否支持当前 Extension API；
-3. MCP Bridge 的 `mcp/package.json` 依赖是否安装完成；
-4. Pwiki Server 是否能在终端直接执行 `pwiki-mcp`；
-5. 是否在加载旧进程，必要时重启 pi 后再检查。
+1. pi 当前加载的确实是 ~/.pi/agent/extensions；
+2. pi 版本支持当前 Extension API；
+3. 只有在使用 MCP Bridge 时才安装 mcp 依赖；
+4. pwiki-mcp 可以在终端直接启动；
+5. 已执行 /reload，必要时重启 pi 以清理旧进程。
 
-## 开发
+### 开发与安全
 
-开发树包含测试和更完整的工作区资料；GitHub 特供版只用于安装和公开分发。修改扩展后，至少应检查 TypeScript 导入路径、MCP package 的依赖锁文件、README 中的安装路径，并确认没有把密钥、个人路径、运行时状态或内部服务地址带入发布目录。
-
-提交前建议执行：
+修改扩展后，应检查 TypeScript 导入路径、MCP package lock、README 安装路径，
+并确认没有带入密钥、个人路径、内部服务地址、运行时状态或私有 Pwiki 数据。
+公开同步前至少执行：
 
 ```bash
 git diff --check
@@ -169,8 +231,132 @@ rg -n -i 'api[_-]?key|access[_-]?token|password|secret|/mnt/data|/home/' . \
   --glob '!mcp/node_modules/**'
 ```
 
-上述搜索会命中代码中的安全字段名和脱敏规则，这是预期的；需要人工确认的是是否存在真实值、个人绝对路径或内部地址。
+字段名和脱敏规则本身可能被搜索命中；需要人工确认的是是否存在真实值、个人
+绝对路径或内部地址。
 
-## 许可
+### 许可
 
-MIT。请在公开 Issue 或 Pull Request 中提交可复现的问题、兼容性信息和最小修改建议。
+MIT。欢迎提交可复现的问题、兼容性信息和最小修改建议。
+
+## English Documentation
+
+### Overview
+
+Pi Agent Extensions is a public, source-form distribution of pi extensions for
+structured engineering work. It adds phase-aware authorization, parallel
+sub-agents, model/provider routing, Windows command tools, context and goal
+tracking, and a policy-aware local MCP bridge. It runs through pi's Extension
+API and does not modify pi core.
+
+### Feature map
+
+- **Workflow and safety:** /chat, /plan, /work, /auto, and /auto_all, Work
+  Contracts, plan management, path protection, command safety checks, and
+  sanitized audit context.
+- **AUTO_FLASH:** configure the AI reviewer used by /auto with
+  /auto_flash <provider>/<model>. A reviewer can decide an approval-boundary
+  call, but cannot promote guarded work or grant AUTO_ALL. Provider stream
+  failures and aborts are surfaced as failures instead of being misread as an
+  invalid boolean response.
+- **Parallel agents:** spawn_agent, check_agent_results, read_agent_output,
+  control_agent, send_agent_message, update_agent_task, manage_skills, and
+  manage_tools, with task panels, stage reports, persistence, and timeout
+  recovery metadata.
+- **Models and providers:** switch_model, L0/L1/L2 tiers, thinking levels,
+  custom provider persistence and discovery, plus OpenAI-compatible and
+  Anthropic streaming compatibility helpers.
+- **Windows execution:** cmd and powershell with code-page selection, timeouts,
+  bounded output, process-tree cleanup, and explicit command purpose.
+- **Context and goals:** context/token status, long-attention PS reminders,
+  work-goal lifecycle tools, and persisted phase/goal state.
+- **MCP Bridge:** manage local stdio servers, inspect their tools and metadata,
+  call tools through verified schemas, and apply strict or pwiki risk policies.
+- **Pwiki integration:** the repository contains a skills/pi-wiki/SKILL.md usage
+  discipline; Pwiki itself remains a separately installed CLI/MCP project.
+
+### Installation
+
+Install and verify [pi coding agent](https://github.com/badlogic/pi-mono), then:
+
+```bash
+git clone https://github.com/ang-XWBWZ/pi-agent-extensions.git ~/.pi/agent/extensions
+cd ~/.pi/agent/extensions
+git pull --ff-only
+```
+
+Reload pi after installing or updating:
+
+```text
+/reload
+```
+
+The ordinary extensions do not require MCP dependencies. If you use the bridge:
+
+```bash
+cd ~/.pi/agent/extensions/mcp
+npm install --omit=dev --ignore-scripts
+```
+
+The default MCP configuration is ~/.pi/agent/mcp-servers.json; override it
+with PI_MCP_CONFIG when needed.
+
+### Authorization model
+
+| Mode | Meaning |
+| --- | --- |
+| CHAT | Conversation and clarification only; no repository side effects. |
+| PLAN | Read-only discovery, requirements, and plan work. |
+| WORK | Guarded implementation; sensitive, unknown, destructive, and protected operations remain controlled. |
+| AUTO | AI-reviewed authorization for eligible command boundaries inside WORK. Configure with /auto_flash. |
+| AUTO_ALL | Explicit approval for non-protected command calls; it does not bypass hard protection. |
+
+AUTO is not AUTO_ALL. If no reviewer is configured, /auto warns and rejects
+operations that require AI review. /auto_flash off disables the reviewer;
+/auto_all remains a separate explicit mode. cmd and powershell additionally
+require auto_all=true and a purpose when used under AUTO_ALL.
+
+### MCP and Pwiki quick start
+
+Inspect a configured MCP server before calling it:
+
+```text
+mcp_manage(action="list")
+mcp_manage(action="tools", name="example")
+mcp_discover(action="catalog", server="example")
+mcp_discover(action="tool", server="example", name="tool_name")
+mcp_call(server="example", tool="tool_name", arguments={})
+```
+
+Pwiki is independent and requires Node.js 22 or newer:
+
+```bash
+npm install -g @llangtop/pwiki-cli @llangtop/pwiki-mcp
+```
+
+The included Pwiki skill requires read operations to use wiki read tools and
+keeps edits, refreshes, vector operations, and compilation explicitly separated
+by risk. It must not be used as a reason to edit Pwiki data files directly.
+
+### Public distribution boundary
+
+The public bundle contains extension source, the MCP bridge, the Pwiki usage
+skill, README, and .gitignore. It intentionally excludes development tests,
+private reports and notes, the full Pwiki project, local indexes, runtime
+dependencies, and credentials. Root-level AGENTS.md and SYSTEM.md, when
+present in the repository, are contribution documents rather than runtime
+extensions.
+
+### Troubleshooting and contribution
+
+After an update, run /reload; reinstall mcp dependencies only when using the
+bridge. If a tool is missing, verify the loaded extension directory, pi's
+Extension API compatibility, the bridge dependency installation, and whether an
+old pi process needs to be restarted.
+
+Before publishing a change, run git diff --check and review searches for API
+keys, access tokens, passwords, secrets, personal absolute paths, internal
+addresses, runtime state, and private Pwiki data. Matches for field names and
+sanitization code are not automatically leaks; inspect the actual values.
+
+MIT licensed. Please file reproducible issues with compatibility details and the
+smallest useful patch.
