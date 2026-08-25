@@ -37,6 +37,7 @@ export interface AutoFlashDecision {
   command: string;
   toolName?: string;
   purpose?: string;
+  input?: unknown;
   cwd: string;
   effect: ToolEffect;
 }
@@ -159,6 +160,8 @@ function isToolEffect(value: unknown): value is ToolEffect {
 interface McpPolicyRegistry {
   classifyCall?: (server: string, tool: string, argumentsValue: unknown) => unknown;
   isAlwaysAllowed?: (server: string) => unknown;
+  resolveAlias?: (toolName: string) => string | undefined;
+  resolveDirectTool?: (toolName: string) => { server: string; tool: string } | undefined;
 }
 
 function mcpPolicyRegistry(): McpPolicyRegistry | undefined {
@@ -180,8 +183,59 @@ function classifyMcpCall(input: Record<string, unknown>): ToolEffect {
   }
 }
 
-function isAlwaysAllowedMcpCall(input: Record<string, unknown>): boolean {
-  const server = typeof input.server === "string" ? input.server.trim() : "";
+function mcpServerForTool(
+  toolName: string,
+  input: Record<string, unknown>,
+): string | undefined {
+  if (toolName === "mcp_call") {
+    return typeof input.server === "string" && input.server.trim()
+      ? input.server.trim()
+      : undefined;
+  }
+  try {
+    return mcpPolicyRegistry()?.resolveAlias?.(toolName)
+      ?? mcpPolicyRegistry()?.resolveDirectTool?.(toolName)?.server;
+  } catch {
+    return undefined;
+  }
+}
+
+function mcpMethodForTool(toolName: string, input: Record<string, unknown>): string | undefined {
+  if (toolName === "mcp_call") {
+    const value = input.tool;
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  }
+  try {
+    const directTool = mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
+    if (directTool) return directTool.tool;
+  } catch {
+    // Fall through to the configured alias shape.
+  }
+  const value = input.method;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function mcpReviewInput(toolName: string, input: Record<string, unknown>): unknown {
+  const server = mcpServerForTool(toolName, input);
+  const tool = mcpMethodForTool(toolName, input);
+  if (!server || !tool) return undefined;
+  const isDirectTool = !!mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
+  return {
+    server,
+    tool,
+    arguments: isDirectTool ? input : input.arguments ?? {},
+  };
+}
+
+function isMcpAliasTool(toolName: string): boolean {
+  return toolName !== "mcp_call" && !!mcpServerForTool(toolName, {});
+}
+
+function isAlwaysAllowedMcpCall(
+  input: Record<string, unknown>,
+  toolName = "mcp_call",
+): boolean {
+  const server = mcpServerForTool(toolName, input);
   if (!server) return false;
   try {
     return mcpPolicyRegistry()?.isAlwaysAllowed?.(server) === true;
@@ -237,6 +291,15 @@ export function classifyCustomToolEffect(
   }
   if (toolName === "mcp_call") {
     return classifyMcpCall(input);
+  }
+  const aliasServer = mcpServerForTool(toolName, input);
+  if (aliasServer) {
+    const directTool = mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
+    return classifyMcpCall({
+      server: aliasServer,
+      tool: directTool?.tool ?? input.method,
+      arguments: directTool ? input : input.arguments,
+    });
   }
   if (toolName === "mcp_discover") {
     return "read";
@@ -302,6 +365,7 @@ function describeCustomTarget(
     "name",
     "server",
     "tool",
+    "method",
     "uri",
     "command",
     "cwd",
@@ -735,6 +799,7 @@ function decideToolCallBase(
           command: target,
           toolName: event.toolName,
           purpose,
+          input: mcpReviewInput(event.toolName, input),
           cwd: ctx.cwd,
           effect,
         });
@@ -745,6 +810,7 @@ function decideToolCallBase(
       command: target,
       toolName: event.toolName,
       purpose,
+      input: mcpReviewInput(event.toolName, input),
       cwd: ctx.cwd,
       effect,
     });
@@ -752,11 +818,7 @@ function decideToolCallBase(
 
   // A server-level always-allow rule is an explicit local preference, but it
   // cannot promote a phase or turn unknown/destructive actions into safe ones.
-  if (
-    event.toolName === "mcp_call" &&
-    effect === "persistent" &&
-    isAlwaysAllowedMcpCall(input)
-  ) {
+  if (effect === "persistent" && isAlwaysAllowedMcpCall(input, event.toolName)) {
     return allow(effect, target);
   }
 
@@ -790,6 +852,7 @@ function decideToolCallBase(
   if (
     profile.approval === "never_ask" &&
     !AUTO_CONFIRM_TOOLS.has(event.toolName) &&
+    !isMcpAliasTool(event.toolName) &&
     !(
       event.toolName === "switch_model" &&
       typeof input.action === "string" &&

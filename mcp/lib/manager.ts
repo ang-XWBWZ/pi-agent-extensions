@@ -118,6 +118,11 @@ export interface McpManagerOptions {
   connect?: (server: McpServerConfig) => Promise<McpConnection>;
 }
 
+export interface McpAliasInfo {
+  alias: string;
+  server: string;
+}
+
 interface ActiveConnection {
   fingerprint: string;
   connection: McpConnection;
@@ -493,6 +498,24 @@ export class McpManager {
     return Object.entries(this.readConfig().mcpServers)
       .map(([name, server]) => summarizeServer(name, server))
       .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  listAliases(): McpAliasInfo[] {
+    return Object.entries(this.readConfig().mcpServers)
+      .filter(([, server]) => server.enabled && !!server.alias)
+      .map(([server, config]) => ({ alias: config.alias!, server }))
+      .sort((a, b) => a.alias.localeCompare(b.alias));
+  }
+
+  resolveAlias(alias: string): string | undefined {
+    const normalized = alias.trim();
+    if (!normalized) return undefined;
+    try {
+      return Object.entries(this.readConfig().mcpServers)
+        .find(([, server]) => server.alias === normalized)?.[0];
+    } catch {
+      return undefined;
+    }
   }
 
   status(name?: string): Array<McpServerSummary & { connected: boolean; pid?: number | null }> {

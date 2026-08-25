@@ -14,7 +14,7 @@ import {
   setupRequirementsFeature,
 } from "./work-mode/requirements-feature.js";
 import { setupRequirementsContinuity } from "./work-mode/requirements-continuity.js";
-import { registerAutoFlashCommand } from "./work-mode/auto-flash.js";
+import { ensureAutoFlashSystemContext, registerAutoFlashCommand } from "./work-mode/auto-flash.js";
 import { getExecutionContext, setExecutionContext } from "./lib/execution-context.js";
 
 // ============================================================
@@ -23,6 +23,9 @@ import { getExecutionContext, setExecutionContext } from "./lib/execution-contex
 
 export default function (pi: ExtensionAPI) {
   registerAutoFlashCommand(pi);
+  pi.on("session_start", (event, ctx) => {
+    if (event.reason === "startup") ensureAutoFlashSystemContext(ctx.cwd);
+  });
 
   // ---- Shared state ----
   const initialExecutionContext = getExecutionContext();

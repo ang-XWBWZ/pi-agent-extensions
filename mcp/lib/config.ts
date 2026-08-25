@@ -9,6 +9,8 @@ export interface McpServerConfig {
   args: string[];
   env: Record<string, string>;
   cwd?: string;
+  /** Optional direct Pi tool name for this MCP server. */
+  alias?: string;
   enabled: boolean;
   /** Skip normal confirmation for locally classified persistent calls in WORK. */
   alwaysAllow: boolean;
@@ -27,6 +29,7 @@ export interface McpServerSummary {
   command: string;
   args: string[];
   cwd?: string;
+  alias?: string;
   enabled: boolean;
   alwaysAllow: boolean;
   policy: McpServerPolicy;
@@ -96,6 +99,14 @@ export function assertServerName(name: string): string {
   return normalized;
 }
 
+export function assertMcpAlias(name: string): string {
+  const normalized = name.trim();
+  if (!SERVER_NAME.test(normalized)) {
+    throw new McpConfigError("MCP alias must use letters, numbers, _ or -, up to 64 characters");
+  }
+  return normalized;
+}
+
 export function defaultMcpConfigPath(
   env: NodeJS.ProcessEnv = process.env,
   homeDirectory = homedir(),
@@ -114,11 +125,13 @@ export function normalizeServerConfig(value: unknown, name = "server"): McpServe
   if (typeof alwaysAllow !== "boolean") throw new McpConfigError(`${name}.alwaysAllow must be boolean`);
 
   const cwd = value.cwd === undefined ? undefined : requireString(value.cwd, `${name}.cwd`);
+  const alias = value.alias === undefined ? undefined : assertMcpAlias(requireString(value.alias, `${name}.alias`));
   return {
     command: requireString(value.command, `${name}.command`),
     args: value.args === undefined ? [] : asStringArray(value.args, `${name}.args`),
     env: value.env === undefined ? {} : asEnvironment(value.env),
     ...(cwd ? { cwd } : {}),
+    ...(alias ? { alias } : {}),
     enabled,
     alwaysAllow,
     policy: asPolicy(value.policy),
@@ -144,8 +157,18 @@ export function readMcpConfig(path = defaultMcpConfigPath()): McpConfigFile {
   }
 
   const mcpServers: Record<string, McpServerConfig> = {};
+  const aliases = new Map<string, string>();
   for (const [name, server] of Object.entries(raw.mcpServers)) {
-    mcpServers[assertServerName(name)] = normalizeServerConfig(server, `mcpServers.${name}`);
+    const serverName = assertServerName(name);
+    const normalized = normalizeServerConfig(server, `mcpServers.${name}`);
+    if (normalized.alias) {
+      const previous = aliases.get(normalized.alias);
+      if (previous) {
+        throw new McpConfigError(`MCP alias ${normalized.alias} is already used by ${previous}`);
+      }
+      aliases.set(normalized.alias, serverName);
+    }
+    mcpServers[serverName] = normalized;
   }
   return { mcpServers };
 }
@@ -165,6 +188,7 @@ export function summarizeServer(name: string, server: McpServerConfig): McpServe
     command: server.command,
     args: [...server.args],
     ...(server.cwd ? { cwd: server.cwd } : {}),
+    ...(server.alias ? { alias: server.alias } : {}),
     enabled: server.enabled,
     alwaysAllow: server.alwaysAllow,
     policy: server.policy,

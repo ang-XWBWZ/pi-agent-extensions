@@ -14,7 +14,7 @@ import {
   workflowPromptForPhase,
 } from "./types.js";
 import { formatProfileForPrompt, profileFromPhase } from "./execution-profile.js";
-import { getAutoFlashModel, registerAutoFlashCommand } from "./auto-flash.js";
+import { ensureAutoFlashSystemContext, getAutoFlashModel, registerAutoFlashCommand } from "./auto-flash.js";
 
 export interface CoreState {
   phase: ConversationPhase;
@@ -191,6 +191,7 @@ export function setupCore(
   pi.registerCommand("auto", {
     description: "WORK phase - AI-reviewed command authorization; use /auto_flash to configure the reviewer",
     handler: async (_a, ctx) => {
+      ensureAutoFlashSystemContext(ctx.cwd);
       applyProfile("work", "auto", ctx);
       const model = getAutoFlashModel();
       ctx.ui.notify(
@@ -218,6 +219,7 @@ export function setupCore(
   pi.registerCommand("yolo", {
     description: "Compatibility alias for /auto",
     handler: async (_a, ctx) => {
+      ensureAutoFlashSystemContext(ctx.cwd);
       applyProfile("work", "auto", ctx);
       ctx.ui.notify("/yolo 已兼容映射到 /auto", "warning");
     },

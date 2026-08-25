@@ -109,6 +109,12 @@ mcp_discover(action="tool", server="example", name="tool_name")
 mcp_call(server="example", tool="tool_name", arguments={})
 ```
 
+启用的 MCP Server 在扩展加载或执行 `/reload` 后会自动发现并注册其公开工具。
+只有一个 Server 提供某个工具时可直接使用原始工具名；多个 Server 重名时使用
+`mcp__<server>__<tool>` 命名空间。`mcp_manage` 仍用于查看服务器，
+`mcp_discover` 用于读取完整 schema，`mcp_call` 保留为通用兜底；直连工具不会
+绕过本地授权、风险策略或确认流程。
+
 先用 mcp_manage 查看服务器和真实工具 schema，再调用 mcp_call。Bridge
 不会把环境变量值回显；服务器策略支持 strict 和 Pwiki 专用的 pwiki。
 未知或破坏性操作不会因为服务器被设为 always-allow 就自动绕过确认。
@@ -326,6 +332,13 @@ mcp_discover(action="catalog", server="example")
 mcp_discover(action="tool", server="example", name="tool_name")
 mcp_call(server="example", tool="tool_name", arguments={})
 ```
+
+Enabled MCP servers are discovered at extension load or after `/reload`. When
+one server exposes a tool, the advertised name can be called directly; name
+collisions use the `mcp__<server>__<tool>` namespace. `mcp_manage` remains the
+server inspection entry point, `mcp_discover` reads the full schema, and
+`mcp_call` remains the generic fallback. Direct tools do not bypass local
+authorization, risk policy, or confirmation.
 
 Pwiki is independent and requires Node.js 22 or newer:
 
