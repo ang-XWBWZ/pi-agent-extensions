@@ -22,11 +22,19 @@ import {
   isAutoCircuitBroken,
   isAutoStopped,
   recordAutoStep,
+  resetAutoCircuitBreaker,
+  resetAutoSteps,
   updateAutoStatusBar,
 } from "./auto-status.js";
 import { profileFromPhase } from "./execution-profile.js";
 import {
   decideToolCall,
+  FILE_MUTATION_TOOLS,
+  SHELL_TOOLS,
+  commandOf,
+  inputOf,
+  pathOf,
+  purposeOf,
   type ToolDecision,
   type ToolEffect,
 } from "./tool-decision.js";
@@ -93,12 +101,89 @@ async function applyDecision(
         });
       }
       updateAutoStatusBar(ctx);
-      ctx.ui.notify(breaker.reason ?? "AUTO 连续执行步数已达上限，已触发熔断", "warning");
-      return {
-        block: true,
-        reason: breaker.reason ?? "AUTO 连续步数达到上限熔断",
-        terminate: true,
-      };
+      ctx.ui.notify(
+        breaker.reason ?? "AUTO 连续执行步数已达上限，已触发熔断并转为普通认证模式",
+        "warning",
+      );
+
+      // 回到普通认证：基于 GUARDED 模式重新生成判定，进入普通人工审批流程
+      const currentExecCtx = getExecutionContext();
+      const guardedProfile = profileFromPhase({
+        phase: state.phase,
+        isSubAgent: state.isSubAgent,
+        executionContext: currentExecCtx,
+      });
+      let guardedDecision = decideToolCall(guardedProfile, event, ctx);
+
+      // 若在普通模式下原本为 allow（例如日常命令或只读/写入），因刚触发熔断，
+      // 必须包装为人工普通认证放行确认，杜绝静默继续执行，无 10s 超时倒计时
+      if (guardedDecision.action === "allow" && !guardedDecision.confirm) {
+        if (SHELL_TOOLS.has(event.toolName)) {
+          const command = commandOf(event);
+          const purpose = purposeOf(event);
+          guardedDecision = {
+            action: "ask",
+            effect: guardedDecision.effect,
+            target: command,
+            confirm: {
+              type: "command",
+              label: `AUTO 熔断人工确认: ${event.toolName}`,
+              target: command,
+              allowlist: "cmd",
+              confirmedLabel: "熔断确认放行",
+              purpose: purpose || breaker.reason,
+              remember: false,
+              onEdit: (edited) => {
+                inputOf(event).command = edited;
+                return true;
+              },
+            },
+          };
+        } else if (FILE_MUTATION_TOOLS.has(event.toolName)) {
+          const path = pathOf(event, ctx.cwd) ?? event.toolName;
+          const purpose = purposeOf(event);
+          guardedDecision = {
+            action: "ask",
+            effect: guardedDecision.effect,
+            target: path,
+            confirm: {
+              type: "path",
+              label: `AUTO 熔断人工确认: ${event.toolName}`,
+              target: path,
+              allowlist: "path",
+              confirmedLabel: "熔断确认放行",
+              purpose: purpose || breaker.reason,
+              remember: false,
+            },
+          };
+        } else {
+          const purpose = purposeOf(event);
+          guardedDecision = {
+            action: "ask",
+            effect: guardedDecision.effect,
+            target: event.toolName,
+            confirm: {
+              type: "action",
+              label: `AUTO 熔断人工确认: ${event.toolName}`,
+              target: event.toolName,
+              allowlist: "action",
+              confirmedLabel: "熔断确认放行",
+              purpose: purpose || breaker.reason,
+              remember: false,
+            },
+          };
+        }
+      }
+
+      // 执行普通认证流程（无 10s 超时倒计时、无直接失败终止）
+      const result = await applyDecision(guardedDecision, event, ctx, state, callbacks);
+      if (!result?.block) {
+        // 人工确认放行后，重置熔断标志与步数计数器
+        resetAutoCircuitBreaker();
+        resetAutoSteps();
+        updateAutoStatusBar(ctx, `人工放行: ${event.toolName}`);
+      }
+      return result;
     }
   }
 

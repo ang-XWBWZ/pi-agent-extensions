@@ -52,8 +52,8 @@ export interface ToolDecision {
   flashReview?: AutoFlashDecision;
 }
 
-const SHELL_TOOLS = new Set(["bash", "cmd", "powershell"]);
-const FILE_MUTATION_TOOLS = new Set(["write", "edit"]);
+export const SHELL_TOOLS = new Set(["bash", "cmd", "powershell"]);
+export const FILE_MUTATION_TOOLS = new Set(["write", "edit"]);
 const FILE_ACCESS_TOOLS = new Set(["read", "write", "edit"]);
 const READ_TOOLS = new Set([
   "grep",
@@ -96,16 +96,16 @@ const AUTO_CONFIRM_TOOLS = new Set([
   "mcp_call",
 ]);
 
-function inputOf(event: { input?: unknown }): Record<string, unknown> {
+export function inputOf(event: { input?: unknown }): Record<string, unknown> {
   return (event.input ?? {}) as Record<string, unknown>;
 }
 
-function commandOf(event: { input?: unknown }): string {
+export function commandOf(event: { input?: unknown }): string {
   const command = inputOf(event).command;
   return typeof command === "string" ? command.trim() : "";
 }
 
-function purposeOf(event: { toolName?: string; input?: unknown }): string | undefined {
+export function purposeOf(event: { toolName?: string; input?: unknown }): string | undefined {
   const input = inputOf(event);
   const explicit =
     input.purpose ??
@@ -140,7 +140,7 @@ function purposeOf(event: { toolName?: string; input?: unknown }): string | unde
   return undefined;
 }
 
-function pathOf(
+export function pathOf(
   event: { input?: unknown },
   cwd: string,
 ): string | undefined {

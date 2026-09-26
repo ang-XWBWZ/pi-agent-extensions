@@ -34,6 +34,28 @@ function touch(goal: WorkGoalState): WorkGoalState {
   return goal;
 }
 
+export type GoalLifecycleEvent = "created" | "finished" | "aborted" | "deleted";
+export type GoalLifecycleListener = (event: GoalLifecycleEvent, goal: WorkGoalState) => void;
+
+const lifecycleListeners = new Set<GoalLifecycleListener>();
+
+export function onGoalLifecycle(listener: GoalLifecycleListener): () => void {
+  lifecycleListeners.add(listener);
+  return () => {
+    lifecycleListeners.delete(listener);
+  };
+}
+
+function notifyGoalLifecycle(event: GoalLifecycleEvent, goal: WorkGoalState): void {
+  for (const listener of lifecycleListeners) {
+    try {
+      listener(event, goal);
+    } catch {
+      // 容错防止监听器异常中断主流程
+    }
+  }
+}
+
 export function createWorkGoal(input: {
   title?: string;
   goal: string;
@@ -61,7 +83,13 @@ export function createWorkGoal(input: {
   const s = store();
   s.goals.set(goal.id, goal);
   s.activeGoalId = goal.id;
+  notifyGoalLifecycle("created", goal);
   return goal;
+}
+
+export function hasActiveWorkGoal(): boolean {
+  const goal = getActiveWorkGoal();
+  return goal !== null && goal.status === "active";
 }
 
 export function getActiveWorkGoal(): WorkGoalState | null {
@@ -138,11 +166,13 @@ export function finishWorkGoal(id: string, summary?: string): WorkGoalState {
       passed: true,
     });
   }
-  return updateWorkGoal(id, (goal) => {
+  const finished = updateWorkGoal(id, (goal) => {
     goal.status = "done";
     goal.finishedAt = Date.now();
     return goal;
   });
+  notifyGoalLifecycle("finished", finished);
+  return finished;
 }
 
 export function abortWorkGoal(id: string, reason?: string): WorkGoalState {
@@ -152,9 +182,24 @@ export function abortWorkGoal(id: string, reason?: string): WorkGoalState {
       message: reason,
     });
   }
-  return updateWorkGoal(id, (goal) => {
+  const aborted = updateWorkGoal(id, (goal) => {
     goal.status = "aborted";
     goal.finishedAt = Date.now();
     return goal;
   });
+  notifyGoalLifecycle("aborted", aborted);
+  return aborted;
 }
+
+export function deleteWorkGoal(id: string): boolean {
+  const s = store();
+  const goal = s.goals.get(id);
+  if (!goal) return false;
+  s.goals.delete(id);
+  if (s.activeGoalId === id) {
+    s.activeGoalId = undefined;
+  }
+  notifyGoalLifecycle("deleted", goal);
+  return true;
+}
+

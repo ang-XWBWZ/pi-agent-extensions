@@ -22,6 +22,10 @@ import {
   isPlanComplete,
   setPlanStepStatus,
 } from "./plan-state.js";
+import {
+  registerActivePlanChecker,
+  resetAutoSteps,
+} from "./auto-status.js";
 
 export interface PlanState {
   phase: ConversationPhase;
@@ -49,6 +53,9 @@ export function setupPlanFeature(
   getCurrentStepIndex: () => number;
   replacePlanSteps: (steps: string[], ctx: ExtensionContext, fullText?: string) => void;
 } {
+  // 注册计划检查器以供 AUTO 模式熔断步数动态判定（未完成计划下上限 200 步）
+  registerActivePlanChecker(() => hasUnfinishedPlan(s.planSteps));
+
   function persistPlan(completed = false) {
     pi.appendEntry("work-plan-state", {
       steps: s.planSteps.map((step) => ({ ...step })),
@@ -80,6 +87,7 @@ export function setupPlanFeature(
     clearState();
     if (!s.isSubAgent) ctx.ui.setWidget("plan-panel", undefined);
     persistPlan(false);
+    resetAutoSteps();
   }
 
   function getCurrentStepIndex(): number {
@@ -105,6 +113,7 @@ export function setupPlanFeature(
     s.planFullText = fullText;
     updatePlanPanel(ctx);
     persistPlan(false);
+    resetAutoSteps();
   }
 
   pi.on("session_start", (_event, ctx) => {
@@ -463,6 +472,9 @@ export function setupPlanFeature(
               next.updatedAt = Date.now();
             }
           }
+          if (s.planSteps.length === 0) {
+            resetAutoSteps();
+          }
           updatePlanPanel(ctx);
           persistPlan(false);
           return {
@@ -547,6 +559,7 @@ export function setupPlanFeature(
           }
           updatePlanPanel(ctx);
           persistPlan(true);
+          resetAutoSteps();
           return {
             content: [
               { type: "text", text: "计划已完成，最终状态保留用于审计" },

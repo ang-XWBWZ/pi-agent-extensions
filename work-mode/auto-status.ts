@@ -5,9 +5,12 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getExecutionContext } from "../lib/execution-context.js";
 import { getSettingsSection } from "../lib/settings-io.js";
+import { getActiveWorkGoal, onGoalLifecycle } from "../lib/work-goal-store.js";
 import { getAutoFlashModel } from "./auto-flash.js";
 
-export const DEFAULT_MAX_AUTO_STEPS = 25;
+export const MAX_AUTO_STEPS_DEFAULT = 100;
+export const MAX_AUTO_STEPS_WITH_PLAN = 200;
+export const DEFAULT_MAX_AUTO_STEPS = 100;
 export const AUTO_MAX_STEPS_SETTINGS_KEY = "autoMaxSteps";
 
 let autoStopped = false;
@@ -16,12 +19,49 @@ let consecutiveAutoSteps = 0;
 let currentAutoAction: string | undefined;
 let stopAbortController: AbortController | undefined;
 
-export function getMaxAutoSteps(): number {
+type PlanChecker = () => boolean;
+let activePlanChecker: PlanChecker | undefined;
+
+/**
+ * 注册未完成计划检查器
+ */
+export function registerActivePlanChecker(checker: PlanChecker | undefined): void {
+  activePlanChecker = checker;
+}
+
+export function hasActivePlan(): boolean {
+  try {
+    return activePlanChecker ? activePlanChecker() : false;
+  } catch {
+    return false;
+  }
+}
+
+export function hasActiveGoal(): boolean {
+  try {
+    const goal = getActiveWorkGoal();
+    return goal !== null && goal.status === "active";
+  } catch {
+    return false;
+  }
+}
+
+export function hasActivePlanOrGoal(): boolean {
+  return hasActivePlan() || hasActiveGoal();
+}
+
+// 自动监听目标生命周期事件（创建、完成、终止、删除），触发步数计数清零
+onGoalLifecycle((_event) => {
+  resetAutoSteps();
+});
+
+export function getMaxAutoSteps(hasPlanOrGoal?: boolean): number {
   const custom = getSettingsSection(AUTO_MAX_STEPS_SETTINGS_KEY, undefined);
   if (typeof custom === "number" && custom > 0) {
     return Math.floor(custom);
   }
-  return DEFAULT_MAX_AUTO_STEPS;
+  const hasPlan = hasPlanOrGoal !== undefined ? hasPlanOrGoal : hasActivePlanOrGoal();
+  return hasPlan ? MAX_AUTO_STEPS_WITH_PLAN : MAX_AUTO_STEPS_DEFAULT;
 }
 
 export function isAutoStopped(): boolean {
@@ -73,9 +113,11 @@ export function checkAutoCircuitBreaker(): { broken: boolean; reason?: string } 
   const maxSteps = getMaxAutoSteps();
   if (consecutiveAutoSteps >= maxSteps) {
     autoCircuitBroken = true;
+    const hasContext = hasActivePlanOrGoal();
+    const contextDesc = hasContext ? "（有计划/目标进行中，限额200步）" : "（无计划/目标，限额100步）";
     return {
       broken: true,
-      reason: `AUTO 连续自动执行步数已达上限(${maxSteps})，已触发防死循环熔断并自动回退到 GUARDED 模式。请人工检查任务状态或手动确认后续操作。`,
+      reason: `AUTO 连续自动执行步数已达上限(${maxSteps})${contextDesc}，已触发防死循环熔断并自动回退到普通认证模式。`,
     };
   }
   return { broken: false };
@@ -111,12 +153,12 @@ export function updateAutoStatusBar(ctx: ExtensionContext, action?: string): voi
   }
 
   if (autoStopped) {
-    ctx.ui.setStatus("auto-status", "🛑 AUTO [已终止]");
+    ctx.ui.setStatus("auto-status", "AUTO [已终止]");
     return;
   }
 
   if (autoCircuitBroken) {
-    ctx.ui.setStatus("auto-status", `⚠️ AUTO [已熔断: 超${getMaxAutoSteps()}步]`);
+    ctx.ui.setStatus("auto-status", `AUTO [已熔断: 超${getMaxAutoSteps()}步]`);
     return;
   }
 
@@ -127,11 +169,11 @@ export function updateAutoStatusBar(ctx: ExtensionContext, action?: string): voi
   }
 
   if (currentAutoAction) {
-    ctx.ui.setStatus("auto-status", `🤖 AUTO [${currentAutoAction}]`);
+    ctx.ui.setStatus("auto-status", `AUTO [${currentAutoAction}]`);
   } else {
     const model = getAutoFlashModel();
     const modelStr = model ? `${model.provider}/${model.model}` : "未配置模型";
-    ctx.ui.setStatus("auto-status", `🤖 AUTO [就绪 | ${modelStr}]`);
+    ctx.ui.setStatus("auto-status", `AUTO [就绪 | ${modelStr}]`);
   }
 }
 

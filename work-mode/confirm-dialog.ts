@@ -70,6 +70,7 @@ export async function showActionConfirm(
     return "always";
   }
 
+  if (typeof ctx.ui?.select !== "function") return "no";
   const choice = await ctx.ui.select(title, options);
   if (choice === "仅允许本次") return "yes";
   if (choice === "拒绝并说明原因") return rejectionChoice(ctx, false);
@@ -103,6 +104,7 @@ export async function showPathConfirm(
     return "no";
   }
 
+  if (typeof ctx.ui?.select !== "function") return "no";
   const choice = await ctx.ui.select(title, options);
   if (choice === "仅允许本次") return "yes";
   if (choice === "始终允许此路径") return "always";
