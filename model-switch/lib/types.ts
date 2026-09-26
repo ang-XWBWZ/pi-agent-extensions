@@ -71,12 +71,20 @@ export function forceThinkingSupport(model: unknown): void {
       max: "max",
     };
   } else {
-    // 保留模型原有的合法映射，仅为 xhigh/max 补齐以支持官方 getSupportedThinkingLevels
-    if (m.thinkingLevelMap.minimal === undefined) m.thinkingLevelMap.minimal = "minimal";
-    if (m.thinkingLevelMap.low === undefined) m.thinkingLevelMap.low = "low";
-    if (m.thinkingLevelMap.medium === undefined) m.thinkingLevelMap.medium = "medium";
-    if (m.thinkingLevelMap.high === undefined) m.thinkingLevelMap.high = "high";
-    if (m.thinkingLevelMap.xhigh === undefined) m.thinkingLevelMap.xhigh = "xhigh";
-    if (m.thinkingLevelMap.max === undefined) m.thinkingLevelMap.max = "max";
+    // 补齐所有思考等级映射，解除 null 与 undefined 阻断，全面兼容原生 7 级
+    if (!m.thinkingLevelMap.minimal) m.thinkingLevelMap.minimal = "minimal";
+    if (!m.thinkingLevelMap.low) m.thinkingLevelMap.low = "low";
+    if (!m.thinkingLevelMap.medium) m.thinkingLevelMap.medium = "medium";
+    if (!m.thinkingLevelMap.high) m.thinkingLevelMap.high = "high";
+    if (!m.thinkingLevelMap.xhigh) m.thinkingLevelMap.xhigh = "xhigh";
+    if (!m.thinkingLevelMap.max) m.thinkingLevelMap.max = "max";
   }
 }
+
+export function forceThinkingSupportAll(models: unknown[]): void {
+  if (!Array.isArray(models)) return;
+  for (const m of models) {
+    forceThinkingSupport(m);
+  }
+}
+

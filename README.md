@@ -260,7 +260,7 @@ npm install --omit=dev --ignore-scripts
 | `/auto_model <provider>/<model>` | 设置用于后台自动审批的轻量 AI 模型 |
 | `/auto_add_prmt <提示词>` | 追加审核模型的自定义提示词 |
 | `/tier` / `/tier-add` | 管理 L0/L1/L2 阶梯模型配置 |
-| `/thinking <off~xhigh>` | 调节推理模型的思考深度 |
+| `/thinklev`（别名 `/thinklive`、`/thinking-level`） | 调节思考深度（支持 7 级 lev、交互式二级菜单及专属配置持久化） |
 | `/note` | 查看并管理跨轮注意力暂存备忘录 |
 
 ---

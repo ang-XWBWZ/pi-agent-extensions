@@ -72,7 +72,7 @@ export function registerSwitchModel(
             for (const t of ["L0", "L1", "L2"] as TierKey[]) {
               const c = config[t];
               if (c && c.models.length > 0) {
-                const think = c.thinkingLevel ? ` [\u{1F9E0}${c.thinkingLevel}]` : "";
+                const think = c.thinkingLevel ? ` [思考:${c.thinkingLevel}]` : "";
                 lines.push(`${t} · ${c.label}${think}`);
                 for (const m of c.models) lines.push(`  - ${m.provider}/${m.model}`);
               } else { lines.push(`${t} · (未配置)`); }
@@ -91,7 +91,7 @@ export function registerSwitchModel(
             if (params.thinkingLevel && isValidThinkingLevel(params.thinkingLevel)) tc.thinkingLevel = params.thinkingLevel as ThinkingLevel;
             config[tier as TierKey] = tc;
             writeAllTiers(config); setState({ tierConfig: config });
-            return { content: [{ type: "text", text: `\u2705 ${tier} + ${params.provider}/${params.model}${params.thinkingLevel ? ` | \u{1F9E0} ${params.thinkingLevel}` : ""}` }], details: {} };
+            return { content: [{ type: "text", text: `${tier} + ${params.provider}/${params.model}${params.thinkingLevel ? ` | 思考: ${params.thinkingLevel}` : ""}` }], details: {} };
           }
           case "remove_from_tier": {
             const tier = params.tier?.toUpperCase();
@@ -103,7 +103,7 @@ export function registerSwitchModel(
               );
             } else { delete config[tier as TierKey]; }
             writeAllTiers(config); setState({ tierConfig: config });
-            return { content: [{ type: "text", text: params.provider ? `\u2705 移除 ${params.provider}/${params.model}` : `\u2705 ${tier} 已清空` }], details: {} };
+            return { content: [{ type: "text", text: params.provider ? `移除 ${params.provider}/${params.model}` : `${tier} 已清空` }], details: {} };
           }
           case "set_tier_thinking": {
             const tier = params.tier?.toUpperCase();
@@ -112,7 +112,7 @@ export function registerSwitchModel(
             if (!params.thinkingLevel || !isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: "需要 thinkingLevel" }], details: {} };
             config[tier as TierKey].thinkingLevel = params.thinkingLevel as ThinkingLevel;
             writeAllTiers(config); setState({ tierConfig: config });
-            return { content: [{ type: "text", text: `\u2705 ${tier} \u{1F9E0} ${params.thinkingLevel}` }], details: {} };
+            return { content: [{ type: "text", text: `${tier} 思考: ${params.thinkingLevel}` }], details: {} };
           }
           default: return { content: [{ type: "text", text: `未知 action: ${params.action}` }], details: {} };
         }
@@ -120,9 +120,20 @@ export function registerSwitchModel(
 
       // standalone thinking
       if (params.thinkingLevel && !params.tier && !params.provider) {
-        if (!isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: `无效` }], details: {} };
+        if (!isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: "无效思考等级" }], details: {} };
+        if (ctx.model) forceThinkingSupport(ctx.model);
         setThinking(params.thinkingLevel, ctx.model);
-        return { content: [{ type: "text", text: `\u2705 \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` }], details: {} };
+        updateSettings((s) => {
+          s.defaultThinkingLevel = params.thinkingLevel;
+          if (ctx.model) {
+            if (!s.modelThinkingLevels || typeof s.modelThinkingLevels !== "object") {
+              s.modelThinkingLevels = {};
+            }
+            (s.modelThinkingLevels as Record<string, string>)[`${ctx.model.provider}/${ctx.model.id}`] = params.thinkingLevel;
+          }
+          return s;
+        });
+        return { content: [{ type: "text", text: `思考深度已设为: ${params.thinkingLevel} (${thinkingLabel(params.thinkingLevel)})，并已永久保存至配置` }], details: {} };
       }
 
       // tier switch
@@ -155,7 +166,7 @@ export function registerSwitchModel(
           if (statusLine) statusLine(ctx);
         }
         const think = params.thinkingLevel ?? config[tier as TierKey]?.thinkingLevel;
-        return { content: [{ type: "text", text: ok ? `\u2705 ${tier} · ${config[tier as TierKey].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "失败" }], details: {} };
+        return { content: [{ type: "text", text: ok ? `${tier} · ${config[tier as TierKey].label}: ${r.provider}/${r.model}${think ? ` | 思考: ${think}(${thinkingLabel(think)})` : ""}` : "失败" }], details: {} };
       }
 
       // provider+model (支持自动从 model 字段解析 provider/model 或单独 model 名称)
@@ -177,7 +188,7 @@ export function registerSwitchModel(
       }
 
       if (targetProvider && targetModel) {
-        if (params.thinkingLevel && !isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: `无效 thinkingLevel` }], details: {} };
+        if (params.thinkingLevel && !isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: "无效 thinkingLevel" }], details: {} };
         const t = ctx.modelRegistry.find(targetProvider, targetModel);
         if (!t) return { content: [{ type: "text", text: `Model not found: ${targetProvider}/${targetModel}` }], details: {} };
         const ok = await pi.setModel(t);
@@ -203,7 +214,7 @@ export function registerSwitchModel(
           });
           if (statusLine) statusLine(ctx);
         }
-        return { content: [{ type: "text", text: ok ? `Switched to ${targetProvider}/${targetModel}${params.thinkingLevel ? ` | \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` : ""}` : "Failed" }], details: {} };
+        return { content: [{ type: "text", text: ok ? `Switched to ${targetProvider}/${targetModel}${params.thinkingLevel ? ` | 思考: ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` : ""}` : "Failed" }], details: {} };
       }
 
       // list
@@ -214,7 +225,7 @@ export function registerSwitchModel(
       const curTier = currentTier ?? getCurrentTier(cur?.provider, cur?.id, config);
       const think = currentThinking || pi.getThinkingLevel();
       const lines: string[] = [];
-      lines.push(`\u{1F9E0} 当前思考: ${think}(${thinkingLabel(think)})`);
+      lines.push(`当前思考: ${think}(${thinkingLabel(think)})`);
       lines.push("");
 
       const hasConfig = Object.values(config).some((c: TierConfig) => c.models.length > 0);
@@ -227,7 +238,7 @@ export function registerSwitchModel(
             c.models.some((tm) => tm.provider === m.provider && tm.model === m.id),
           );
           const isCur = curTier === t;
-          const thinkInfo = c.thinkingLevel ? ` [\u{1F9E0}${c.thinkingLevel}]` : "";
+          const thinkInfo = c.thinkingLevel ? ` [思考:${c.thinkingLevel}]` : "";
           lines.push(`${t} · ${c.label}${thinkInfo}${isCur ? " ◀ 当前层级" : ""}`);
           lines.push(`  ${c.desc}`);
           for (const m of tierModels) {

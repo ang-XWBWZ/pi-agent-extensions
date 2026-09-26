@@ -19,12 +19,12 @@ export function buildModelConfigs(
   return models.map((m) => {
     const isReasoning = typeof m.reasoning === "boolean"
       ? m.reasoning
-      : /reasoner|r1|o1|o3|thinking|cot/i.test(m.id);
+      : true; // 自定义模型默认开启 reasoning 支持，避免被原生 getSupportedThinkingLevels 限制为 ["off"]
     return {
       id: m.id,
       name: m.name || m.id,
       reasoning: isReasoning,
-      thinkingLevelMap: {
+      thinkingLevelMap: (m as any).thinkingLevelMap ?? {
         off: undefined,
         minimal: isReasoning ? "minimal" : undefined,
         low: isReasoning ? "low" : undefined,
@@ -34,7 +34,7 @@ export function buildModelConfigs(
         max: isReasoning ? "max" : undefined,
       },
       input: ["text"] as ("text" | "image")[],
-      cost: detectModelCost(m.id, m.cost),
+      cost: detectModelCost(m.id, (m as any).cost),
       contextWindow: m.contextWindow ?? contextWindow ?? detectContextWindow(m.id),
       maxTokens: (m.maxTokens && m.maxTokens !== 16384 ? m.maxTokens : undefined)
         ?? maxTokens

@@ -61,7 +61,7 @@ export function registerTierCmds(
         });
       }
       const think = config[tier]?.thinkingLevel;
-      ctx.ui.notify(ok ? `\u2705 ${tier} · ${config[tier].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "切换失败", ok ? "info" : "warning");
+      ctx.ui.notify(ok ? `${tier} · ${config[tier].label}: ${r.provider}/${r.model}${think ? ` | 思考: ${think}(${thinkingLabel(think)})` : ""}` : "切换失败", ok ? "info" : "warning");
     },
   });
 
@@ -105,7 +105,7 @@ export function registerTierCmds(
       config[tier as TierKey] = tc;
       writeAllTiers(config);
       setState({ tierConfig: config });
-      ctx.ui.notify(`\u2705 ${tier} + ${provider}/${model}${thinking ? ` | \u{1F9E0} ${thinking}` : ""}`, "info");
+      ctx.ui.notify(`${tier} + ${provider}/${model}${thinking ? ` | 思考: ${thinking}` : ""}`, "info");
     },
   });
 
@@ -132,10 +132,10 @@ export function registerTierCmds(
         if (config[tier as TierKey].models.length === before) {
           ctx.ui.notify(`${provider}/${model} 不在 ${tier} 中`, "warning"); return;
         }
-        ctx.ui.notify(`\u2705 从 ${tier} 移除 ${provider}/${model}`, "info");
+        ctx.ui.notify(`从 ${tier} 移除 ${provider}/${model}`, "info");
       } else {
         delete config[tier as TierKey];
-        ctx.ui.notify(`\u2705 ${tier} 已清空`, "info");
+        ctx.ui.notify(`${tier} 已清空`, "info");
       }
 
       writeAllTiers(config);
@@ -159,7 +159,7 @@ export function registerTierCmds(
       config[tier as TierKey].thinkingLevel = parts[1] as ThinkingLevel;
       writeAllTiers(config);
       setState({ tierConfig: config });
-      ctx.ui.notify(`\u2705 ${tier} 默认思考: ${parts[1]}(${thinkingLabel(parts[1])})`, "info");
+      ctx.ui.notify(`${tier} 默认思考: ${parts[1]}(${thinkingLabel(parts[1])})`, "info");
     },
   });
 
@@ -171,7 +171,7 @@ export function registerTierCmds(
       for (const t of ["L0", "L1", "L2"] as TierKey[]) {
         const c = config[t];
         if (c && c.models.length > 0) {
-          const think = c.thinkingLevel ? ` [\u{1F9E0}${c.thinkingLevel}]` : "";
+          const think = c.thinkingLevel ? ` [思考:${c.thinkingLevel}]` : "";
           lines.push(`${t} · ${c.label}${think}`);
           for (const m of c.models) lines.push(`  - ${m.provider}/${m.model}`);
         } else {

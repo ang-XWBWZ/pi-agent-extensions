@@ -6,7 +6,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel, TierKey, TierConfig } from "./model-switch/lib/types.js";
-import { forceThinkingSupport, thinkingLabel, isValidThinkingLevel } from "./model-switch/lib/types.js";
+import { forceThinkingSupport, forceThinkingSupportAll, thinkingLabel, isValidThinkingLevel } from "./model-switch/lib/types.js";
 import { readAllTiers, getCurrentTier, resolveTierModel } from "./model-switch/lib/tier-config.js";
 import { getSettings, updateSettings } from "./lib/settings-io.js";
 import { registerTierCmds } from "./model-switch/commands/tier-cmds.js";
@@ -59,9 +59,36 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function restoreModelThinking(model: unknown, tier?: TierKey | null): ThinkingLevel | undefined {
+    if (!model) return undefined;
+    forceThinkingSupport(model);
+    const m = model as { provider?: string; id?: string };
+    const s = getSettings();
+    const modelKey = m.provider && m.id ? `${m.provider}/${m.id}` : null;
+    const modelSpecific = modelKey ? (s.modelThinkingLevels as Record<string, string>)?.[modelKey] : undefined;
+    if (modelSpecific && isValidThinkingLevel(modelSpecific)) {
+      setThinking(modelSpecific, model);
+      return modelSpecific as ThinkingLevel;
+    }
+    if (tier && tierConfig[tier]?.thinkingLevel) {
+      return applyThinking(tier, model);
+    }
+    if (s.defaultThinkingLevel && isValidThinkingLevel(s.defaultThinkingLevel)) {
+      setThinking(s.defaultThinkingLevel as string, model);
+      return s.defaultThinkingLevel as ThinkingLevel;
+    }
+    return undefined;
+  }
+
   // ---- session_start ----
   pi.on("session_start", async (_e, ctx) => {
     refreshConfig();
+    if (ctx.model) forceThinkingSupport(ctx.model);
+    try {
+      const all = ctx.modelRegistry?.getAll?.() || [];
+      forceThinkingSupportAll(all);
+    } catch {}
+
     const initThinking = pi.getThinkingLevel?.();
     if (initThinking) currentThinking = initThinking;
 
@@ -88,7 +115,7 @@ export default function (pi: ExtensionAPI) {
             defaultRef = { provider: r.provider, model: r.model };
             currentTier = tk as TierKey;
             await pi.setModel(t);
-            applyThinking(currentTier, t);
+            restoreModelThinking(t, currentTier);
             statusLine(ctx);
             return true;
           }
@@ -102,15 +129,16 @@ export default function (pi: ExtensionAPI) {
           defaultRef = { provider: p, model: m };
           currentTier = getCurrentTier(p, m, tierConfig);
           await pi.setModel(t);
-          if (currentTier) applyThinking(currentTier, t);
+          restoreModelThinking(t, currentTier);
           statusLine(ctx);
           return true;
         }
       }
 
-      // 3. 如果未配置持久化模型，但当前已有模型，更新状态栏
+      // 3. 如果未配置持久化模型，但当前已有模型，更新状态与思考深度
       if (ctx.model) {
         currentTier = getCurrentTier(ctx.model.provider, ctx.model.id, tierConfig);
+        restoreModelThinking(ctx.model, currentTier);
         statusLine(ctx);
       }
       return false;
@@ -126,8 +154,20 @@ export default function (pi: ExtensionAPI) {
 
   // ---- 事件监听：保持与官方 thinking 和 model 选择双向同步 ----
   pi.on("thinking_level_select", (event, ctx) => {
-    if (event?.level) {
+    if (event?.level && isValidThinkingLevel(event.level)) {
       currentThinking = event.level;
+      if (ctx.model) {
+        forceThinkingSupport(ctx.model);
+        // 用户通过原生快捷键/原生选择器切换思考深度时，自动持久化至当前模型专属配置与全局默认
+        updateSettings((s) => {
+          if (!s.modelThinkingLevels || typeof s.modelThinkingLevels !== "object") {
+            s.modelThinkingLevels = {};
+          }
+          (s.modelThinkingLevels as Record<string, string>)[`${ctx.model.provider}/${ctx.model.id}`] = event.level;
+          s.defaultThinkingLevel = event.level;
+          return s;
+        });
+      }
     }
     statusLine(ctx);
   });
@@ -135,6 +175,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("model_select", async (event, ctx) => {
     refreshConfig();
     if (event?.model) {
+      forceThinkingSupport(event.model);
       currentTier = getCurrentTier(event.model.provider, event.model.id, tierConfig);
       // 当用户主动选择模型 (source 为 "set" 或 "cycle") 时持久化保存
       if (event.source === "set" || event.source === "cycle") {
@@ -150,6 +191,11 @@ export default function (pi: ExtensionAPI) {
           return s;
         });
       }
+      // 切换模型时自动恢复该模型的思考深度
+      restoreModelThinking(event.model, currentTier);
+    }
+    if (ctx.model) {
+      forceThinkingSupport(ctx.model);
     }
     const think = pi.getThinkingLevel?.();
     if (think) currentThinking = think;
