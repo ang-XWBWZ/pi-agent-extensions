@@ -15,11 +15,6 @@ export function registerSendMessage(pi: ExtensionAPI): void {
     label: "Send Agent Message",
     description:
       "向子 Agent 或其他 Agent 发送消息。支持广播 (to='broadcast') 和点对点通信。",
-    promptSnippet: "Send messages between agents via the AgentBus",
-    promptGuidelines: [
-      "Use send_agent_message for one-way coordination with running Agents; target a task unless a broadcast is necessary.",
-      "send_agent_message is fire-and-forget; use check_agent_results for results instead of waiting for a reply.",
-    ],
     parameters: Type.Object({
       to: Type.String({ description: "目标: 'broadcast' | jobId | taskId" }),
       type: Type.Optional(StringEnum(["info", "request", "response", "error"] as const)),

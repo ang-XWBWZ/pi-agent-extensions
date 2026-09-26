@@ -64,6 +64,7 @@ const READ_TOOLS = new Set([
   "work_goal_log",
   "check_agent_results",
   "read_agent_output",
+  "load_capability",
 ]);
 const PROGRESS_TOOLS = new Set([
   "spawn_agent",

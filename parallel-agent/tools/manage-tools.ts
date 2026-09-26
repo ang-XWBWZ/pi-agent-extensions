@@ -20,11 +20,6 @@ export function registerManageTools(pi: ExtensionAPI): void {
       "管理 tool 黑名单。黑名单中的 tool 不会注册到子进程会话，" +
       "子进程完全不知道该 tool 的存在（无注册指令、无说明内容）。" +
       "修改立即生效，无需 /reload。\n\n",
-    promptSnippet: "Manage tool blacklist for sub-agents (add/remove/list/set)",
-    promptGuidelines: [
-      "Use manage_tools to inspect or intentionally change which tools are hidden from sub-agent sessions.",
-      "Prefer manage_tools incremental add/remove; use blacklist_set only from a known complete baseline.",
-    ],
     parameters: Type.Object({
       action: Type.String({
         description: "操作: blacklist_add | blacklist_remove | blacklist_list | blacklist_set",

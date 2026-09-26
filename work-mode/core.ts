@@ -21,6 +21,11 @@ import {
   setAutoStopped,
   updateAutoStatusBar,
 } from "./auto-status.js";
+import {
+  formatImmutableCapabilityIndex,
+  syncActiveToolsForPhase,
+} from "../lib/capability-router.js";
+import { registerCapabilityTool } from "../lib/capability-tool.js";
 
 export interface CoreState {
   phase: ConversationPhase;
@@ -47,6 +52,8 @@ export function setupCore(
 
   let unregBus: (() => void) | undefined;
   let unregInput: (() => void) | undefined;
+
+  registerCapabilityTool(pi);
 
   if (!s.isSubAgent) {
     pi.on("session_start", (_event, ctx) => {
@@ -99,6 +106,7 @@ export function setupCore(
     });
     pi.appendEntry("work-phase-state", { phase, autonomy, autoAll });
     updateStatus(ctx);
+    syncActiveToolsForPhase(phase, pi);
   }
 
   function showPhaseNotification(ctx: ExtensionContext) {
@@ -155,6 +163,7 @@ export function setupCore(
       restoredGoal?.status === "active" ? `GOAL: ${restoredGoal.title}` : "",
     );
     updateStatus(ctx);
+    syncActiveToolsForPhase(s.phase, pi);
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -166,9 +175,11 @@ export function setupCore(
       isSubAgent: s.isSubAgent,
       executionContext: getExecutionContext(),
     });
+    const capabilityIndex = formatImmutableCapabilityIndex();
     const runtimePrompt = [
       formatProfileForPrompt(profile),
       workflowPromptForPhase(s.phase),
+      ...(capabilityIndex ? [capabilityIndex] : []),
     ].join("\n\n");
     return { systemPrompt: event.systemPrompt + "\n\n" + runtimePrompt };
   });

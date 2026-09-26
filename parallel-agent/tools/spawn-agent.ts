@@ -52,13 +52,6 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
       "派发子 Agent 执行分析任务。子 Agent 继承默认工具（read/bash/edit/write），" +
       "在后台并行运行，不阻塞主 Agent。每个任务拥有独立、增量落盘的任务面板与备注。" +
       "返回 jobId 用于查询结果。",
-    promptSnippet: "Spawn sub-agents for parallel code exploration (read-only)",
-    promptGuidelines: [
-      "Use spawn_agent only for bounded independent work that benefits from parallelism or a second-pass review; in PLAN every task must explicitly use phase=plan or chat.",
-      "Give every spawn_agent task a goal, scope, allowed and forbidden tools, expected output, and stop condition.",
-      "Do not use spawn_agent for a trivial read/search; completed results auto-inject and can also be checked with check_agent_results.",
-      "Use spawn_agent notes for durable initial constraints or handoff context that must remain visible on the child task panel; the child must later submit a conclusion for every meaningful stage and detail only when useful.",
-    ],
     parameters: Type.Object({
       tasks: Type.Array(
         Type.Object({

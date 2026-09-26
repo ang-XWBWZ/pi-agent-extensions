@@ -112,11 +112,6 @@ export function registerCheckResults(pi: ExtensionAPI): void {
     description:
       "查询子 Agent 执行结果。可轮询（不阻塞）或等待（阻塞直到完成）。" +
       "不传 jobId 时列出所有 Job。",
-    promptSnippet: "Check or wait for sub-agent results",
-    promptGuidelines: [
-      "Use check_agent_results after spawn_agent; prefer the default non-blocking check because completed results auto-inject.",
-      "Use check_agent_results wait=true only when the next action strictly depends on every child result.",
-    ],
     parameters: Type.Object({
       jobId: Type.Optional(Type.String({ description: "Job ID（不传则列出所有）" })),
       wait: Type.Optional(Type.Boolean({ description: "是否阻塞等待完成（默认 false）" })),

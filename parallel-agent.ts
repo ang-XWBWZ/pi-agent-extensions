@@ -18,6 +18,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerCapability } from "./lib/capability-router.js";
 import {
   onMessage,
   registerFrontendProcessor,
@@ -33,6 +34,41 @@ import { registerUpdateAgentTask } from "./parallel-agent/tools/update-task.js";
 import { registerReadAgentOutput } from "./parallel-agent/tools/read-output.js";
 
 export default function (pi: ExtensionAPI) {
+  registerCapability({
+    id: "parallel_agent",
+    name: "Parallel Agent Subsystem",
+    summary: "Spawn/manage background sub-agents for parallel code exploration and task delegation.",
+    keywords: ["subagent", "parallel", "spawn_agent", "background agent", "worker", "delegation"],
+    phases: ["work"],
+    tools: [
+      "spawn_agent",
+      "check_agent_results",
+      "send_agent_message",
+      "control_agent",
+      "update_agent_task",
+      "read_agent_output",
+      "manage_skills",
+      "manage_tools",
+    ],
+    usageDoc: `# Parallel Agent Subsystem (parallel_agent)
+
+### Available Tools:
+- \`spawn_agent(tasks)\`: Spawns sub-agents to explore code or run analysis in parallel in the background. Returns jobId.
+- \`check_agent_results(jobId?, wait?, timeout?)\`: Non-blocking or blocking poll for sub-agent results. Completed results auto-inject into context.
+- \`send_agent_message(to, payload, type?)\`: Point-to-point or broadcast message delivery to running sub-agents.
+- \`control_agent(action, jobId?, taskId?, ...)\`: Manage sub-agent lifecycle (list, status, pause, resume, abort, kill, save, load).
+- \`update_agent_task(...)\`: Update sub-agent task panel with monotonic progress, conclusions, and notes.
+- \`read_agent_output(jobId, taskId, cursor?, maxBytes?)\`: Paged byte-slice read of raw sub-agent logs without polluting context.
+- \`manage_skills(action, skills?)\`: Manage sub-agent skill blacklist.
+- \`manage_tools(action, tools?)\`: Manage sub-agent tool blacklist.
+
+### Critical Guidelines:
+1. Use spawn_agent only for bounded independent work that benefits from concurrency or second-pass review.
+2. In PLAN phase, every task must explicitly use phase="plan" or "chat".
+3. Give each sub-agent a concrete goal, scope, allowed/forbidden tools, expected output, and stop condition.
+4. Completed results are auto-injected; avoid polling in a busy loop when wait=false is sufficient.
+5. Use read_agent_output only when summary evidence is missing; never dump full archives into context.`,
+  });
   // SDK 子 Agent 没有交互式 UI。若仍注册这个全局 widget，它们会驱动
   // 父会话的 TUI 重绘，并在销毁时清掉父会话的 TUI 引用。
   const suppressSubAgentWidget =

@@ -56,14 +56,6 @@ export function registerUpdateAgentTask(pi: ExtensionAPI): void {
       "它不替代 send_agent_message、check_agent_results 或 control_agent。" +
       "子 Agent 身份优先于传入 ID；主 Agent 调用时需提供 jobId + taskId。" +
       "结论会追加为阶段记录并更新最新结论；详细说明只在提供时保存。省略字段保持原值，落盘失败会保留内存状态并返回 persistenceError。",
-    promptSnippet:
-      "Proactively persist sub-agent stage conclusions, optional details, progress, blockers, and partial findings",
-    promptGuidelines: [
-      "Use update_agent_task at start, after each meaningful stage, when blocked, and before the final answer.",
-      "Use update_agent_task conclusion for a clear stage result, not a terse label; optional detail adds only needed evidence or boundaries, never full logs.",
-      "Use update_agent_task note for brief durable observations outside stage conclusions; keep progress monotonic.",
-      "Before final answer, use update_agent_task to set completed/100 and a final conclusion with result, verification, and blockers; summary is a legacy alias.",
-    ],
     parameters: Type.Object({
       jobId: Type.Optional(
         Type.String({ description: "主 Agent 调用时的 Job ID；子 Agent 自动识别" }),

@@ -370,8 +370,6 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Add a Runtime PS reminder for the main agent",
     promptGuidelines: [
       "Use long_attention_add_ps only for a compact constraint, decision, risk, or open loop that must survive future turns.",
-      "Do not use long_attention_add_ps for current plan steps, temporary findings, or generic advice.",
-      "Give long_attention_add_ps the shortest useful expiration; reserve project/persistent for stable decisions.",
     ],
     parameters: Type.Object({
       message: Type.String({ description: "PS 内容，必须短、具体、可行动" }),
@@ -417,8 +415,6 @@ export default function (pi: ExtensionAPI) {
     name: "long_attention_list_ps",
     label: "Long Attention List PS",
     description: "查看长程注意力 PS 列表和当前注入配置。",
-    promptSnippet: "List Runtime PS reminders",
-    promptGuidelines: ["Use long_attention_list_ps before clearing or tuning Runtime PS items."],
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
       if (signal?.aborted) throw new Error("aborted");
@@ -445,8 +441,6 @@ export default function (pi: ExtensionAPI) {
     name: "long_attention_clear_ps",
     label: "Long Attention Clear PS",
     description: "清空或按 expires 清理长程注意力 PS。",
-    promptSnippet: "Clear Runtime PS reminders",
-    promptGuidelines: ["Use long_attention_clear_ps only with a clear scope; preserve project/persistent items unless the user requests removal."],
     parameters: Type.Object({
       scope: Type.Optional(Type.String({ description: "all|turn|task|phase|session|project|persistent，默认 all" })),
     }),
@@ -472,8 +466,6 @@ export default function (pi: ExtensionAPI) {
     name: "long_attention_config_ps",
     label: "Long Attention Config PS",
     description: "查看或调整长程注意力 PS 注入配置。",
-    promptSnippet: "Get or set Runtime PS config",
-    promptGuidelines: ["Use long_attention_config_ps only to inspect or intentionally change Runtime PS injection settings."],
     parameters: Type.Object({
       key: Type.Optional(Type.String({ description: "配置项名" })),
       value: Type.Optional(Type.Any({ description: "新值" })),

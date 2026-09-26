@@ -79,11 +79,6 @@ export function registerControlAgent(pi: ExtensionAPI): void {
     description:
       "控制子 Agent 生命周期：列出、查看状态、注入消息、打断、暂停、恢复、杀死、存档、恢复存档、删除存档。" +
       "status 会显示子 Agent 主动提交的阶段结论；可用 stageOffset 展开某一阶段的可选详细说明。支持操作单个 task 或整个 job。",
-    promptSnippet: "Manage sub-agent lifecycle (list/status/send/abort/pause/resume/kill/save/load/list_saves/delete_save)",
-    promptGuidelines: [
-      "Use control_agent list/status before changing a child Agent lifecycle; taskId targets one task and omission targets the job.",
-      "Use control_agent kill, kill_job, or delete_save only for an explicit cleanup reason and report the affected target.",
-    ],
     parameters: Type.Object({
       action: Type.String({ description: "操作: list | status | send | abort | pause | resume | kill | kill_job | save | list_saves | delete_save" }),
       jobId: Type.Optional(Type.String({ description: "Job ID" })),

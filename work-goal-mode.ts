@@ -5,6 +5,7 @@ import {
   compactAuditValue,
   redactAuditText,
 } from "./lib/audit-sanitize.js";
+import { registerCapability } from "./lib/capability-router.js";
 import {
   isToolResultError,
   renderStructuredToolCall,
@@ -118,6 +119,34 @@ function resultPreview(event: { content?: Array<{ type: string; text?: string }>
 }
 
 export default function (pi: ExtensionAPI) {
+  registerCapability({
+    id: "work_goal",
+    name: "Work Goal Ledger",
+    summary: "Structured task audit ledger (start/status/log/finish/abort).",
+    keywords: ["goal", "audit", "ledger", "work_goal", "task tracking"],
+    phases: ["work"],
+    tools: [
+      "work_goal_start",
+      "work_goal_status",
+      "work_goal_log",
+      "work_goal_finish",
+      "work_goal_abort",
+    ],
+    usageDoc: `# Work Goal Ledger Subsystem (work_goal)
+Provides structured audit logging and progress tracking for execution in WORK mode.
+
+### Available Tools:
+- \`work_goal_start(goal, title?)\`: Start an audit ledger for the current Work authorization.
+- \`work_goal_status()\`: Show current ledger status and recent logs.
+- \`work_goal_log(limit?)\`: Inspect recent ledger entries.
+- \`work_goal_finish(summary?)\`: Complete the goal ledger with an audit summary.
+- \`work_goal_abort(reason?)\`: Terminate the current ledger without losing records.
+
+### Usage Rules:
+- Only call within WORK phase.
+- Recording execution never expands or modifies current approval authority.`,
+  });
+
   pi.on("tool_call", (event, ctx) => {
     if (!shouldRecordGenericTool(event.toolName)) return;
     const executionContext = getExecutionContext();
@@ -173,11 +202,6 @@ export default function (pi: ExtensionAPI) {
     label: "work_goal_start",
     description:
       "Start an audit ledger for the current Work authorization. It records execution but never grants or expands permissions.",
-    promptSnippet: "Start an audit ledger without changing Work authorization",
-    promptGuidelines: [
-      "Use work_goal_start only in WORK when a concrete task benefits from a detailed audit ledger.",
-      "work_goal_start records the current authorization and must never be used to enable auto execution.",
-    ],
     parameters: Type.Object({
       goal: Type.String({ description: "Goal to execute toward" }),
       title: Type.Optional(Type.String({ description: "Short target title" })),
@@ -273,7 +297,6 @@ export default function (pi: ExtensionAPI) {
     name: "work_goal_status",
     label: "work_goal_status",
     description: "Show the current Work goal ledger status and recent logs.",
-    promptSnippet: "Show current Work goal ledger status",
     parameters: Type.Object({}),
     renderCall(_args, theme, context) {
       return renderStructuredToolCall(theme, context, "work_goal_status", []);
@@ -314,7 +337,6 @@ export default function (pi: ExtensionAPI) {
     name: "work_goal_log",
     label: "work_goal_log",
     description: "Show the current Work goal ledger, optionally limited to the most recent N entries.",
-    promptSnippet: "Show Work goal ledger entries",
     parameters: Type.Object({
       limit: Type.Optional(Type.Number({ description: "Recent log count" })),
     }),
@@ -356,7 +378,6 @@ export default function (pi: ExtensionAPI) {
     name: "work_goal_finish",
     label: "work_goal_finish",
     description: "Finish the active Work goal ledger and write a completion summary.",
-    promptSnippet: "Finish Work goal ledger and summarize execution",
     parameters: Type.Object({
       summary: Type.Optional(Type.String({ description: "Optional human summary" })),
     }),
@@ -410,7 +431,6 @@ export default function (pi: ExtensionAPI) {
     label: "work_goal_abort",
     description:
       "Abort the active Work goal ledger without changing the current Work authorization.",
-    promptSnippet: "Abort current Work goal ledger without changing authorization",
     parameters: Type.Object({
       reason: Type.Optional(Type.String({ description: "Abort reason" })),
     }),

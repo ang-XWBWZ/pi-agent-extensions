@@ -19,11 +19,6 @@ export function registerManageSkills(pi: ExtensionAPI): void {
     description:
       "管理 skill 黑名单。黑名单中的 skill 完全不会注入子进程。" +
       "支持添加/移除/列出/覆盖黑名单。修改立即生效，无需 /reload。",
-    promptSnippet: "Manage skill blacklist (add/remove/list/set)",
-    promptGuidelines: [
-      "Use manage_skills to inspect or intentionally change the sub-agent skill blacklist.",
-      "Prefer manage_skills incremental add/remove; use blacklist_set only from a known complete baseline.",
-    ],
     parameters: Type.Object({
       action: Type.String({
         description: "操作: blacklist_add | blacklist_remove | blacklist_list | blacklist_set",

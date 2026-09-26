@@ -21,11 +21,6 @@ export function registerReadAgentOutput(pi: ExtensionAPI): void {
       "按 UTF-8 字节游标分页读取某个子 Agent 的原始输出。" +
       "它只读取请求的片段，不加载会话存档，也不会主动把完整日志注入主上下文。" +
       "默认 12,000 字节，最多 32,000 字节；用返回的 nextCursor 继续。",
-    promptSnippet: "Read one bounded slice of a sub-agent's raw output when a preview needs evidence",
-    promptGuidelines: [
-      "Use read_agent_output only when a task summary or preview leaves a concrete evidence gap; do not prefetch full child output or session archives.",
-      "With read_agent_output, start with the default bounded page and use nextCursor only if the needed evidence is not yet present; summarize the finding instead of repeatedly copying raw logs.",
-    ],
     parameters: Type.Object({
       jobId: Type.String({ description: "子任务所属 Job ID" }),
       taskId: Type.String({ description: "子任务 Task ID" }),
