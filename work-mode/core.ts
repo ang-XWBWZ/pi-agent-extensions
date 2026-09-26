@@ -189,7 +189,7 @@ export function setupCore(
   });
 
   pi.registerCommand("auto", {
-    description: "WORK phase - AI-reviewed command authorization; use /auto_flash to configure the reviewer",
+    description: "WORK phase - AI-reviewed command authorization; use /auto_model to configure the reviewer",
     handler: async (_a, ctx) => {
       ensureAutoFlashSystemContext(ctx.cwd);
       applyProfile("work", "auto", ctx);
@@ -197,7 +197,7 @@ export function setupCore(
       ctx.ui.notify(
         model
           ? `WORK phase - AUTO AI 审批（${model.provider}/${model.model}）`
-          : "WORK phase - AUTO AI 审批；尚未配置 AUTO_FLASH，请执行 /auto_flash <provider>/<model>",
+          : "WORK phase - AUTO AI 审批；尚未配置 AI 审批模型，请执行 /auto_model <provider>/<model>",
         model ? "info" : "warning",
       );
     },

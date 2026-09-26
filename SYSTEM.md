@@ -263,9 +263,11 @@ approve, send the exact command/tool, target, risk effect, working directory, an
 the optional `purpose` to the configured `AUTO_FLASH` model. The model returns a
 structured allow/deny decision and a reason; only an allow continues.
 
-`/auto_flash <provider>/<model>` configures the reviewer. `/auto_flash off` leaves
+`/auto_model <provider>/<model>` configures the reviewer (`/auto_flash` remains supported as an alias). `/auto_model off` leaves
 `/auto` unable to pass calls that require AI review, so they are denied rather
-than silently falling back to human approval. Safe in-workspace reads and
+than silently falling back to human approval. `/auto_add_prmt <prompt>` supplies custom
+reviewer instructions (persisted in `autoCustomPrompt`), and active Plan/Goal stateless
+specifications are automatically injected into the review context. Safe in-workspace reads and
 recognized routine/scoped work do not need a redundant model round trip.
 
 The reviewer reference is persisted in `~/.pi/agent/settings.json` as the

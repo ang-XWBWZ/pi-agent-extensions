@@ -12,8 +12,12 @@ import type { Model, AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsSection, updateSettings } from "../lib/settings-io.js";
 import { compactAuditValue, compactReviewValue, redactAuditText } from "../lib/audit-sanitize.js";
+import type { PlanStep } from "./types.js";
+import type { WorkGoalState } from "../lib/workflow-types.js";
+import { getActiveWorkGoal } from "../lib/work-goal-store.js";
 
 export const AUTO_FLASH_SETTINGS_KEY = "autoFlashModel";
+export const AUTO_CUSTOM_PROMPT_SETTINGS_KEY = "autoCustomPrompt";
 export const AUTO_FLASH_SYSTEM_CONTEXT_PATH = ".agents/auto_flash_system.md";
 export const DEFAULT_AUTO_FLASH_SYSTEM_CONTEXT = `# AUTO_FLASH 预定义审核上下文
 #
@@ -98,6 +102,9 @@ export interface AutoFlashReviewRequest {
   input?: unknown;
   cwd: string;
   effect: string;
+  planContext?: string;
+  goalContext?: string;
+  customPrompt?: string;
 }
 
 export interface AutoFlashReviewResult {
@@ -105,6 +112,58 @@ export interface AutoFlashReviewResult {
   reason: string;
   modelRef?: string;
   skipped?: boolean;
+}
+
+export function getAutoCustomPrompt(): string | undefined {
+  const value = getSettingsSection(AUTO_CUSTOM_PROMPT_SETTINGS_KEY, undefined);
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function setAutoCustomPrompt(prompt?: string): void {
+  updateSettings((settings) => {
+    if (prompt && prompt.trim()) {
+      settings[AUTO_CUSTOM_PROMPT_SETTINGS_KEY] = prompt.trim();
+    } else {
+      delete settings[AUTO_CUSTOM_PROMPT_SETTINGS_KEY];
+    }
+    return settings;
+  });
+}
+
+export function formatStatelessPlanContext(steps: PlanStep[], fullText?: string): string {
+  const lines: string[] = [];
+  if (fullText && fullText.trim()) {
+    lines.push(`计划概述: ${redactAuditText(fullText.trim()).slice(0, 1000)}`);
+  }
+  if (steps.length > 0) {
+    lines.push("计划步骤清单:");
+    for (const step of steps) {
+      const marker = step.status === "current" ? "▶ [进行中]" : `[${step.status}]`;
+      lines.push(`  ${step.id}. ${marker} ${redactAuditText(step.text).slice(0, 300)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function formatStatelessGoalContext(goal: WorkGoalState): string {
+  const title = redactAuditText(goal.title).slice(0, 200);
+  const goalText = redactAuditText(goal.goal).slice(0, 1000);
+  return [
+    `目标名称: ${title}`,
+    `目标定义: ${goalText}`,
+  ].join("\n");
+}
+
+export function getActiveGoalContext(): string | undefined {
+  try {
+    const active = getActiveWorkGoal();
+    if (active && active.status === "active") {
+      return formatStatelessGoalContext(active);
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
 }
 
 function normalizeRef(value: unknown): AutoFlashModelRef | undefined {
@@ -236,7 +295,7 @@ export async function reviewWithAutoFlash(
   if (!ref) {
     return {
       allow: false,
-      reason: "未配置 AUTO_FLASH 模型；请先执行 /auto_flash <provider>/<model>",
+      reason: "未配置 AUTO_FLASH 模型；请先执行 /auto_model <provider>/<model>",
     };
   }
 
@@ -246,7 +305,7 @@ export async function reviewWithAutoFlash(
     return {
       allow: false,
       modelRef,
-      reason: `AUTO_FLASH 模型不可用：${modelRef}；请执行 /auto_flash 重新配置`,
+      reason: `AUTO_FLASH 模型不可用：${modelRef}；请执行 /auto_model 重新配置`,
     };
   }
   const provider = ctx.modelRegistry.getProvider(ref.provider);
@@ -293,6 +352,11 @@ export async function reviewWithAutoFlash(
         "输出必须是 JSON。",
       ].join("\n")
     : "你是严格、简洁、保守的安全审批器。输出必须是 JSON。";
+
+  const customPrompt = (request.customPrompt ?? getAutoCustomPrompt())?.trim();
+  const goalContext = (request.goalContext ?? getActiveGoalContext())?.trim();
+  const planContext = request.planContext?.trim();
+
   const prompt = [
     "审查下面这条即将执行的命令或工具调用。你是安全审批器，不负责执行调用。",
     "只返回 JSON，不要 Markdown：{\"allow\":true|false,\"reason\":\"简短中文原因\"}。",
@@ -303,6 +367,21 @@ export async function reviewWithAutoFlash(
     `调用用途: ${safePurpose}`,
     ...(safeInput !== undefined ? [`调用参数: ${safeInput}`] : []),
     `调用目标: ${safeCommand}`,
+    ...(goalContext ? [
+      "---",
+      "【当前活动目标（目标模式）】",
+      goalContext,
+    ] : []),
+    ...(planContext ? [
+      "---",
+      "【当前执行计划（计划模式）】",
+      planContext,
+    ] : []),
+    ...(customPrompt ? [
+      "---",
+      "【用户自定义审核指令】",
+      redactAuditText(customPrompt).slice(0, 3000),
+    ] : []),
   ].join("\n");
   const sessionId = autoFlashSessionId(ctx);
 
@@ -362,45 +441,107 @@ function parseModelRef(args: string): AutoFlashModelRef | undefined {
   return provider && model ? { provider, model } : undefined;
 }
 
-export function registerAutoFlashCommand(pi: ExtensionAPI): void {
-  pi.registerCommand("auto_flash", {
-    description: "配置 AUTO 的 AI 安全审批模型: /auto_flash <provider>/<model> | off",
-    handler: async (args, ctx) => {
-      const value = args.trim();
-      if (value.toLowerCase() === "off" || value.toLowerCase() === "disable") {
-        updateSettings((settings) => {
-          delete settings[AUTO_FLASH_SETTINGS_KEY];
-          return settings;
-        });
-        ensureAutoFlashSystemContext(ctx.cwd);
-        ctx.ui.notify("AUTO_FLASH 已关闭；/auto 将拒绝需要 AI 审批的命令，/auto_all 仍是全同意模式", "warning");
-        return;
-      }
-
-      let ref = parseModelRef(value);
-      if (!ref) {
-        const available = await ctx.modelRegistry.getAvailable();
-        if (available.length === 0) {
-          ctx.ui.notify("没有可用模型。用法: /auto_flash <provider>/<model> 或 /auto_flash off", "error");
-          return;
-        }
-        const selected = await ctx.ui.select(
-          "选择 AUTO_FLASH 安全审批模型",
-          available.map((model) => `${model.provider}/${model.id}`),
-        );
-        ref = selected ? parseModelRef(selected) : undefined;
-      }
-      if (!ref) return;
-      if (!ctx.modelRegistry.find(ref.provider, ref.model)) {
-        ctx.ui.notify(`模型不存在或不可用: ${modelLabel(ref)}`, "error");
-        return;
-      }
+export function registerAutoModelCommand(pi: ExtensionAPI): void {
+  const handler = async (args: string, ctx: ExtensionContext) => {
+    const value = args.trim();
+    if (value.toLowerCase() === "off" || value.toLowerCase() === "disable") {
       updateSettings((settings) => {
-        settings[AUTO_FLASH_SETTINGS_KEY] = ref;
+        delete settings[AUTO_FLASH_SETTINGS_KEY];
         return settings;
       });
       ensureAutoFlashSystemContext(ctx.cwd);
-      ctx.ui.notify(`AUTO_FLASH 已配置: ${modelLabel(ref)}`, "info");
+      ctx.ui.notify("AUTO AI 审批模型已关闭；/auto 将拒绝需要 AI 审批的命令，/auto_all 仍是全同意模式", "warning");
+      return;
+    }
+
+    let ref = parseModelRef(value);
+    if (!ref) {
+      const available = await ctx.modelRegistry.getAvailable();
+      if (available.length === 0) {
+        ctx.ui.notify("没有可用模型。用法: /auto_model <provider>/<model> 或 /auto_model off", "error");
+        return;
+      }
+      const selected = await ctx.ui.select(
+        "选择 AUTO 安全审批模型",
+        available.map((model) => `${model.provider}/${model.id}`),
+      );
+      ref = selected ? parseModelRef(selected) : undefined;
+    }
+    if (!ref) return;
+    if (!ctx.modelRegistry.find(ref.provider, ref.model)) {
+      ctx.ui.notify(`模型不存在或不可用: ${modelLabel(ref)}`, "error");
+      return;
+    }
+    updateSettings((settings) => {
+      settings[AUTO_FLASH_SETTINGS_KEY] = ref;
+      return settings;
+    });
+    ensureAutoFlashSystemContext(ctx.cwd);
+    ctx.ui.notify(`AUTO 安全审批模型已配置: ${modelLabel(ref)}`, "info");
+  };
+
+  pi.registerCommand("auto_model", {
+    description: "配置 AUTO 的 AI 安全审批模型: /auto_model <provider>/<model> | off",
+    handler,
+  });
+
+  pi.registerCommand("auto_flash", {
+    description: "兼容别名，指向 /auto_model",
+    handler,
+  });
+}
+
+export function registerAutoAddPrmtCommand(pi: ExtensionAPI): void {
+  pi.registerCommand("auto_add_prmt", {
+    description: "输入/配置审核模型的自定义提示词: /auto_add_prmt <自定义提示词> | off | clear",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (value.toLowerCase() === "off" || value.toLowerCase() === "clear" || value.toLowerCase() === "reset") {
+        setAutoCustomPrompt(undefined);
+        ctx.ui.notify("已清除审核模型自定义提示词", "info");
+        return;
+      }
+
+      if (value) {
+        setAutoCustomPrompt(value);
+        const preview = value.length > 50 ? value.slice(0, 47) + "..." : value;
+        ctx.ui.notify(`审核模型自定义提示词已更新: ${preview}`, "info");
+        return;
+      }
+
+      const current = getAutoCustomPrompt();
+      let input: string | undefined;
+      if (typeof ctx.ui.editor === "function") {
+        input = await ctx.ui.editor("输入审核模型自定义提示词 (清空保存则清除):", current ?? "");
+      } else if (typeof ctx.ui.input === "function") {
+        input = await ctx.ui.input("输入审核模型自定义提示词 (留空取消):", current ?? "");
+      } else {
+        ctx.ui.notify(
+          current
+            ? `当前审核模型自定义提示词: ${current}\n用法: /auto_add_prmt <提示词> 或 /auto_add_prmt off`
+            : "当前未配置自定义提示词。用法: /auto_add_prmt <提示词>",
+          "info",
+        );
+        return;
+      }
+
+      if (input === undefined) {
+        return;
+      }
+
+      if (input.trim()) {
+        setAutoCustomPrompt(input.trim());
+        const preview = input.trim().length > 50 ? input.trim().slice(0, 47) + "..." : input.trim();
+        ctx.ui.notify(`审核模型自定义提示词已更新: ${preview}`, "info");
+      } else {
+        setAutoCustomPrompt(undefined);
+        ctx.ui.notify("已清除审核模型自定义提示词", "info");
+      }
     },
   });
+}
+
+export function registerAutoFlashCommand(pi: ExtensionAPI): void {
+  registerAutoModelCommand(pi);
+  registerAutoAddPrmtCommand(pi);
 }

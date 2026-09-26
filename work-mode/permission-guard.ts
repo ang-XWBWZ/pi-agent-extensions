@@ -15,7 +15,7 @@ import {
 import { getExecutionContext } from "../lib/execution-context.js";
 import { type ConversationPhase, type PlanStep } from "./types.js";
 import { confirmAndRemember, showAutoFlashFallbackConfirm } from "./confirm-dialog.js";
-import { reviewWithAutoFlash } from "./auto-flash.js";
+import { formatStatelessPlanContext, reviewWithAutoFlash, type AutoFlashReviewRequest } from "./auto-flash.js";
 import { profileFromPhase } from "./execution-profile.js";
 import {
   decideToolCall,
@@ -27,6 +27,7 @@ export interface PermissionState {
   phase: ConversationPhase;
   isSubAgent: boolean;
   planSteps: PlanStep[];
+  planFullText?: string;
   pathAllowlist: Set<string>;
   cmdAllowlist: Set<string>;
   actionAllowlist: Set<string>;
@@ -54,11 +55,18 @@ async function applyDecision(
   }
   if (decision.action === "allow") {
     if (decision.flashReview) {
-      const review = await reviewWithAutoFlash(ctx, decision.flashReview);
+      const planContext = (state.planSteps && state.planSteps.length > 0) || state.planFullText
+        ? formatStatelessPlanContext(state.planSteps ?? [], state.planFullText)
+        : undefined;
+      const reviewReq: AutoFlashReviewRequest = {
+        ...decision.flashReview,
+        ...(planContext ? { planContext } : {}),
+      };
+      const review = await reviewWithAutoFlash(ctx, reviewReq);
       if (!review.allow) {
         const fallback = await showAutoFlashFallbackConfirm(
           ctx,
-          decision.flashReview,
+          reviewReq,
           review,
           state.isSubAgent,
         );
