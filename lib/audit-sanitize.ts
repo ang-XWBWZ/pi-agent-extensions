@@ -38,6 +38,47 @@ export function compactAuditValue(value: unknown, limit = 800): string {
   return text.length > limit ? text.slice(0, limit) + "...[truncated]" : text;
 }
 
+const LARGE_BODY_FIELD = /(?:content|text|body|diff|patch|code|payload|data|prompt|script)/i;
+
+export function sanitizeReviewValue(value: unknown, depth = 0): unknown {
+  if (depth > 5) return "[truncated]";
+  if (typeof value === "string") {
+    const redacted = redactAuditText(value);
+    if (redacted.length > 500) {
+      return `${redacted.slice(0, 300)}... [共 ${redacted.length} 字符]`;
+    }
+    return redacted;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 30).map((item) => sanitizeReviewValue(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (SECRET_FIELD.test(key)) {
+        result[key] = "[redacted]";
+      } else if (typeof item === "string" && LARGE_BODY_FIELD.test(key) && item.length > 300) {
+        const redacted = redactAuditText(item);
+        result[key] = `${redacted.slice(0, 200)}... [共 ${redacted.length} 字符]`;
+      } else {
+        result[key] = sanitizeReviewValue(item, depth + 1);
+      }
+    }
+    return result;
+  }
+  return value;
+}
+
+export function compactReviewValue(value: unknown, limit = 2_400): string {
+  let text: string;
+  try {
+    text = JSON.stringify(sanitizeReviewValue(value)) ?? String(value);
+  } catch {
+    text = redactAuditText(String(value));
+  }
+  return text.length > limit ? text.slice(0, limit) + "...[truncated]" : text;
+}
+
 export function auditTextPreview(
   content: Array<{ type: string; text?: string }> | undefined,
   limit = 600,

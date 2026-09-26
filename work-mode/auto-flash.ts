@@ -11,7 +11,7 @@ import { resolve } from "node:path";
 import type { Model, AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsSection, updateSettings } from "../lib/settings-io.js";
-import { compactAuditValue, redactAuditText } from "../lib/audit-sanitize.js";
+import { compactAuditValue, compactReviewValue, redactAuditText } from "../lib/audit-sanitize.js";
 
 export const AUTO_FLASH_SETTINGS_KEY = "autoFlashModel";
 export const AUTO_FLASH_SYSTEM_CONTEXT_PATH = ".agents/auto_flash_system.md";
@@ -49,6 +49,11 @@ git status、git diff、git log 等检查命令可用于核对范围。提交、
 [网络与外部系统]
 网络请求、远程 API、发布、推送、部署和外部消息属于外部副作用。先区分本地调用入口、实际请求、远端响应和后台可见性。
 不能仅凭 UI 文案、分支进入或本地错误字符串声称远端调用已经发生；没有必要时不要发送验证性真实请求。
+
+[MCP与知识库操作]
+MCP 工具调用（包含 mcp_call、call_mcp_tool 或 direct tool）需重点核对 server、tool 及 arguments 参数。
+知识库与文档检索（如 wiki_search、wiki_read_entry、wiki_read_chunk、wiki_area_list 等只读工具）在当前项目范围内通常允许。
+知识库条目创建、修改与维护（如 wiki_create_entry、wiki_modify_entry、wiki_load 等持久化工具），只要目标条目/路径明确、内容合理且与当前任务用途一致，应予以批准；但若涉及清空、大范围删除或未指定具体条目的盲目覆盖，应予以拒绝。
 
 [凭证与敏感数据]
 不要读取、打印、提交或发送 API key、token、密码、私钥、Cookie、完整设备标识或其他秘密。
@@ -276,7 +281,7 @@ export async function reviewWithAutoFlash(
   const safePurpose = redactAuditText(request.purpose ?? "未提供").slice(0, 600);
   const safeInput = request.input === undefined
     ? undefined
-    : compactAuditValue(request.input, 2_000);
+    : compactReviewValue(request.input, 2_400);
   const predefinedContext = loadAutoFlashSystemContext(request.cwd);
   const systemPrompt = predefinedContext
     ? [

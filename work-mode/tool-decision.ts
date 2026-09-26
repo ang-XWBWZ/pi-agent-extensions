@@ -104,11 +104,39 @@ function commandOf(event: { input?: unknown }): string {
   return typeof command === "string" ? command.trim() : "";
 }
 
-function purposeOf(event: { input?: unknown }): string | undefined {
-  const purpose = inputOf(event).purpose;
-  if (typeof purpose !== "string") return undefined;
-  const value = purpose.replace(/\s+/g, " ").trim();
-  return value ? value.slice(0, 240) : undefined;
+function purposeOf(event: { toolName?: string; input?: unknown }): string | undefined {
+  const input = inputOf(event);
+  const explicit =
+    input.purpose ??
+    input.toolAction ??
+    input.toolSummary ??
+    input.description ??
+    input.summary ??
+    input.reason ??
+    input.justification;
+
+  if (typeof explicit === "string") {
+    const value = explicit.replace(/\s+/g, " ").trim();
+    if (value) return value.slice(0, 240);
+  }
+
+  if (typeof event.toolName === "string" && event.toolName.trim()) {
+    const mcp = parseMcpCallInfo(event.toolName, input);
+    if (mcp) {
+      const targetHint =
+        mcp.arguments.entry ??
+        mcp.arguments.path ??
+        mcp.arguments.title ??
+        mcp.arguments.query ??
+        mcp.arguments.name;
+      const hintStr = typeof targetHint === "string" && targetHint.trim()
+        ? ` [${targetHint.trim().slice(0, 60)}]`
+        : "";
+      return `调用 MCP 工具 ${mcp.server}/${mcp.tool}${hintStr}`;
+    }
+  }
+
+  return undefined;
 }
 
 function pathOf(
@@ -168,6 +196,118 @@ function mcpPolicyRegistry(): McpPolicyRegistry | undefined {
   return (globalThis as Record<string, unknown>).__pi_mcp_policy_registry as McpPolicyRegistry | undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+export interface McpCallInfo {
+  server: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  isDirect?: boolean;
+}
+
+export function parseMcpCallInfo(
+  toolName: string,
+  input: Record<string, unknown> = {},
+): McpCallInfo | undefined {
+  // 1. call_mcp_tool (Antigravity / MCP client format)
+  if (toolName === "call_mcp_tool") {
+    const server = input.ServerName ?? input.serverName ?? input.server;
+    const tool = input.ToolName ?? input.toolName ?? input.tool ?? input.method;
+    if (typeof server === "string" && server.trim() && typeof tool === "string" && tool.trim()) {
+      const rawArgs = input.Arguments ?? input.arguments;
+      const args = isRecord(rawArgs) ? rawArgs : {};
+      return {
+        server: server.trim(),
+        tool: tool.trim(),
+        arguments: args,
+        isDirect: false,
+      };
+    }
+  }
+
+  // 2. mcp_call (Generic Pi MCP format)
+  if (toolName === "mcp_call") {
+    const server = typeof input.server === "string" && input.server.trim() ? input.server.trim() : undefined;
+    const tool = typeof input.tool === "string" && input.tool.trim() ? input.tool.trim() : undefined;
+    if (server && tool) {
+      const args = isRecord(input.arguments) ? input.arguments : {};
+      return {
+        server,
+        tool,
+        arguments: args,
+        isDirect: false,
+      };
+    }
+    return undefined;
+  }
+
+  // 3. Registered alias tool (e.g. wiki({ method, arguments }))
+  try {
+    const aliasServer = mcpPolicyRegistry()?.resolveAlias?.(toolName);
+    if (aliasServer) {
+      const tool = typeof input.method === "string" && input.method.trim()
+        ? input.method.trim()
+        : typeof input.tool === "string" && input.tool.trim()
+        ? input.tool.trim()
+        : undefined;
+      if (tool) {
+        const args = isRecord(input.arguments) ? input.arguments : {};
+        return {
+          server: aliasServer,
+          tool,
+          arguments: args,
+          isDirect: false,
+        };
+      }
+    }
+  } catch {
+    // Ignore registry lookup failure
+  }
+
+  // 4. Registered direct tool (from mcpPolicyRegistry)
+  try {
+    const directTool = mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
+    if (directTool) {
+      return {
+        server: directTool.server,
+        tool: directTool.tool,
+        arguments: input,
+        isDirect: true,
+      };
+    }
+  } catch {
+    // Ignore registry lookup failure
+  }
+
+  // 5. Namespaced tool name: mcp__<server>__<tool> or mcp_<server>_<tool>
+  const namespacedMatch = toolName.match(/^mcp(?:__|_)([a-zA-Z0-9_-]+?)(?:__|_)(.+)$/);
+  if (namespacedMatch) {
+    const server = namespacedMatch[1];
+    const tool = namespacedMatch[2];
+    const args = isRecord(input.arguments) ? input.arguments : input;
+    return {
+      server,
+      tool,
+      arguments: args,
+      isDirect: true,
+    };
+  }
+
+  // 6. Direct known server prefix fallback (e.g. wiki_* -> pwiki)
+  if (toolName.startsWith("wiki_")) {
+    return {
+      server: "pwiki",
+      tool: toolName,
+      arguments: isRecord(input.arguments) ? input.arguments : input,
+      isDirect: true,
+    };
+  }
+
+  return undefined;
+}
+
 function classifyMcpCall(input: Record<string, unknown>): ToolEffect {
   const server = typeof input.server === "string" ? input.server.trim() : "";
   const tool = typeof input.tool === "string" ? input.tool.trim() : "";
@@ -187,48 +327,32 @@ function mcpServerForTool(
   toolName: string,
   input: Record<string, unknown>,
 ): string | undefined {
-  if (toolName === "mcp_call") {
-    return typeof input.server === "string" && input.server.trim()
-      ? input.server.trim()
-      : undefined;
-  }
-  try {
-    return mcpPolicyRegistry()?.resolveAlias?.(toolName)
-      ?? mcpPolicyRegistry()?.resolveDirectTool?.(toolName)?.server;
-  } catch {
-    return undefined;
-  }
+  return parseMcpCallInfo(toolName, input)?.server;
 }
 
 function mcpMethodForTool(toolName: string, input: Record<string, unknown>): string | undefined {
-  if (toolName === "mcp_call") {
-    const value = input.tool;
-    return typeof value === "string" && value.trim() ? value.trim() : undefined;
-  }
-  try {
-    const directTool = mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
-    if (directTool) return directTool.tool;
-  } catch {
-    // Fall through to the configured alias shape.
-  }
-  const value = input.method;
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  return parseMcpCallInfo(toolName, input)?.tool;
 }
 
 function mcpReviewInput(toolName: string, input: Record<string, unknown>): unknown {
-  const server = mcpServerForTool(toolName, input);
-  const tool = mcpMethodForTool(toolName, input);
-  if (!server || !tool) return undefined;
-  const isDirectTool = !!mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
-  return {
-    server,
-    tool,
-    arguments: isDirectTool ? input : input.arguments ?? {},
-  };
+  const mcp = parseMcpCallInfo(toolName, input);
+  if (mcp) {
+    return {
+      server: mcp.server,
+      tool: mcp.tool,
+      arguments: mcp.arguments,
+    };
+  }
+  return Object.keys(input).length > 0 ? input : undefined;
 }
 
 function isMcpAliasTool(toolName: string): boolean {
-  return toolName !== "mcp_call" && !!mcpServerForTool(toolName, {});
+  if (toolName === "mcp_call" || toolName === "call_mcp_tool") return false;
+  return !!parseMcpCallInfo(toolName, {})?.server;
+}
+
+function isMcpTool(toolName: string, input: Record<string, unknown> = {}): boolean {
+  return toolName === "mcp_call" || toolName === "call_mcp_tool" || !!parseMcpCallInfo(toolName, input);
 }
 
 function isAlwaysAllowedMcpCall(
@@ -289,9 +413,23 @@ export function classifyCustomToolEffect(
     if (action === "remove") return "destructive";
     return "persistent";
   }
+  if (toolName === "mcp_discover") {
+    return "read";
+  }
+
+  const mcpInfo = parseMcpCallInfo(toolName, input);
+  if (mcpInfo) {
+    return classifyMcpCall({
+      server: mcpInfo.server,
+      tool: mcpInfo.tool,
+      arguments: mcpInfo.arguments,
+    });
+  }
+
   if (toolName === "mcp_call") {
     return classifyMcpCall(input);
   }
+
   const aliasServer = mcpServerForTool(toolName, input);
   if (aliasServer) {
     const directTool = mcpPolicyRegistry()?.resolveDirectTool?.(toolName);
@@ -300,9 +438,6 @@ export function classifyCustomToolEffect(
       tool: directTool?.tool ?? input.method,
       arguments: directTool ? input : input.arguments,
     });
-  }
-  if (toolName === "mcp_discover") {
-    return "read";
   }
 
   if (READ_TOOLS.has(toolName)) return "read";
@@ -354,6 +489,8 @@ function describeCustomTarget(
   input: Record<string, unknown>,
 ): string {
   const details: string[] = [];
+  const mcpInfo = parseMcpCallInfo(toolName, input);
+
   for (const key of [
     "action",
     "path",
@@ -386,6 +523,49 @@ function describeCustomTarget(
       details.push(`${key}=${String(value).trim()}`);
     }
   }
+
+  if (mcpInfo) {
+    if (!details.some((d) => d.startsWith("server="))) {
+      details.push(`server=${mcpInfo.server}`);
+    }
+    if (!details.some((d) => d.startsWith("tool=") || d.startsWith("method="))) {
+      details.push(`tool=${mcpInfo.tool}`);
+    }
+    const args = mcpInfo.arguments;
+    for (const key of [
+      "entry",
+      "path",
+      "file",
+      "name",
+      "title",
+      "query",
+      "area",
+      "id",
+      "uri",
+      "model",
+      "action",
+      "mode",
+    ]) {
+      const value = args[key];
+      if (
+        (typeof value === "string" || typeof value === "number") &&
+        String(value).trim() &&
+        !details.some((d) => d.startsWith(`${key}=`))
+      ) {
+        const strVal = String(value).trim();
+        const formatted = strVal.includes(" ") ? `"${strVal}"` : strVal;
+        details.push(`${key}=${formatted}`);
+      }
+    }
+    for (const key of ["content", "text", "body", "patch", "diff", "code"]) {
+      const value = args[key];
+      if (typeof value === "string" && value.length > 0 && !details.some((d) => d.startsWith(`${key}=`))) {
+        details.push(`${key}=(${value.length} chars)`);
+        break;
+      }
+    }
+  }
+
   return details.length > 0 ? `${toolName} ${details.join(" ")}` : toolName;
 }
 
@@ -852,7 +1032,7 @@ function decideToolCallBase(
   if (
     profile.approval === "never_ask" &&
     !AUTO_CONFIRM_TOOLS.has(event.toolName) &&
-    !isMcpAliasTool(event.toolName) &&
+    !isMcpTool(event.toolName, input) &&
     !(
       event.toolName === "switch_model" &&
       typeof input.action === "string" &&
