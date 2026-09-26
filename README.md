@@ -180,7 +180,7 @@ Select-String -Path *.txt -Pattern "连接超时"
 
 **统一风险守卫**：内置文件/终端工具和全部自定义工具都经过 `read / progress / workspace_write / persistent / destructive / unknown` 风险判定。破坏性和未知确认只能单次授权，不能写入“始终允许”。非只读调用自动写入脱敏审计条目；普通工具失败保持当前步骤，交给 AI 诊断和重试，不会谎报完成。
 
-**用户命令**：`/chat` `/plan` `/work` `/auto` `/auto_all` `/auto_model` `/auto_add_prmt` `/security-review` `/plan-expand` `/plan-collapse` `/plan-cancel`。`/auto` 使用 `/auto_model <provider>/<model>` 配置的 AI 审批模型（`/auto_flash` 为兼容别名）；引用保存在 `~/.pi/agent/settings.json` 的 `autoFlashModel`，自定义供应商仍从运行时 `provider` 注册链调用；`/auto_add_prmt <提示词>` 可配置审核模型的自定义提示词；若计划/目标模式启动，其无状态规格内容会自动注入审批上下文。`/auto_all` 是独立的显式全同意授权，不调用 AI 审批。`cmd/powershell` 支持 `purpose`（审批用途）和 `auto_all`（全同意请求）参数；拒绝审批时可选择填写原因，原因进入脱敏审计并返回给调用方。`/yolo` 暂作为 `/auto` 兼容别名。
+**用户命令**：`/chat` `/plan` `/work` `/auto` `/auto_stop` `/auto_all` `/auto_model` `/auto_add_prmt` `/security-review` `/plan-expand` `/plan-collapse` `/plan-cancel`。`/auto` 使用 `/auto_model <provider>/<model>` 配置的 AI 审批模型（`/auto_flash` 为兼容别名）；引用保存在 `~/.pi/agent/settings.json` 的 `autoFlashModel`，自定义供应商仍从运行时 `provider` 注册链调用；审批模型限制思考强度（`reasoning: "minimal"`）与最大 Token（256），避免长考和冗长输出；`/auto_add_prmt <提示词>` 可配置审核模型的自定义提示词；若计划/目标模式启动，其无状态规格内容会自动注入审批上下文；`/auto_stop`（别名 `/auto_cancel`、`/auto_abort`）可一键强制终止 AUTO 任务并回退到 GUARDED 模式；单轮连续自动执行超过 25 步（可配 `autoMaxSteps`）自动触发防死循环熔断；终端最底部状态栏实时展示 AUTO 工作状态（就绪/审核中/已放行/已拦截/已终止/已熔断）。`/auto_all` 是独立的显式全同意授权，不调用 AI 审批。`cmd/powershell` 支持 `purpose`（审批用途）和 `auto_all`（全同意请求）参数；拒绝审批时可选择填写原因，原因进入脱敏审计并返回给调用方。`/yolo` 暂作为 `/auto` 兼容别名。
 
 ---
 

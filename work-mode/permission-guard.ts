@@ -12,10 +12,17 @@ import {
   compactAuditValue,
   redactAuditText,
 } from "../lib/audit-sanitize.js";
-import { getExecutionContext } from "../lib/execution-context.js";
+import { getExecutionContext, setExecutionContext } from "../lib/execution-context.js";
 import { type ConversationPhase, type PlanStep } from "./types.js";
 import { confirmAndRemember, showAutoFlashFallbackConfirm } from "./confirm-dialog.js";
 import { formatStatelessPlanContext, reviewWithAutoFlash, type AutoFlashReviewRequest } from "./auto-flash.js";
+import {
+  checkAutoCircuitBreaker,
+  getOrCreateAutoAbortSignal,
+  isAutoStopped,
+  recordAutoStep,
+  updateAutoStatusBar,
+} from "./auto-status.js";
 import { profileFromPhase } from "./execution-profile.js";
 import {
   decideToolCall,
@@ -35,6 +42,7 @@ export interface PermissionState {
 
 export interface PermissionCallbacks {
   getCurrentStepIndex: () => number;
+  onCircuitBreak?: (reason: string, ctx: ExtensionContext) => void;
 }
 
 interface PendingAudit {
@@ -49,21 +57,63 @@ async function applyDecision(
   event: { toolCallId: string; toolName: string },
   ctx: ExtensionContext,
   state: PermissionState,
+  callbacks?: PermissionCallbacks,
 ) {
   if (decision.warning) {
     ctx.ui.notify(decision.warning, "warning");
   }
+
+  if (isAutoStopped()) {
+    updateAutoStatusBar(ctx);
+    return {
+      block: true,
+      reason: "用户已通过 /auto_stop 强制终止 AUTO 自动化任务",
+    };
+  }
+
+  const executionContext = getExecutionContext();
+  if (executionContext.autonomy === "auto" && decision.action !== "deny") {
+    const breaker = checkAutoCircuitBreaker();
+    if (breaker.broken) {
+      if (callbacks?.onCircuitBreak) {
+        callbacks.onCircuitBreak(breaker.reason ?? "步数超限", ctx);
+      } else {
+        setExecutionContext({
+          ...executionContext,
+          autonomy: "guarded",
+          approval: {
+            ...executionContext.approval,
+            interactive: true,
+            preauthorized: false,
+            inheritToChildren: false,
+            autoAll: false,
+          },
+        });
+      }
+      updateAutoStatusBar(ctx);
+      ctx.ui.notify(breaker.reason ?? "AUTO 连续执行步数已达上限，已触发熔断", "warning");
+      return {
+        block: true,
+        reason: breaker.reason ?? "AUTO 连续步数达到上限熔断",
+      };
+    }
+  }
+
   if (decision.action === "allow") {
     if (decision.flashReview) {
+      updateAutoStatusBar(ctx, `审核中: ${event.toolName}...`);
+      const signal = getOrCreateAutoAbortSignal(ctx.signal);
       const planContext = (state.planSteps && state.planSteps.length > 0) || state.planFullText
         ? formatStatelessPlanContext(state.planSteps ?? [], state.planFullText)
         : undefined;
       const reviewReq: AutoFlashReviewRequest = {
         ...decision.flashReview,
         ...(planContext ? { planContext } : {}),
+        signal,
       };
       const review = await reviewWithAutoFlash(ctx, reviewReq);
       if (!review.allow) {
+        updateAutoStatusBar(ctx, `已拦截: ${event.toolName}`);
         const fallback = await showAutoFlashFallbackConfirm(
           ctx,
           reviewReq,
@@ -76,14 +126,24 @@ async function applyDecision(
             reason: fallback.reason ?? review.reason,
           };
         }
+        const step = recordAutoStep();
+        updateAutoStatusBar(ctx, `人工放行: ${event.toolName} (#${step})`);
       } else if (!review.skipped) {
+        const step = recordAutoStep();
+        updateAutoStatusBar(ctx, `已放行: ${event.toolName} (#${step})`);
         ctx.ui.notify(`AUTO_FLASH 已通过${review.modelRef ? `（${review.modelRef}）` : ""}：${review.reason}`, "info");
       }
+    } else if (executionContext.autonomy === "auto" && decision.effect !== "read") {
+      const step = recordAutoStep();
+      updateAutoStatusBar(ctx, `执行中: ${event.toolName} (#${step})`);
     }
     return;
   }
 
   if (decision.action === "deny") {
+    if (executionContext.autonomy === "auto") {
+      updateAutoStatusBar(ctx, `硬拦截: ${event.toolName}`);
+    }
     return {
       block: true,
       reason: decision.reason ?? "Tool call denied by workflow authorization",
@@ -137,7 +197,7 @@ export function setupPermissionGuard(
       executionContext,
     });
     const decision = decideToolCall(profile, event, ctx);
-    const result = await applyDecision(decision, event, ctx, state);
+    const result = await applyDecision(decision, event, ctx, state, callbacks);
     const blocked = Boolean(result?.block);
 
     if (

@@ -15,6 +15,12 @@ import {
 } from "./types.js";
 import { formatProfileForPrompt, profileFromPhase } from "./execution-profile.js";
 import { ensureAutoFlashSystemContext, getAutoFlashModel, registerAutoFlashCommand } from "./auto-flash.js";
+import {
+  resetAutoSessionState,
+  resetAutoStateForTurn,
+  setAutoStopped,
+  updateAutoStatusBar,
+} from "./auto-status.js";
 
 export interface CoreState {
   phase: ConversationPhase;
@@ -68,6 +74,7 @@ export function setupCore(
       `${s.phase.toUpperCase()} · ${executionContext.approval.autoAll ? "AUTO_ALL" : executionContext.autonomy.toUpperCase()}`,
     );
     ctx.ui.setStatus("work-auth", "");
+    updateAutoStatusBar(ctx);
   }
 
   function applyProfile(
@@ -150,8 +157,10 @@ export function setupCore(
     updateStatus(ctx);
   });
 
-  pi.on("before_agent_start", (event, _ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
     resetForNewTurn();
+    resetAutoStateForTurn();
+    updateAutoStatusBar(ctx);
     const profile = profileFromPhase({
       phase: s.phase,
       isSubAgent: s.isSubAgent,
@@ -192,6 +201,7 @@ export function setupCore(
     description: "WORK phase - AI-reviewed command authorization; use /auto_model to configure the reviewer",
     handler: async (_a, ctx) => {
       ensureAutoFlashSystemContext(ctx.cwd);
+      resetAutoSessionState();
       applyProfile("work", "auto", ctx);
       const model = getAutoFlashModel();
       ctx.ui.notify(
@@ -206,6 +216,7 @@ export function setupCore(
   pi.registerCommand("auto_all", {
     description: "WORK phase - explicitly authorize all non-protected command calls; use auto_all=true",
     handler: async (_a, ctx) => {
+      resetAutoSessionState();
       applyProfile("work", "auto", ctx, true);
       ctx.ui.notify(
         "WORK phase - AUTO_ALL 全同意已启用；cmd/powershell 需传 auto_all=true 和 purpose，受保护路径仍硬拦截，不调用 AI 审批。",
@@ -214,12 +225,35 @@ export function setupCore(
     },
   });
 
+  const autoStopHandler = async (_a: string, ctx: ExtensionContext) => {
+    setAutoStopped(true);
+    applyProfile("work", "guarded", ctx);
+    updateAutoStatusBar(ctx, "已终止");
+    ctx.ui.notify("已强制终止当前 AUTO 自动化任务，已回退至 GUARDED 手动确认模式。", "info");
+  };
+
+  pi.registerCommand("auto_stop", {
+    description: "强制终止当前 AUTO 任务并回退到 GUARDED 模式，避免死循环",
+    handler: autoStopHandler,
+  });
+
+  pi.registerCommand("auto_cancel", {
+    description: "别名：强制终止当前 AUTO 任务 (/auto_stop)",
+    handler: autoStopHandler,
+  });
+
+  pi.registerCommand("auto_abort", {
+    description: "别名：强制终止当前 AUTO 任务 (/auto_stop)",
+    handler: autoStopHandler,
+  });
+
   registerAutoFlashCommand(pi);
 
   pi.registerCommand("yolo", {
     description: "Compatibility alias for /auto",
     handler: async (_a, ctx) => {
       ensureAutoFlashSystemContext(ctx.cwd);
+      resetAutoSessionState();
       applyProfile("work", "auto", ctx);
       ctx.ui.notify("/yolo 已兼容映射到 /auto", "warning");
     },

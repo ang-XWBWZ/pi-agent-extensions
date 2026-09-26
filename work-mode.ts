@@ -1,4 +1,4 @@
-﻿/**
+/**
  * work-mode.ts - collaboration phase, execution profile, requirements, and
  * progress panel wiring.
  */
@@ -109,5 +109,22 @@ export default function (pi: ExtensionAPI) {
 
   setupPermissionGuard(pi, s, {
     getCurrentStepIndex: planCb.getCurrentStepIndex,
+    onCircuitBreak: (_reason, ctx) => {
+      s.phase = "work";
+      const current = getExecutionContext();
+      setExecutionContext({
+        ...current,
+        phase: "work",
+        autonomy: "guarded",
+        approval: {
+          ...current.approval,
+          interactive: true,
+          preauthorized: false,
+          inheritToChildren: false,
+          autoAll: false,
+        },
+      });
+      persist(ctx);
+    },
   });
 }

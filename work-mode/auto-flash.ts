@@ -105,6 +105,7 @@ export interface AutoFlashReviewRequest {
   planContext?: string;
   goalContext?: string;
   customPrompt?: string;
+  signal?: AbortSignal;
 }
 
 export interface AutoFlashReviewResult {
@@ -394,10 +395,10 @@ export async function reviewWithAutoFlash(
         tools: [],
       },
       {
-        reasoning: "low",
-        maxTokens: 512,
-        signal: ctx.signal,
-        timeoutMs: 30_000,
+        reasoning: "minimal",
+        maxTokens: 256,
+        signal: request.signal ?? ctx.signal,
+        timeoutMs: 15_000,
         cacheRetention: AUTO_FLASH_CACHE_RETENTION,
         ...(sessionId ? { sessionId } : {}),
         ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
