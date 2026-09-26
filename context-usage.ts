@@ -7,6 +7,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { estimateTokens as estimatePiTokens } from "@earendil-works/pi-agent-core";
 import { Box, Text, matchesKey, Key, type Component } from "@earendil-works/pi-tui";
+import { getSpeedTracker } from "./lib/speed-tracker.js";
 
 // ---- helpers ----
 
@@ -88,9 +89,51 @@ export default function (pi: ExtensionAPI) {
       const userCtxTok = Math.max(0, total - baseSysTok - skillsTok);
       const estTotal = baseSysTok + skillsTok + userCtxTok;
 
+      // --- 速率统计 ---
+      const tracker = getSpeedTracker();
+      const latest = tracker.getLatestStats();
+      const session = tracker.getSessionStats();
+
+      const speedLines: string[] = [
+        "",
+        "\u2500\u2500 速率指标 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+      ];
+
+      if (latest) {
+        const ttftStr = latest.ttftMs !== undefined ? `${latest.ttftMs} ms` : "-";
+        const genDurStr = latest.genDurationMs !== undefined ? `${(latest.genDurationMs / 1000).toFixed(2)} s` : "-";
+        const totDurStr = latest.totalDurationMs !== undefined ? `${(latest.totalDurationMs / 1000).toFixed(2)} s` : "-";
+        const reasoningExtra = latest.reasoningTokens > 0 ? ` (思考: ${latest.reasoningTokens} tokens)` : "";
+
+        speedLines.push(
+          "",
+          "最新轮次:",
+          `  生成速率    ${latest.outputTps.toFixed(1).padStart(6)} tokens/s`,
+          `  首字延迟    ${ttftStr.padStart(6)}`,
+          `  生成耗时    ${genDurStr.padStart(6)}`,
+          `  总计耗时    ${totDurStr.padStart(6)}`,
+          `  本次输出    ${fmt(latest.outputTokens).padStart(6)} tokens${reasoningExtra}`,
+        );
+
+        if (session.totalTurns > 1) {
+          speedLines.push(
+            "",
+            "会话累计:",
+            `  累计输出    ${fmt(session.totalOutputTokens).padStart(6)} tokens`,
+            `  平均速率    ${session.avgOutputTps.toFixed(1).padStart(6)} tokens/s`,
+            `  统计轮次    ${String(session.totalTurns).padStart(6)} 轮`,
+          );
+        }
+      } else {
+        speedLines.push(
+          "",
+          "  暂无生成速率数据（等待模型响应）",
+        );
+      }
+
       // --- 构建内容 ---
       const content = [
-        "\u{1F4CA} 上下文统计",
+        "上下文与速率统计",
         "",
         `总用量      ${fmt(total).padStart(6)} / ${fmt(cw).padStart(6)} tokens   ${totalPct?.toFixed(1) ?? "??"}%`,
         "",
@@ -102,6 +145,7 @@ export default function (pi: ExtensionAPI) {
         "",
         `合计(估算)  ${fmt(estTotal).padStart(6)} tokens  ${pct(estTotal, cw)}`,
         `模型报告    ${fmt(total).padStart(6)} tokens  ${pct(total, cw)}`,
+        ...speedLines,
         "",
         "Esc / Enter 关闭",
       ].join("\n");

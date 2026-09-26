@@ -112,10 +112,14 @@ export function applyCustomProviderContextUsage(
   const cacheWrite = Number.isFinite(usage.cacheWrite) && usage.cacheWrite > 0
     ? usage.cacheWrite
     : 0;
+  const resolvedInput = usage.input > 0
+    ? usage.input
+    : Math.max(0, local.sentTokens - cacheRead - cacheWrite);
+  const resolvedOutput = usage.output > 0 ? usage.output : local.replyTokens;
   const nextUsage = {
     ...usage,
-    input: Math.max(0, local.sentTokens - cacheRead - cacheWrite),
-    output: local.replyTokens,
+    input: resolvedInput,
+    output: resolvedOutput,
   };
   return {
     ...nextUsage,
@@ -131,16 +135,27 @@ export function parseOpenAIUsage(rawUsage: any, model: Model<Api>): AssistantMes
   const promptTokens = tokenCount(rawUsage?.prompt_tokens);
   const outputTokens = tokenCount(rawUsage?.completion_tokens);
   const cacheReadTokens = tokenCount(
-    rawUsage?.prompt_tokens_details?.cached_tokens ?? rawUsage?.prompt_cache_hit_tokens,
+    rawUsage?.prompt_tokens_details?.cached_tokens ??
+    rawUsage?.prompt_cache_hit_tokens ??
+    rawUsage?.cached_tokens ??
+    rawUsage?.cache_read_input_tokens,
   );
-  const cacheWriteTokens = tokenCount(rawUsage?.prompt_tokens_details?.cache_write_tokens);
+  const cacheWriteTokens = tokenCount(
+    rawUsage?.prompt_tokens_details?.cache_write_tokens ??
+    rawUsage?.cache_creation_input_tokens,
+  );
   const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
   const reportedTotal = tokenCount(rawUsage?.total_tokens);
+  const reasoningTokens = tokenCount(
+    rawUsage?.completion_tokens_details?.reasoning_tokens ??
+    rawUsage?.reasoning_tokens,
+  );
   const usage: AssistantMessage["usage"] = {
     input,
     output: outputTokens,
     cacheRead: cacheReadTokens,
     cacheWrite: cacheWriteTokens,
+    reasoning: reasoningTokens > 0 ? reasoningTokens : undefined,
     // Preserve the provider's context statistic without reconstructing it.
     // Pi natively falls back to the component fields when this remains zero.
     totalTokens: reportedTotal,

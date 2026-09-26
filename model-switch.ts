@@ -36,12 +36,8 @@ export default function (pi: ExtensionAPI) {
     model?: { provider: string; id: string };
     ui: { setStatus(k: string, v: unknown): void; theme: { fg(c: string, t: string): string } };
   }): void {
-    if (!ctx?.model) return;
-    const tier = currentTier ?? getCurrentTier(ctx.model.provider, ctx.model.id, tierConfig);
-    const tierPart = tier ? `${tier} · ` : "";
-    const think = pi.getThinkingLevel?.() || currentThinking;
-    const thinkPart = think && think !== "off" ? ` \u{1F9E0}${thinkingLabel(think)}` : "";
-    ctx.ui.setStatus("default-model", ctx.ui.theme.fg("muted", `\u{1F539}${tierPart}${ctx.model.provider}/${ctx.model.id}${thinkPart}`));
+    // 移除 default-model 独立状态项，彻底消除【🧠最大】与冗余模型展示，保持底栏两行精简
+    ctx?.ui?.setStatus?.("default-model", undefined);
   }
 
   function applyThinking(tier: TierKey, model?: unknown): ThinkingLevel | undefined {

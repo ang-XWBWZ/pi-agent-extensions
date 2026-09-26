@@ -157,3 +157,40 @@ export function resetAutoSessionState(): void {
   currentAutoAction = undefined;
   stopAbortController = undefined;
 }
+
+/**
+ * 获取纯文本、无表情的 AUTO / 工作模式状态简述（用于紧凑二行底栏右侧展示）
+ */
+export function getAutoStatusSummary(): string | undefined {
+  const executionContext = getExecutionContext();
+  const phase = executionContext?.phase;
+
+  if (phase && phase !== "work") {
+    return phase.toUpperCase();
+  }
+
+  if (autoStopped) {
+    return "AUTO [已终止]";
+  }
+
+  if (autoCircuitBroken) {
+    return `AUTO [已熔断: 超${getMaxAutoSteps()}步]`;
+  }
+
+  const isAuto = executionContext?.autonomy === "auto";
+  const isAutoAll = executionContext?.approval?.autoAll;
+
+  if (currentAutoAction) {
+    return `AUTO [${currentAutoAction}]`;
+  }
+
+  if (isAutoAll) {
+    return "AUTO_ALL [就绪]";
+  }
+
+  if (isAuto) {
+    return "AUTO [就绪]";
+  }
+
+  return "GUARDED";
+}

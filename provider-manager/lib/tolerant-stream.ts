@@ -15,6 +15,7 @@ import {
   createAssistantMessageEventStream,
   getCurrentTools,
   getCurrentSystemPrompt,
+  calculateCost,
 } from "@earendil-works/pi-ai";
 import type {
   Api,
@@ -490,7 +491,7 @@ export function createOpenAITolerantStream() {
           let reachedTerminalFrame = false;
           for (const raw of events) {
             processSseFrame(raw);
-            if (sawDoneMarker || hasFinishReason) {
+            if (sawDoneMarker) {
               reachedTerminalFrame = true;
               break;
             }
@@ -499,6 +500,11 @@ export function createOpenAITolerantStream() {
             refreshIdleTimer();
           }
           if (reachedTerminalFrame) {
+            cancelReader(reader);
+            break;
+          }
+          // 当已获得 finishReason 且 usage 已经汇报完成时，可以优雅结束
+          if (hasFinishReason && output.usage?.output > 0 && output.usage?.input > 0) {
             cancelReader(reader);
             break;
           }
@@ -592,6 +598,7 @@ export function createOpenAITolerantStream() {
           { messages: reqBody.messages, tools: reqBody.tools },
           output.content,
         );
+        calculateCost(model, output.usage);
 
         output.stopReason = mapped as any;
         outer.push({ type: "done", reason: mapped as any, message: output });

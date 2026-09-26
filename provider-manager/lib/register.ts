@@ -8,7 +8,7 @@ import { normalizeBaseUrl, readCustomProviders } from "./config.js";
 import { createOpenAITolerantStream } from "../../stream-compat/lib/tolerant-stream.js";
 import { createAnthropicStream } from "../../stream-compat/lib/anthropic-stream.js";
 import { resolveStreamStrategy } from "../../stream-compat/lib/strategy-resolver.js";
-import { detectContextWindow } from "./discovery.js";
+import { detectContextWindow, detectModelCost } from "./discovery.js";
 
 export function buildModelConfigs(
   models: DiscoveredModel[],
@@ -17,7 +17,9 @@ export function buildModelConfigs(
   compat?: Record<string, unknown>,
 ) {
   return models.map((m) => {
-    const isReasoning = m.reasoning !== false;
+    const isReasoning = typeof m.reasoning === "boolean"
+      ? m.reasoning
+      : /reasoner|r1|o1|o3|thinking|cot/i.test(m.id);
     return {
       id: m.id,
       name: m.name || m.id,
@@ -32,7 +34,7 @@ export function buildModelConfigs(
         max: isReasoning ? "max" : undefined,
       },
       input: ["text"] as ("text" | "image")[],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: detectModelCost(m.id, m.cost),
       contextWindow: m.contextWindow ?? contextWindow ?? detectContextWindow(m.id),
       maxTokens: (m.maxTokens && m.maxTokens !== 16384 ? m.maxTokens : undefined)
         ?? maxTokens

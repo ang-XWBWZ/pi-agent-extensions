@@ -434,3 +434,36 @@ export function detectContextWindow(modelId: string): number {
   if (/claude|haiku|sonnet|opus/i.test(modelId)) return 200000;
   return 256000;
 }
+
+export function detectModelCost(modelId: string, configuredCost?: any): { input: number; output: number; cacheRead: number; cacheWrite: number } {
+  if (configuredCost && typeof configuredCost.input === "number") {
+    return {
+      input: configuredCost.input,
+      output: configuredCost.output ?? configuredCost.input,
+      cacheRead: configuredCost.cacheRead ?? (configuredCost.input * 0.1),
+      cacheWrite: configuredCost.cacheWrite ?? configuredCost.input,
+    };
+  }
+  const id = modelId.toLowerCase();
+  if (id.includes("deepseek") || id.includes("ds")) {
+    if (id.includes("reasoner") || id.includes("r1")) {
+      return { input: 0.55, output: 2.19, cacheRead: 0.14, cacheWrite: 0.55 };
+    }
+    // chat / flash / v3
+    return { input: 0.14, output: 0.28, cacheRead: 0.014, cacheWrite: 0.14 };
+  }
+  if (id.includes("claude")) {
+    if (id.includes("haiku")) return { input: 0.8, output: 4.0, cacheRead: 0.08, cacheWrite: 1.0 };
+    return { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite: 3.75 };
+  }
+  if (id.includes("gpt-4o-mini")) {
+    return { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 };
+  }
+  if (id.includes("gpt-4o")) {
+    return { input: 2.5, output: 10.0, cacheRead: 1.25, cacheWrite: 2.5 };
+  }
+  if (id.includes("qwen")) {
+    return { input: 0.2, output: 0.6, cacheRead: 0.04, cacheWrite: 0.2 };
+  }
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
