@@ -18,6 +18,8 @@ import { getActiveWorkGoal } from "../lib/work-goal-store.js";
 
 export const AUTO_FLASH_SETTINGS_KEY = "autoFlashModel";
 export const AUTO_CUSTOM_PROMPT_SETTINGS_KEY = "autoCustomPrompt";
+export const AUTO_FLASH_MAX_TOKENS_SETTINGS_KEY = "autoFlashMaxTokens";
+export const DEFAULT_AUTO_FLASH_MAX_TOKENS = 1024;
 export const AUTO_FLASH_SYSTEM_CONTEXT_PATH = ".agents/auto_flash_system.md";
 export const DEFAULT_AUTO_FLASH_SYSTEM_CONTEXT = `# AUTO_FLASH 预定义审核上下文
 #
@@ -126,6 +128,25 @@ export function setAutoCustomPrompt(prompt?: string): void {
       settings[AUTO_CUSTOM_PROMPT_SETTINGS_KEY] = prompt.trim();
     } else {
       delete settings[AUTO_CUSTOM_PROMPT_SETTINGS_KEY];
+    }
+    return settings;
+  });
+}
+
+export function getAutoFlashMaxTokens(): number {
+  const value = getSettingsSection(AUTO_FLASH_MAX_TOKENS_SETTINGS_KEY, undefined);
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  return DEFAULT_AUTO_FLASH_MAX_TOKENS;
+}
+
+export function setAutoFlashMaxTokens(maxTokens?: number): void {
+  updateSettings((settings) => {
+    if (typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0) {
+      settings[AUTO_FLASH_MAX_TOKENS_SETTINGS_KEY] = Math.floor(maxTokens);
+    } else {
+      delete settings[AUTO_FLASH_MAX_TOKENS_SETTINGS_KEY];
     }
     return settings;
   });
@@ -275,17 +296,33 @@ function assistantText(message: AssistantMessage): string {
 
 export function parseAutoFlashDecision(text: string): { allow: boolean; reason: string } | undefined {
   const candidate = text.match(/\{[\s\S]*\}/)?.[0];
-  if (!candidate) return undefined;
-  try {
-    const value = JSON.parse(candidate) as Record<string, unknown>;
-    if (typeof value.allow !== "boolean") return undefined;
-    const reason = typeof value.reason === "string" && value.reason.trim()
-      ? value.reason.trim().slice(0, 600)
-      : value.allow ? "AUTO_FLASH 审查通过" : "AUTO_FLASH 审查拒绝，但未给出原因";
-    return { allow: value.allow, reason };
-  } catch {
-    return undefined;
+  if (candidate) {
+    try {
+      const value = JSON.parse(candidate) as Record<string, unknown>;
+      if (typeof value.allow === "boolean") {
+        const reason = typeof value.reason === "string" && value.reason.trim()
+          ? value.reason.trim().slice(0, 600)
+          : value.allow ? "AUTO_FLASH 审查通过" : "AUTO_FLASH 审查拒绝，但未给出原因";
+        return { allow: value.allow, reason };
+      }
+    } catch {
+      // 容错降级进入下方截断补偿
+    }
   }
+
+  // 截断容错：当输出被截断缺少尾部引号或闭合大括号时，正则鲁棒提取
+  const allowMatch = text.match(/"allow"\s*:\s*(true|false)\b/i);
+  if (allowMatch) {
+    const allow = allowMatch[1].toLowerCase() === "true";
+    const reasonMatch = text.match(/"reason"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)(?:"|$)/);
+    let reason = reasonMatch ? reasonMatch[1].replace(/\\"/g, '"').trim() : "";
+    if (!reason) {
+      reason = allow ? "AUTO_FLASH 审查通过" : "AUTO_FLASH 审查拒绝，但未给出原因";
+    }
+    return { allow, reason: reason.slice(0, 600) };
+  }
+
+  return undefined;
 }
 
 export async function reviewWithAutoFlash(
@@ -395,8 +432,8 @@ export async function reviewWithAutoFlash(
         tools: [],
       },
       {
-        reasoning: "minimal",
-        maxTokens: 256,
+        reasoning: "low",
+        maxTokens: getAutoFlashMaxTokens(),
         signal: request.signal ?? ctx.signal,
         timeoutMs: 15_000,
         cacheRetention: AUTO_FLASH_CACHE_RETENTION,

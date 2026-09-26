@@ -39,6 +39,15 @@ import {
   createRequestAbortError,
 } from "../../provider-manager/lib/abortable-request.js";
 
+const PI_TO_OPENAI_REASONING_EFFORT: Record<string, string> = {
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max",
+};
+
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 function resolveStreamIdleTimeoutMs(value: unknown): number {
@@ -124,7 +133,7 @@ export function createOpenAITolerantStream() {
 
         const reasoning = options?.reasoning;
         if (reasoning && reasoning !== "off" && model.reasoning) {
-          reqBody.reasoning_effort = reasoning;
+          reqBody.reasoning_effort = PI_TO_OPENAI_REASONING_EFFORT[reasoning] ?? reasoning;
         }
 
         // 规范化提取工具定义（兼顾 Legacy Context 与 Pi TranscriptContext）
