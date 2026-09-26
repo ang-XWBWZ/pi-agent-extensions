@@ -176,6 +176,7 @@ export function setupCore(
   pi.registerCommand("chat", {
     description: "CHAT phase - pure conversation and clarification",
     handler: async (_a, ctx) => {
+      resetAutoSessionState();
       applyProfile("chat", "guarded", ctx);
       showPhaseNotification(ctx);
     },
@@ -184,6 +185,7 @@ export function setupCore(
   pi.registerCommand("plan", {
     description: "PLAN phase - confirm requirements before execution",
     handler: async (_a, ctx) => {
+      resetAutoSessionState();
       applyProfile("plan", "guarded", ctx);
       showPhaseNotification(ctx);
     },
@@ -192,6 +194,7 @@ export function setupCore(
   pi.registerCommand("work", {
     description: "WORK phase - execute with guarded authorization",
     handler: async (_a, ctx) => {
+      resetAutoSessionState();
       applyProfile("work", "guarded", ctx);
       showPhaseNotification(ctx);
     },
@@ -227,6 +230,13 @@ export function setupCore(
 
   const autoStopHandler = async (_a: string, ctx: ExtensionContext) => {
     setAutoStopped(true);
+    if (typeof (ctx as any).abort === "function") {
+      try {
+        (ctx as any).abort();
+      } catch {
+        // ignore
+      }
+    }
     applyProfile("work", "guarded", ctx);
     updateAutoStatusBar(ctx, "已终止");
     ctx.ui.notify("已强制终止当前 AUTO 自动化任务，已回退至 GUARDED 手动确认模式。", "info");

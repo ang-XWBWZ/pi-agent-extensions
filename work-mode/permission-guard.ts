@@ -19,6 +19,7 @@ import { formatStatelessPlanContext, reviewWithAutoFlash, type AutoFlashReviewRe
 import {
   checkAutoCircuitBreaker,
   getOrCreateAutoAbortSignal,
+  isAutoCircuitBroken,
   isAutoStopped,
   recordAutoStep,
   updateAutoStatusBar,
@@ -68,6 +69,7 @@ async function applyDecision(
     return {
       block: true,
       reason: "用户已通过 /auto_stop 强制终止 AUTO 自动化任务",
+      terminate: true,
     };
   }
 
@@ -95,6 +97,7 @@ async function applyDecision(
       return {
         block: true,
         reason: breaker.reason ?? "AUTO 连续步数达到上限熔断",
+        terminate: true,
       };
     }
   }
@@ -112,6 +115,14 @@ async function applyDecision(
         signal,
       };
       const review = await reviewWithAutoFlash(ctx, reviewReq);
+      if (isAutoStopped()) {
+        updateAutoStatusBar(ctx);
+        return {
+          block: true,
+          reason: "用户已通过 /auto_stop 强制终止 AUTO 自动化任务",
+          terminate: true,
+        };
+      }
       if (!review.allow) {
         updateAutoStatusBar(ctx, `已拦截: ${event.toolName}`);
         const fallback = await showAutoFlashFallbackConfirm(
@@ -120,22 +131,36 @@ async function applyDecision(
           review,
           state.isSubAgent,
         );
+        if (isAutoStopped()) {
+          updateAutoStatusBar(ctx);
+          return {
+            block: true,
+            reason: "用户已通过 /auto_stop 强制终止 AUTO 自动化任务",
+            terminate: true,
+          };
+        }
         if (fallback.action === "deny") {
           return {
             block: true,
             reason: fallback.reason ?? review.reason,
+            terminate: fallback.timeout !== true,
           };
         }
         const step = recordAutoStep();
         updateAutoStatusBar(ctx, `人工放行: ${event.toolName} (#${step})`);
-      } else if (!review.skipped) {
+      } else {
         const step = recordAutoStep();
         updateAutoStatusBar(ctx, `已放行: ${event.toolName} (#${step})`);
-        ctx.ui.notify(`AUTO_FLASH 已通过${review.modelRef ? `（${review.modelRef}）` : ""}：${review.reason}`, "info");
+        if (!review.skipped) {
+          ctx.ui.notify(`AUTO_FLASH 已通过${review.modelRef ? `（${review.modelRef}）` : ""}：${review.reason}`, "info");
+        }
       }
-    } else if (executionContext.autonomy === "auto" && decision.effect !== "read") {
+    } else if (executionContext.autonomy === "auto") {
       const step = recordAutoStep();
-      updateAutoStatusBar(ctx, `执行中: ${event.toolName} (#${step})`);
+      const actionLabel = decision.effect === "read"
+        ? `读取中: ${event.toolName} (#${step})`
+        : `执行中: ${event.toolName} (#${step})`;
+      updateAutoStatusBar(ctx, actionLabel);
     }
     return;
   }
@@ -259,6 +284,10 @@ export function setupPermissionGuard(
         durationMs: Date.now() - pending.startedAt,
         result: auditTextPreview(event.content),
       });
+    }
+
+    if (isAutoStopped() || isAutoCircuitBroken()) {
+      return;
     }
 
     if (!event.isError || state.phase !== "work" || state.planSteps.length === 0) {

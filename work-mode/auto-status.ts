@@ -98,6 +98,12 @@ export function getOrCreateAutoAbortSignal(parentSignal?: AbortSignal): AbortSig
 export function updateAutoStatusBar(ctx: ExtensionContext, action?: string): void {
   if (!ctx?.ui?.setStatus) return;
   const executionContext = getExecutionContext();
+  if (executionContext.phase !== "work") {
+    ctx.ui.setStatus("auto-status", undefined);
+    currentAutoAction = undefined;
+    return;
+  }
+
   const isAuto = executionContext.autonomy === "auto";
 
   if (action !== undefined) {
@@ -137,8 +143,9 @@ export function clearAutoStatusBar(ctx: ExtensionContext): void {
 export function resetAutoStateForTurn(): void {
   consecutiveAutoSteps = 0;
   currentAutoAction = undefined;
-  // If not explicitly stopped or broken, keep flags clean
-  if (!autoStopped && !autoCircuitBroken) {
+  autoStopped = false;
+  autoCircuitBroken = false;
+  if (stopAbortController) {
     stopAbortController = undefined;
   }
 }

@@ -148,9 +148,13 @@ export async function showAutoFlashFallbackConfirm(
 
   const options = ["仅允许本次 (推翻AI拦截)", "确认拒绝 (立即终止本次调用)"];
 
+  const timeoutController = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<"__timeout__">((resolve) => {
-    timer = setTimeout(() => resolve("__timeout__"), timeoutMs);
+    timer = setTimeout(() => {
+      timeoutController.abort();
+      resolve("__timeout__");
+    }, timeoutMs);
   });
 
   const promptPromise = (async () => {
@@ -158,7 +162,10 @@ export async function showAutoFlashFallbackConfirm(
       if (isSubAgent) {
         return await requestConfirm("bash", title, request.command, options, timeoutMs);
       }
-      return await ctx.ui.select(title, options, { timeout: timeoutMs });
+      return await ctx.ui.select(title, options, {
+        timeout: timeoutMs,
+        signal: timeoutController.signal,
+      });
     } catch {
       return undefined;
     }
