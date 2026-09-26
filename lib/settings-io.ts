@@ -11,7 +11,8 @@
  *   4. 兼容现有所有 callers 的 API 签名
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 // ---- 单例缓存键 ----
@@ -23,8 +24,12 @@ function settingsPath(): string {
   // 缓存路径减少重复计算
   let p = (globalThis as Record<string, unknown>)[FILE_KEY] as string | undefined;
   if (!p) {
-    const home = process.env.HOME || process.env.USERPROFILE || ".";
-    p = join(home, ".pi", "agent", "settings.json");
+    if (process.env.PI_CODING_AGENT_DIR) {
+      p = join(process.env.PI_CODING_AGENT_DIR, "settings.json");
+    } else {
+      const home = process.env.HOME || process.env.USERPROFILE || homedir() || ".";
+      p = join(home, ".pi", "agent", "settings.json");
+    }
     (globalThis as Record<string, unknown>)[FILE_KEY] = p;
   }
   return p;
@@ -48,7 +53,9 @@ function ensureCache(): CacheEntry {
 
 function tryReadDisk(): Record<string, unknown> {
   try {
-    return JSON.parse(readFileSync(settingsPath(), "utf-8"));
+    const sp = settingsPath();
+    if (!existsSync(sp)) return {};
+    return JSON.parse(readFileSync(sp, "utf-8"));
   } catch {
     return {};
   }
@@ -69,7 +76,12 @@ export function reloadSettingsFromDisk(): Record<string, unknown> {
  * 获取完整的 settings 对象（深拷贝副本，防止调用方意外修改缓存）
  */
 export function getSettings(): Record<string, unknown> {
-  return structuredClone(ensureCache().data);
+  const disk = tryReadDisk();
+  const entry = ensureCache();
+  if (Object.keys(disk).length > 0) {
+    entry.data = disk;
+  }
+  return structuredClone(entry.data);
 }
 
 /**
@@ -83,8 +95,10 @@ export function getSettings(): Record<string, unknown> {
  *   });
  */
 export function updateSettings(updater: (settings: Record<string, unknown>) => Record<string, unknown>): void {
+  const disk = tryReadDisk();
   const entry = ensureCache();
-  const clone = structuredClone(entry.data);
+  const base = Object.keys(disk).length > 0 ? disk : entry.data;
+  const clone = structuredClone(base);
   const next = updater(clone);
   // 持久化到磁盘
   writeFileSync(settingsPath(), JSON.stringify(next, null, 2) + "\n", "utf-8");

@@ -28,6 +28,7 @@ use pi's Extension API and do not modify pi's core.
 | 并行 Agent | 派发独立子任务、轮询/等待结果、读取输出、消息通信、暂停/恢复/终止、阶段面板、超时恢复记录 | parallel-agent.ts、parallel-agent/ |
 | 模型与层级 | 直接切换 provider/model，维护 L0/L1/L2 模型层级，设置默认思考深度 | model-switch.ts、model-switch/ |
 | 自定义供应商 | 注册和恢复自定义 provider，发现模型，兼容 OpenAI 风格和 Anthropic 流式响应，处理供应商流结束字段差异 | provider-manager.ts、provider-manager/ |
+| 流兼容与双轨调度 | 双轨调度 (auto/builtin/tolerant)，知名渠道兼容预设，自适应防崩守门，第三方模型终止符号兼容保护 | stream-compat.ts、stream-compat/ |
 | Windows 命令 | 通过 cmd.exe 和 PowerShell 执行命令，支持代码页、超时、输出截断、进程树清理和目的说明 | cmd-tool.ts、powershell-tool.ts |
 | 上下文与长程注意力 | 查看 token/context 状态，记录和管理阶段性提醒，维护工作目标及可恢复状态 | context-usage.ts、token-stats.ts、long-attention-ps.ts、work-goal-mode.ts |
 | MCP Bridge | 管理本机 stdio MCP Server，发现工具/提示/资源，按策略调用工具并区分只读、持久化和破坏性操作 | mcp/ |
@@ -196,6 +197,7 @@ Linux/macOS 用户继续使用 pi 原生 bash，不需要为本扩展额外安�
 ├── parallel-agent/         # 子 Agent、任务面板和输出管理
 ├── model-switch/           # 模型层级和思考深度
 ├── provider-manager/       # 自定义供应商、发现和流式兼容
+├── stream-compat/          # 双轨流式调度与中转防崩兼容层
 ├── work-mode/              # 阶段、授权、计划、路径保护和安全评审
 ├── mcp/                    # 独立的 stdio MCP Bridge
 └── skills/pi-wiki/         # Pwiki 使用纪律和工具流程
@@ -269,8 +271,8 @@ API and does not modify pi core.
   manage_tools, with task panels, stage reports, persistence, and timeout
   recovery metadata.
 - **Models and providers:** switch_model, L0/L1/L2 tiers, thinking levels,
-  custom provider persistence and discovery, plus OpenAI-compatible and
-  Anthropic streaming compatibility helpers.
+  custom provider persistence and discovery, dual-track streaming (auto/builtin/tolerant),
+  OpenAI-compatible and Anthropic streaming compatibility helpers, and adaptive finish-reason protection.
 - **Windows execution:** cmd and powershell with code-page selection, timeouts,
   bounded output, process-tree cleanup, and explicit command purpose.
 - **Context and goals:** context/token status, long-attention PS reminders,

@@ -7,7 +7,7 @@ import { Type } from "typebox";
 import type { ThinkingLevel, TierKey, TierConfig } from "../lib/types.js";
 import { isValidThinkingLevel, TIER_DEFAULTS, thinkingLabel, forceThinkingSupport, KEY_PROVIDER, KEY_MODEL, KEY_TIER } from "../lib/types.js";
 import { readAllTiers, writeAllTiers, resolveTierModel, getCurrentTier } from "../lib/tier-config.js";
-import { updateSettings } from "../../lib/settings-io.js";
+import { updateSettings, readSettings, writeSettingsRaw } from "../../lib/settings-io.js";
 import {
   isToolResultError,
   renderStructuredToolCall,
@@ -19,6 +19,7 @@ export function registerSwitchModel(
   getState: () => { currentTier: TierKey | null; tierConfig: Record<TierKey, TierConfig>; currentThinking: string; defaultRef: { provider: string; model: string } | null },
   setState: (s: Partial<{ currentTier: TierKey | null; tierConfig: Record<TierKey, TierConfig>; currentThinking: string; defaultRef: { provider: string; model: string } | null }>) => void,
   applyThinking: (tier: TierKey, model?: unknown) => ThinkingLevel | undefined,
+  statusLine?: (ctx: any) => void,
 ): void {
 
   function setThinking(level: string, model?: unknown): void {
@@ -137,39 +138,72 @@ export function registerSwitchModel(
         if (!t) return { content: [{ type: "text", text: `不存在` }], details: {} };
         const ok = await pi.setModel(t);
         if (ok) {
-          setState({ currentTier: tier as TierKey, tierConfig: config });
+          setState({
+            currentTier: tier as TierKey,
+            tierConfig: config,
+            defaultRef: { provider: r.provider, model: r.model },
+          });
           if (params.thinkingLevel) setThinking(params.thinkingLevel, t);
           else applyThinking(tier as TierKey, t);
-          // 持久化：写回 defaultProvider/defaultModel/defaultTier
-          const s = readSettings();
-          s[KEY_PROVIDER] = r.provider;
-          s[KEY_MODEL] = r.model;
-          s[KEY_TIER] = tier;
-          writeSettingsRaw(s);
+          // 持久化：原子写回 defaultProvider/defaultModel/defaultTier
+          updateSettings((s) => {
+            s[KEY_PROVIDER] = r.provider;
+            s[KEY_MODEL] = r.model;
+            s[KEY_TIER] = tier;
+            return s;
+          });
+          if (statusLine) statusLine(ctx);
         }
         const think = params.thinkingLevel ?? config[tier as TierKey]?.thinkingLevel;
         return { content: [{ type: "text", text: ok ? `\u2705 ${tier} · ${config[tier as TierKey].label}: ${r.provider}/${r.model}${think ? ` | \u{1F9E0} ${think}(${thinkingLabel(think)})` : ""}` : "失败" }], details: {} };
       }
 
-      // provider+model
-      if (params.provider && params.model) {
-        if (params.thinkingLevel && !isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: `无效` }], details: {} };
-        const t = ctx.modelRegistry.find(params.provider, params.model);
-        if (!t) return { content: [{ type: "text", text: `Model not found` }], details: {} };
+      // provider+model (支持自动从 model 字段解析 provider/model 或单独 model 名称)
+      let targetProvider = params.provider;
+      let targetModel = params.model;
+
+      if (!targetProvider && targetModel) {
+        if (targetModel.includes("/")) {
+          const slashIdx = targetModel.indexOf("/");
+          targetProvider = targetModel.slice(0, slashIdx);
+          targetModel = targetModel.slice(slashIdx + 1);
+        } else {
+          const all = await ctx.modelRegistry.getAvailable();
+          const match = all.find((m: { id: string }) => m.id === targetModel);
+          if (match) {
+            targetProvider = (match as { provider: string }).provider;
+          }
+        }
+      }
+
+      if (targetProvider && targetModel) {
+        if (params.thinkingLevel && !isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: `无效 thinkingLevel` }], details: {} };
+        const t = ctx.modelRegistry.find(targetProvider, targetModel);
+        if (!t) return { content: [{ type: "text", text: `Model not found: ${targetProvider}/${targetModel}` }], details: {} };
         const ok = await pi.setModel(t);
         const { tierConfig } = getState();
         if (ok) {
-          setState({ currentTier: getCurrentTier(params.provider, params.model, tierConfig) });
+          const matchedTier = getCurrentTier(targetProvider, targetModel, tierConfig);
+          setState({
+            currentTier: matchedTier,
+            defaultRef: { provider: targetProvider, model: targetModel },
+          });
           if (params.thinkingLevel) setThinking(params.thinkingLevel, t);
-          else { const ct = getState().currentTier; if (ct) applyThinking(ct, t); }
-          // 持久化：写回 defaultProvider/defaultModel，清除 defaultTier
-          const s = readSettings();
-          s[KEY_PROVIDER] = params.provider;
-          s[KEY_MODEL] = params.model;
-          delete s[KEY_TIER];
-          writeSettingsRaw(s);
+          else if (matchedTier) applyThinking(matchedTier, t);
+          // 持久化：原子写回 defaultProvider/defaultModel，更新或清除 defaultTier
+          updateSettings((s) => {
+            s[KEY_PROVIDER] = targetProvider;
+            s[KEY_MODEL] = targetModel;
+            if (matchedTier) {
+              s[KEY_TIER] = matchedTier;
+            } else {
+              delete s[KEY_TIER];
+            }
+            return s;
+          });
+          if (statusLine) statusLine(ctx);
         }
-        return { content: [{ type: "text", text: ok ? `Switched to ${params.provider}/${params.model}${params.thinkingLevel ? ` | \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` : ""}` : "Failed" }], details: {} };
+        return { content: [{ type: "text", text: ok ? `Switched to ${targetProvider}/${targetModel}${params.thinkingLevel ? ` | \u{1F9E0} ${params.thinkingLevel}(${thinkingLabel(params.thinkingLevel)})` : ""}` : "Failed" }], details: {} };
       }
 
       // list

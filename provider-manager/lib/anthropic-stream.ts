@@ -18,6 +18,8 @@
 import {
   calculateCost,
   createAssistantMessageEventStream,
+  getCurrentTools,
+  getCurrentSystemPrompt,
 } from "@earendil-works/pi-ai";
 import type {
   Api,
@@ -217,11 +219,13 @@ export function createAnthropicStream() {
 
         const messages = convertToAnthropicMessages(context.messages);
 
+        const resolvedSystemPrompt = (context as any).systemPrompt?.trim()
+          || (typeof getCurrentSystemPrompt === "function" ? getCurrentSystemPrompt(context.messages ?? []) : "");
         const reqBody: Record<string, unknown> = {
           model: model.id,
           messages,
           stream: true,
-          ...(context.systemPrompt?.trim() ? { system: context.systemPrompt } : {}),
+          ...(resolvedSystemPrompt ? { system: resolvedSystemPrompt } : {}),
         };
 
         // 思考等级 → adaptive effort
@@ -238,8 +242,10 @@ export function createAnthropicStream() {
         }
 
         // 工具
-        if (context.tools && context.tools.length > 0) {
-          (reqBody as any).tools = context.tools.map((t: any) => ({
+        const resolvedTools = (context as any).tools
+          ?? (typeof getCurrentTools === "function" ? getCurrentTools(context.messages ?? []) : []);
+        if (resolvedTools && resolvedTools.length > 0) {
+          (reqBody as any).tools = resolvedTools.map((t: any) => ({
             name: t.name,
             description: t.description,
             input_schema: t.parameters,

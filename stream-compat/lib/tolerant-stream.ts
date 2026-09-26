@@ -1,14 +1,11 @@
 /**
- * tolerant-stream.ts — 直连 fetch-based tolerant stream handler
+ * stream-compat/lib/tolerant-stream.ts — 副轨高容错直连流解析器
  *
- * 不依赖 pi-main 内置 provider 的流处理，直接发送 HTTP 请求到上游，
- * 手动解析 SSE chunks。完全避开 pi-main 对 provider/baseUrl 的自动检测。
- *
- * 关键兼容处理：
- * 1. reasoning_content 当作 thinking block 处理
- * 2. 缺少 finish_reason 但已有输出时补 "stop"
- * 3. content 始终 null 的上游（DeepSeek 思考模式）能正常出字
- * 4. real HTTP 400 / timeout 原样报错
+ * 核心针对第三方中转站的常见缺陷设计：
+ * 1. 自动从 TranscriptContext 提取工具与系统提示词（避免丢 tools / systemPrompt）
+ * 2. 容忍中转站不返回终止标记（缺失 finish_reason 或不发 [DONE] 时自适应平稳终结）
+ * 3. 避免对纯工具调用（content 为空但有 tool_calls）产生二次非流式误判
+ * 4. reasoning_content 当作 thinking block 处理
  */
 
 import {
@@ -26,7 +23,7 @@ import type {
   Context,
   Tool,
 } from "@earendil-works/pi-ai";
-import { clampOpenAIPromptCacheKey } from "./config.js";
+import { clampOpenAIPromptCacheKey } from "../../provider-manager/lib/config.js";
 import {
   parseOpenAIUsage,
   ensureToolCallId,
@@ -34,13 +31,13 @@ import {
   finalizeToolCallBlock,
   convertMessagesForUpstream,
   applyCustomProviderContextUsage,
-} from "./message-utils.js";
-import { resolveRequestMaxTokens } from "./request-limits.js";
+} from "../../provider-manager/lib/message-utils.js";
+import { resolveRequestMaxTokens } from "../../provider-manager/lib/request-limits.js";
 import {
   awaitWithAbort,
   cancelReader,
   createRequestAbortError,
-} from "./abortable-request.js";
+} from "../../provider-manager/lib/abortable-request.js";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
@@ -48,9 +45,6 @@ function resolveStreamIdleTimeoutMs(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   }
-  // Pi maps disabled httpIdleTimeoutMs=0 to max int32 before it reaches providers.
-  // For this tolerant fetch stream we still need a finite idle guard, otherwise a
-  // half-open SSE connection can leave the agent stuck in Work forever.
   if (value >= 2_000_000_000) return DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   return Math.floor(value);
 }
@@ -91,6 +85,8 @@ export function createOpenAITolerantStream() {
 
         const compat = model.compat as OpenAICompletionsCompat | undefined;
         const convertedMessages = convertMessagesForUpstream(context.messages, model);
+
+        // 规范化提取系统提示词（兼顾 Legacy Context 与 Pi TranscriptContext）
         const resolvedSystemPrompt = (context as any).systemPrompt?.trim()
           || (typeof getCurrentSystemPrompt === "function" ? getCurrentSystemPrompt(context.messages ?? []) : "");
         const messages = resolvedSystemPrompt
@@ -131,6 +127,7 @@ export function createOpenAITolerantStream() {
           reqBody.reasoning_effort = reasoning;
         }
 
+        // 规范化提取工具定义（兼顾 Legacy Context 与 Pi TranscriptContext）
         const resolvedTools: Tool[] = (context as any).tools
           ?? (typeof getCurrentTools === "function" ? getCurrentTools(context.messages ?? []) : []);
         if (resolvedTools && resolvedTools.length > 0) {
@@ -144,8 +141,6 @@ export function createOpenAITolerantStream() {
           }));
         }
 
-        // Use a fixed 32K normal-turn cap. Pair it with Pi's
-        // compaction.reserveTokens=32768; do not derive another estimate-based boundary.
         reqBody.max_tokens = resolveRequestMaxTokens(model, options?.maxTokens);
 
         const baseUrl = model.baseUrl.replace(/\/+$/, "");
@@ -197,6 +192,7 @@ export function createOpenAITolerantStream() {
         );
         refreshIdleTimer();
 
+        // 针对部分中转不支持 stream_options 报 400 的自适应重发
         let responseErrorText: string | undefined;
         if (!response.ok) {
           responseErrorText = await awaitWithAbort(
@@ -306,25 +302,24 @@ export function createOpenAITolerantStream() {
           }
           return block;
         };
+
         const emitTextDelta = (deltaText: string) => {
           if (deltaText.length === 0) return;
-
           if (!seenMeaningfulText && deltaText.trim().length === 0) {
             pendingTextPrefix += deltaText;
             return;
           }
-
           const text = !seenMeaningfulText ? pendingTextPrefix + deltaText : deltaText;
           pendingTextPrefix = "";
-
           if (text.trim().length > 0) {
             seenMeaningfulText = true;
           }
-
           const block = ensureTextBlock();
           block.text += text;
           outer.push({ type: "text_delta", contentIndex: getIdx(block), delta: text, partial: output });
         };
+
+        // 仅在流真正缺失任何有效内容时执行的非流式兜底
         const emitNonStreamingFallback = async (): Promise<string | null> => {
           const fallbackBody = { ...reqBody, stream: false };
           delete fallbackBody.stream_options;
@@ -504,7 +499,6 @@ export function createOpenAITolerantStream() {
           buffer = "";
         }
 
-        // 收尾
         if (timeoutId) clearTimeout(timeoutId);
 
         const inspectStreamState = () => {
@@ -522,6 +516,8 @@ export function createOpenAITolerantStream() {
         };
 
         let streamState = inspectStreamState();
+
+        // 仅在真实出现未闭合工具参数、或完全无内容时，才做非流式补齐
         if (streamState.hasIncompleteToolCalls || (!streamState.hasTextOrThinking && streamState.completeToolCalls.length === 0) || streamState.onlyThinkingNoAnswer) {
           const fallbackFinishReason = await emitNonStreamingFallback();
           if (fallbackFinishReason) {
@@ -531,14 +527,18 @@ export function createOpenAITolerantStream() {
           streamState = inspectStreamState();
         }
 
+        // ============================================================
+        // 核心适应：处理第三方中转站“不返回终止（finish_reason）”的问题
+        // ============================================================
         if (!hasFinishReason) {
           if (streamState.completeToolCalls.length > 0 && !streamState.hasIncompleteToolCalls) {
+            // 中转虽然没给 finish_reason，但工具调用已经完整闭合：自适应赋 tool_calls
             finishReason = "tool_calls";
+            hasFinishReason = true;
           } else if (streamState.hasTextOrThinking) {
-            // Some OpenAI-compatible providers omit finish_reason or [DONE]. If we
-            // already have a complete text/thinking block, finish the turn instead
-            // of surfacing pi-main's hard "Stream ended without finish_reason".
+            // 中转虽然没给 finish_reason，但文本或思考已正常输出：自适应赋 stop，平稳终结
             finishReason = "stop";
+            hasFinishReason = true;
           } else {
             throw new Error("OpenAI-compatible stream ended without finish_reason or meaningful content");
           }
@@ -554,10 +554,6 @@ export function createOpenAITolerantStream() {
 
         if (streamState.onlyThinkingNoAnswer) {
           throw new Error("OpenAI-compatible stream ended after reasoning without final answer content");
-        }
-
-        if (!sawDoneMarker && !hasFinishReason && !streamState.hasTextOrThinking) {
-          throw new Error("OpenAI-compatible stream ended before [DONE]");
         }
 
         if (timeoutId) clearTimeout(timeoutId);
@@ -585,32 +581,20 @@ export function createOpenAITolerantStream() {
         );
 
         output.stopReason = mapped as any;
-        outer.push({ type: "done", reason: mapped as any, message: output });
-        outer.end();
+        outer.push({ type: "done", reason: mapped, message: output });
       } catch (err: any) {
         if (timeoutId) clearTimeout(timeoutId);
-        const rawMsg = err?.message || String(err);
-        const idleTimedOut = abortReason === "idle";
-        const userAborted = abortReason === "user" || rawMsg === "Request was aborted";
-        const providerAborted = err?.name === "AbortError" && !userAborted;
-        const msg = idleTimedOut
-          ? `OpenAI-compatible stream idle timeout after ${idleTimeoutMs}ms`
-          : providerAborted
-            ? `OpenAI-compatible stream aborted or timed out: ${rawMsg}`
-            : rawMsg;
-        outer.push({
-          type: "error",
-          reason: userAborted && !idleTimedOut ? "aborted" : "error",
-          error: {
-            ...output,
-            stopReason: userAborted && !idleTimedOut ? "aborted" : "error",
-            errorMessage: msg,
-          },
-        });
-        outer.end();
+        cancelReader(reader);
+        const mappedError = abortReason === "idle"
+          ? new Error(`Provider stream idle timeout after ${idleTimeoutMs}ms`)
+          : err;
+        output.stopReason = abortReason ? "aborted" : "error";
+        output.errorMessage = mappedError?.message || String(mappedError);
+        outer.push({ type: "error", reason: output.stopReason, error: output });
       } finally {
         if (timeoutId) clearTimeout(timeoutId);
         removeAbortListener?.();
+        outer.end();
       }
     })();
 

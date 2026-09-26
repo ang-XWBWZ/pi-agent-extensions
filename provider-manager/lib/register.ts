@@ -5,8 +5,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AnthropicThinkingMode, DiscoveredModel } from "./config.js";
 import { normalizeBaseUrl, readCustomProviders } from "./config.js";
-import { createOpenAITolerantStream } from "./tolerant-stream.js";
-import { createAnthropicStream } from "./anthropic-stream.js";
+import { createOpenAITolerantStream } from "../../stream-compat/lib/tolerant-stream.js";
+import { createAnthropicStream } from "../../stream-compat/lib/anthropic-stream.js";
+import { resolveStreamStrategy } from "../../stream-compat/lib/strategy-resolver.js";
 import { detectContextWindow } from "./discovery.js";
 
 export function buildModelConfigs(
@@ -33,7 +34,9 @@ export function buildModelConfigs(
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       contextWindow: m.contextWindow ?? contextWindow ?? detectContextWindow(m.id),
-      maxTokens: m.maxTokens ?? maxTokens ?? (isReasoning ? 16384 : 4096),
+      maxTokens: (m.maxTokens && m.maxTokens !== 16384 ? m.maxTokens : undefined)
+        ?? maxTokens
+        ?? 32768,
       ...(compat && Object.keys(compat).length > 0 ? { compat } : {}),
     };
   });
@@ -46,7 +49,7 @@ export function registerCustomProvider(
   apiKey: string,
   apiStyle: "openai" | "anthropic",
   modelConfigs: ReturnType<typeof buildModelConfigs>,
-  streamCompatMode: "builtin" | "finish-reason-fallback",
+  streamCompatMode: "builtin" | "finish-reason-fallback" | "auto" = "auto",
   openaiApiMode: "chat-completions" | "responses" = "chat-completions",
   anthropicThinkingMode: AnthropicThinkingMode = "adaptive_effort",
 ): void {
@@ -92,12 +95,25 @@ export function registerCustomProvider(
     return;
   }
 
-  if (streamCompatMode === "finish-reason-fallback") {
+  // OpenAI 风格：双轨策略解析
+  const explicitTrack = streamCompatMode === "finish-reason-fallback"
+    ? "tolerant"
+    : (streamCompatMode === "builtin" ? "builtin" : undefined);
+  const strategy = resolveStreamStrategy(providerName, baseUrl, undefined, explicitTrack);
+
+  // 核心保护：外部第三方工具添加或注册模型时，保证将 supportsFinishReason: false 注入模型 compat
+  for (const m of modelConfigs) {
+    const existingCompat = (m as any).compat || {};
+    (m as any).compat = {
+      ...strategy.kernelCompat,
+      ...existingCompat,
+      supportsFinishReason: existingCompat.supportsFinishReason ?? strategy.kernelCompat.supportsFinishReason,
+    };
+  }
+
+  if (strategy.track === "tolerant") {
     if (openaiApiMode !== "chat-completions") {
       throw new Error("finish-reason-fallback only supports OpenAI Chat Completions mode");
-    }
-    if (apiStyle !== "openai") {
-      throw new Error(`finish-reason-fallback 仅支持 OpenAI 风格，当前: ${apiStyle}`);
     }
     const tolerantApiName = `${providerName}-openai-tolerant`;
     for (const m of modelConfigs) (m as any).api = tolerantApiName;
@@ -118,11 +134,7 @@ export function registerCustomProvider(
     name: providerName,
     baseUrl: normalizeBaseUrl(baseUrl),
     apiKey,
-    api: apiStyle === "anthropic"
-      ? "anthropic-messages"
-      : openaiApiMode === "responses"
-        ? "openai-responses"
-        : "openai-completions",
+    api: openaiApiMode === "responses" ? "openai-responses" : "openai-completions",
     headers: Object.keys(hdrs).length > 0 ? hdrs : undefined,
     authHeader: authHeader || undefined,
     models: modelConfigs,
@@ -133,14 +145,19 @@ export function restoreCustomProviders(pi: ExtensionAPI): void {
   const customProviders = readCustomProviders();
   for (const [name, cfg] of Object.entries(customProviders)) {
     try {
-      const compat = cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
-        ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
-        : undefined;
+      const explicitTrack = cfg.streamCompatMode === "finish-reason-fallback"
+        ? "tolerant"
+        : (cfg.streamCompatMode === "builtin" ? "builtin" : undefined);
+      const strategy = resolveStreamStrategy(name, cfg.baseUrl, undefined, explicitTrack);
+      const compat = {
+        ...strategy.kernelCompat,
+        ...(typeof cfg.supportsUsageInStreaming === "boolean" ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming } : {}),
+      };
       const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
       const legacyExplicitCustomStream =
         cfg.customStream === true && cfg.customStreamExplicit === true;
       const streamCompatMode = cfg.streamCompatMode
-        ?? (legacyExplicitCustomStream ? "finish-reason-fallback" : "builtin");
+        ?? (legacyExplicitCustomStream ? "finish-reason-fallback" : "auto");
       registerCustomProvider(
         pi,
         name,

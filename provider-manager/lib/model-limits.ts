@@ -62,7 +62,7 @@ export function updateCustomModelLimits(
     cfg.apiKey,
     cfg.apiStyle,
     modelConfigs,
-    cfg.streamCompatMode ?? "builtin",
+    cfg.streamCompatMode ?? "auto",
     cfg.openaiApiMode ?? "chat-completions",
     cfg.anthropicThinkingMode ?? "builtin",
   );

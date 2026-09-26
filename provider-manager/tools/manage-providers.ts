@@ -17,6 +17,7 @@ import {
 } from "../lib/discovery.js";
 import { updateCustomModelLimits } from "../lib/model-limits.js";
 import { buildModelConfigs, registerCustomProvider } from "../lib/register.js";
+import { resolveStreamStrategy } from "../../stream-compat/lib/strategy-resolver.js";
 import {
   isToolResultError,
   renderStructuredToolCall,
@@ -24,14 +25,14 @@ import {
 } from "../../lib/tui-render.js";
 
 type OpenAIApiMode = "chat-completions" | "responses";
-type StreamCompatMode = "builtin" | "finish-reason-fallback";
+type StreamCompatMode = "auto" | "builtin" | "finish-reason-fallback";
 
 function isOpenAIApiMode(value: unknown): value is OpenAIApiMode {
   return value === "chat-completions" || value === "responses";
 }
 
 function isStreamCompatMode(value: unknown): value is StreamCompatMode {
-  return value === "builtin" || value === "finish-reason-fallback";
+  return value === "auto" || value === "builtin" || value === "finish-reason-fallback";
 }
 
 function isAnthropicThinkingMode(value: unknown): value is AnthropicThinkingMode {
@@ -62,7 +63,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       maxTokens: Type.Optional(Type.Number({ description: "Optional max output token override" })),
       reasoningModels: Type.Optional(Type.Array(Type.String({ description: "Model IDs that should keep thinking/reasoning when restricting manually" }))),
       supportsUsageInStreaming: Type.Optional(Type.Boolean({ description: "Whether OpenAI streaming supports usage tail chunks" })),
-      streamCompatMode: Type.Optional(Type.String({ description: "builtin | finish-reason-fallback" })),
+      streamCompatMode: Type.Optional(Type.String({ description: "auto(default) | builtin | finish-reason-fallback" })),
       anthropicThinkingMode: Type.Optional(Type.String({ description: "Claude thinking mode: builtin | adaptive_effort (recommended)" })),
     }),
     renderCall(args, theme, context) {
@@ -136,9 +137,13 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         customProviders[providerName] = cfg;
         writeCustomProviders(customProviders);
 
-        const compat = cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
-          ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
-          : undefined;
+        const strategy = resolveStreamStrategy(providerName, cfg.baseUrl, undefined, cfg.streamCompatMode);
+        const compat = {
+          ...strategy.kernelCompat,
+          ...(cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
+            ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
+            : {}),
+        };
         const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
         try { pi.unregisterProvider(providerName); } catch {}
         registerCustomProvider(
@@ -148,7 +153,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           cfg.apiKey,
           cfg.apiStyle,
           modelConfigs,
-          cfg.streamCompatMode ?? "builtin",
+          cfg.streamCompatMode ?? "auto",
           cfg.openaiApiMode ?? "chat-completions",
           cfg.anthropicThinkingMode ?? "builtin",
         );
@@ -209,7 +214,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         }
 
         const openaiApiMode = cfg.openaiApiMode ?? "chat-completions";
-        if (openaiApiMode !== "chat-completions" && streamCompatModeRaw !== "builtin") {
+        if (openaiApiMode !== "chat-completions" && streamCompatModeRaw === "finish-reason-fallback") {
           return { content: [{ type: "text", text: "finish-reason-fallback only supports openaiApiMode=chat-completions" }], details: { provider: providerName, openaiApiMode } };
         }
 
@@ -217,9 +222,11 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         customProviders[providerName] = cfg;
         writeCustomProviders(customProviders);
 
-        const compat = typeof cfg.supportsUsageInStreaming === "boolean"
-          ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
-          : undefined;
+        const strategy = resolveStreamStrategy(providerName, cfg.baseUrl, undefined, streamCompatModeRaw);
+        const compat = {
+          ...strategy.kernelCompat,
+          ...(typeof cfg.supportsUsageInStreaming === "boolean" ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming } : {}),
+        };
         const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
         try { pi.unregisterProvider(providerName); } catch {}
         registerCustomProvider(
@@ -234,14 +241,14 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           cfg.anthropicThinkingMode ?? "builtin",
         );
 
-        const piApi = streamCompatModeRaw === "finish-reason-fallback"
+        const piApi = strategy.track === "tolerant"
           ? `${providerName}-openai-tolerant`
           : openaiApiMode === "responses"
             ? "openai-responses"
             : "openai-completions";
         return {
-          content: [{ type: "text", text: `Updated ${providerName}: openaiApiMode=${openaiApiMode}, streamCompatMode=${streamCompatModeRaw}, piApi=${piApi}` }],
-          details: { provider: providerName, openaiApiMode, streamCompatMode: streamCompatModeRaw, piApi },
+          content: [{ type: "text", text: `Updated ${providerName}: openaiApiMode=${openaiApiMode}, streamCompatMode=${streamCompatModeRaw}, effectiveTrack=${strategy.track}, piApi=${piApi}` }],
+          details: { provider: providerName, openaiApiMode, streamCompatMode: streamCompatModeRaw, effectiveTrack: strategy.track, piApi },
         };
       }
 
@@ -277,9 +284,13 @@ export function registerManageProviders(pi: ExtensionAPI): void {
         customProviders[providerName] = cfg;
         writeCustomProviders(customProviders);
 
-        const compat = cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
-          ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
-          : undefined;
+        const strategy = resolveStreamStrategy(providerName, cfg.baseUrl, undefined, cfg.streamCompatMode);
+        const compat = {
+          ...strategy.kernelCompat,
+          ...(cfg.apiStyle === "openai" && typeof cfg.supportsUsageInStreaming === "boolean"
+            ? { supportsUsageInStreaming: cfg.supportsUsageInStreaming }
+            : {}),
+        };
         const modelConfigs = buildModelConfigs(cfg.models, undefined, undefined, compat);
         try { pi.unregisterProvider(providerName); } catch {}
         registerCustomProvider(
@@ -289,7 +300,7 @@ export function registerManageProviders(pi: ExtensionAPI): void {
           cfg.apiKey,
           cfg.apiStyle,
           modelConfigs,
-          cfg.streamCompatMode ?? "builtin",
+          cfg.streamCompatMode ?? "auto",
           cfg.openaiApiMode ?? "chat-completions",
           cfg.anthropicThinkingMode ?? "builtin",
         );
@@ -392,12 +403,28 @@ export function registerManageProviders(pi: ExtensionAPI): void {
       const persistedModels = reasoningModelIds
         ? baseModels.map((m) => ({ ...m, reasoning: reasoningModelIds.has(m.id) }))
         : baseModels;
+      const streamCompatModeRaw = params.streamCompatMode ?? "auto";
+      if (!isStreamCompatMode(streamCompatModeRaw)) {
+        return { content: [{ type: "text", text: `Invalid streamCompatMode: ${streamCompatModeRaw}. Supported: auto | builtin | finish-reason-fallback` }], details: {} };
+      }
+      const streamCompatMode = streamCompatModeRaw;
+      if (detectedApi === "openai" && openaiApiMode === "responses" && streamCompatMode === "finish-reason-fallback") {
+        return { content: [{ type: "text", text: "openaiApiMode=responses uses Pi openai-responses and does not support finish-reason-fallback." }], details: {} };
+      }
+      if (detectedApi === "openai" && openaiApiMode !== undefined && !isOpenAIApiMode(openaiApiMode)) {
+        return { content: [{ type: "text", text: `Invalid resolved OpenAI API mode: ${openaiApiMode}` }], details: {} };
+      }
+
+      const strategy = resolveStreamStrategy(providerName, baseUrl, undefined, streamCompatMode);
       const supportsUsageInStreaming = typeof params.supportsUsageInStreaming === "boolean"
         ? params.supportsUsageInStreaming
         : undefined;
-      const compat = detectedApi === "openai" && typeof supportsUsageInStreaming === "boolean"
-        ? { supportsUsageInStreaming }
-        : undefined;
+      const compat = {
+        ...strategy.kernelCompat,
+        ...(detectedApi === "openai" && typeof supportsUsageInStreaming === "boolean"
+          ? { supportsUsageInStreaming }
+          : {}),
+      };
       const modelConfigs = buildModelConfigs(
         persistedModels,
         contextWindowOverride,
@@ -415,23 +442,6 @@ export function registerManageProviders(pi: ExtensionAPI): void {
             }
           : model;
       });
-
-      const streamCompatModeRaw = params.streamCompatMode
-        || (detectedApi === "openai"
-          && openaiApiMode === "chat-completions"
-          && testResult.needsFinishReasonFallback
-          ? "finish-reason-fallback"
-          : "builtin");
-      if (!isStreamCompatMode(streamCompatModeRaw)) {
-        return { content: [{ type: "text", text: `Invalid streamCompatMode: ${streamCompatModeRaw}. Supported: builtin | finish-reason-fallback` }], details: {} };
-      }
-      const streamCompatMode = streamCompatModeRaw;
-      if (detectedApi === "openai" && openaiApiMode === "responses" && streamCompatMode !== "builtin") {
-        return { content: [{ type: "text", text: "openaiApiMode=responses uses Pi openai-responses and does not support finish-reason-fallback." }], details: {} };
-      }
-      if (detectedApi === "openai" && openaiApiMode !== undefined && !isOpenAIApiMode(openaiApiMode)) {
-        return { content: [{ type: "text", text: `Invalid resolved OpenAI API mode: ${openaiApiMode}` }], details: {} };
-      }
 
       const anthropicThinkingModeRaw = params.anthropicThinkingMode ??
         (detectedApi === "anthropic" ? "adaptive_effort" : undefined);

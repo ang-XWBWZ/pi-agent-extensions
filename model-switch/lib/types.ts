@@ -59,14 +59,24 @@ export function forceThinkingSupport(model: unknown): void {
     reasoning?: boolean;
     thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
   };
-  const hasReasoning = m.reasoning === true;
-  m.thinkingLevelMap = {
-    off: undefined,
-    minimal: hasReasoning ? (m.thinkingLevelMap?.minimal ?? "minimal") : undefined,
-    low: hasReasoning ? (m.thinkingLevelMap?.low ?? "low") : undefined,
-    medium: hasReasoning ? (m.thinkingLevelMap?.medium ?? "medium") : undefined,
-    high: hasReasoning ? (m.thinkingLevelMap?.high ?? "high") : undefined,
-    xhigh: hasReasoning ? (m.thinkingLevelMap?.xhigh ?? "xhigh") : undefined,
-    max: hasReasoning ? (m.thinkingLevelMap?.max ?? "max") : undefined,
-  };
+  m.reasoning = true;
+  if (!m.thinkingLevelMap) {
+    m.thinkingLevelMap = {
+      off: undefined,
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
+      xhigh: "xhigh",
+      max: "max",
+    };
+  } else {
+    // 保留模型原有的合法映射，仅为 xhigh/max 补齐以支持官方 getSupportedThinkingLevels
+    if (m.thinkingLevelMap.minimal === undefined) m.thinkingLevelMap.minimal = "minimal";
+    if (m.thinkingLevelMap.low === undefined) m.thinkingLevelMap.low = "low";
+    if (m.thinkingLevelMap.medium === undefined) m.thinkingLevelMap.medium = "medium";
+    if (m.thinkingLevelMap.high === undefined) m.thinkingLevelMap.high = "high";
+    if (m.thinkingLevelMap.xhigh === undefined) m.thinkingLevelMap.xhigh = "xhigh";
+    if (m.thinkingLevelMap.max === undefined) m.thinkingLevelMap.max = "max";
+  }
 }

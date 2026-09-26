@@ -10,9 +10,16 @@ import { KEY_TIERS } from "./types.js";
 import {
   getSettings,
   updateSettings,
-  readSettings as compatRead,
-  writeSettingsRaw as compatWrite,
+  readSettings,
+  writeSettingsRaw,
 } from "../../lib/settings-io.js";
+
+export {
+  getSettings,
+  updateSettings,
+  readSettings,
+  writeSettingsRaw,
+};
 
 export function readAllTiers(): Record<TierKey, TierConfig> {
   const s = getSettings();

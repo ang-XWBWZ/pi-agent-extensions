@@ -429,7 +429,7 @@ export function detectContextWindow(modelId: string): number {
   // Provider-specific larger windows can still be set with set_model_limits.
   if (/(?:^|[/_:.-])gpt(?:[-_.]|$)/i.test(modelId)) return 256000;
   if (/codex-mini-latest/i.test(modelId)) return 200000;
-  if (/v4-flash|v4-pro|1m|1000k|minimax-m3|mimo/i.test(modelId)) return 1000000;
+  if (/deepseek.*flash|v4-flash|v4-pro|1m|1000k|minimax-m3|mimo/i.test(modelId)) return 1000000;
   if (/kimi-k2\.6|kimi-k2\.5|qwen3\.7|qwen3-7|glm-5\.1|glm-5|command-a/i.test(modelId)) return 262144;
   if (/claude|haiku|sonnet|opus/i.test(modelId)) return 200000;
   return 256000;
