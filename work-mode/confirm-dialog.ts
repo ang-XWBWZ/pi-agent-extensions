@@ -148,31 +148,36 @@ export async function showAutoFlashFallbackConfirm(
 
   const options = ["仅允许本次 (推翻AI拦截)", "确认拒绝 (立即终止本次调用)"];
 
-  const timeoutController = new AbortController();
-  let timer: NodeJS.Timeout | undefined;
-  const timeoutPromise = new Promise<"__timeout__">((resolve) => {
-    timer = setTimeout(() => {
-      timeoutController.abort();
-      resolve("__timeout__");
-    }, timeoutMs);
-  });
+  let choice: string | undefined;
+  if (isSubAgent) {
+    // 子 Agent 审批进入前端队列排队，排队等待时间不消耗用户决策倒计时，给予充足的排队与决策窗口
+    choice = await requestConfirm("bash", title, request.command, options, Math.max(timeoutMs, 60_000));
+  } else {
+    // 主 Agent 本地直接弹窗，启动超时倒计时
+    const timeoutController = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<"__timeout__">((resolve) => {
+      timer = setTimeout(() => {
+        timeoutController.abort();
+        resolve("__timeout__");
+      }, timeoutMs);
+    });
 
-  const promptPromise = (async () => {
-    try {
-      if (isSubAgent) {
-        return await requestConfirm("bash", title, request.command, options, timeoutMs);
+    const promptPromise = (async () => {
+      try {
+        return await ctx.ui.select(title, options, {
+          timeout: timeoutMs,
+          signal: timeoutController.signal,
+        });
+      } catch {
+        return undefined;
       }
-      return await ctx.ui.select(title, options, {
-        timeout: timeoutMs,
-        signal: timeoutController.signal,
-      });
-    } catch {
-      return undefined;
-    }
-  })();
+    })();
 
-  const choice = await Promise.race([promptPromise, timeoutPromise]);
-  if (timer) clearTimeout(timer);
+    const result = await Promise.race([promptPromise, timeoutPromise]);
+    if (timer) clearTimeout(timer);
+    choice = result;
+  }
 
   if (choice === "仅允许本次 (推翻AI拦截)") {
     ctx.ui.notify("已由人工推翻 AI 拦截，允许本次调用执行", "info");
@@ -180,7 +185,7 @@ export async function showAutoFlashFallbackConfirm(
   }
 
   if (choice === "__timeout__" || choice === undefined) {
-    ctx.ui.notify(`人工审核已超时（${seconds}s），按 AI 审查意见自动拒绝`, "warning");
+    ctx.ui.notify(`人工审核已超时（${seconds}s），按 AI 审查意见自动拦截`, "warning");
     return {
       action: "deny",
       reason: `AUTO_FLASH 拒绝：${review.reason}（人工审核超时${seconds}s自动拒绝）`,
@@ -193,6 +198,24 @@ export async function showAutoFlashFallbackConfirm(
     reason: `AUTO_FLASH 拒绝：${review.reason}（经人工审核确认拒绝）`,
     timeout: false,
   };
+}
+
+interface GlobalAllowlists {
+  command: Set<string>;
+  path: Set<string>;
+  action: Set<string>;
+}
+
+function getGlobalAllowlists(): GlobalAllowlists {
+  const g = globalThis as Record<string, unknown>;
+  if (!g.__pi_global_allowlists) {
+    g.__pi_global_allowlists = {
+      command: new Set<string>(),
+      path: new Set<string>(),
+      action: new Set<string>(),
+    };
+  }
+  return g.__pi_global_allowlists as GlobalAllowlists;
 }
 
 export async function confirmAndRemember(
@@ -209,6 +232,12 @@ export async function confirmAndRemember(
   if (allowRemember) {
     for (const pattern of allowlist) {
       if (wildcardMatch(pattern, target)) return "silent";
+    }
+    const globalList = getGlobalAllowlists()[type];
+    if (globalList) {
+      for (const pattern of globalList) {
+        if (wildcardMatch(pattern, target)) return "silent";
+      }
     }
   }
 
@@ -263,6 +292,8 @@ export async function confirmAndRemember(
           ? guessCmdPattern(target)
           : target;
     allowlist.add(pattern);
+    const globalList = getGlobalAllowlists()[type];
+    globalList?.add(pattern);
     ctx.ui.notify("已记住: " + pattern, "info");
     return "dialog";
   }
