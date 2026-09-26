@@ -24,14 +24,14 @@ use pi's Extension API and do not modify pi's core.
 | 模块 | 能力 | 主要入口 |
 | --- | --- | --- |
 | 工作阶段与授权 | CHAT / PLAN / WORK，受控授权、AUTO AI 审批、AUTO_ALL 显式全同意、Work Contract、计划和安全评审 | work-mode.ts、work-mode/ |
-| AUTO_FLASH | 为 /auto 配置 AI 安全审批模型；审批失败、模型错误和中止会显式返回，不会伪装成普通 JSON 拒绝 | work-mode/auto-flash.ts |
+| AUTO_FLASH | 为 /auto 配置 AI 安全审批模型；支持 MCP 调用参数完整透明透传与长文本安全压缩，智能推导用途，内置知识库审核细则；审批失败、模型错误和中止显式返回，不会伪装成普通 JSON 拒绝 | work-mode/auto-flash.ts |
 | 并行 Agent | 派发独立子任务、轮询/等待结果、读取输出、消息通信、暂停/恢复/终止、阶段面板、超时恢复记录 | parallel-agent.ts、parallel-agent/ |
 | 模型与层级 | 直接切换 provider/model，维护 L0/L1/L2 模型层级，设置默认思考深度 | model-switch.ts、model-switch/ |
-| 自定义供应商 | 注册和恢复自定义 provider，发现模型，兼容 OpenAI 风格和 Anthropic 流式响应，处理供应商流结束字段差异 | provider-manager.ts、provider-manager/ |
-| 流兼容与双轨调度 | 双轨调度 (auto/builtin/tolerant)，知名渠道兼容预设，自适应防崩守门，第三方模型终止符号兼容保护 | stream-compat.ts、stream-compat/ |
+| 自定义供应商 | 注册和恢复自定义 provider，发现模型，兼容 OpenAI 风格和 Anthropic 流式响应，处理供应商流结束字段差异，自定义模型默认 32k 输出上限，deepseek-flash 默认 1m 上下文 | provider-manager.ts、provider-manager/ |
+| 流兼容与双轨调度 | 双轨调度 (auto/builtin/tolerant)，知名渠道兼容预设，自适应防崩守门，第三方中转站/模型终止符号兼容保护 | stream-compat.ts、stream-compat/ |
 | Windows 命令 | 通过 cmd.exe 和 PowerShell 执行命令，支持代码页、超时、输出截断、进程树清理和目的说明 | cmd-tool.ts、powershell-tool.ts |
 | 上下文与长程注意力 | 查看 token/context 状态，记录和管理阶段性提醒，维护工作目标及可恢复状态 | context-usage.ts、token-stats.ts、long-attention-ps.ts、work-goal-mode.ts |
-| MCP Bridge | 管理本机 stdio MCP Server，发现工具/提示/资源，按策略调用工具并区分只读、持久化和破坏性操作 | mcp/ |
+| MCP Bridge | 管理本机 stdio MCP Server，启用的 Server 工具自动发现并直接暴露为 Pi 工具（如 wiki_*），按策略调用工具并区分只读、持久化和破坏性操作 | mcp/ |
 
 常见工具包括：
 
@@ -60,7 +60,14 @@ AUTO 不是 AUTO_ALL 的别名，也不会自动授予更高权限。使用 /aut
 ```
 
 也可以只执行 /auto_flash 从当前可用模型中选择，或执行 /auto_flash off
-关闭审批模型。未配置审批模型时，/auto 会提示并拒绝需要 AI 审批的边界；
+关闭审批模型。在 AUTO 模式下：
+- 所有命令行、自定义工具和 MCP 工具调用均经过安全审查器。
+- MCP 工具调用参数（包含 `call_mcp_tool`、`mcp_call` 及直接暴露的 `wiki_*` 工具）会被完整、格式化地传递给审查模型。
+- 长文本参数（如正文内容、diff）会自动经过安全压缩（保持前 200 字符预览与字符计数提示），确保目标路径、条目名等核心定位参数不被截断。
+- 自动提取并推导工具调用用途（`toolAction`、`toolSummary` 及目标参数），避免因信息不足导致误判拒绝。
+- 工作区可通过 `.agents/auto_flash_system.md` 自定义补充审核上下文，内置 `[MCP与知识库操作]` 分类准则，保护知识库正常检索与合规写入。
+
+未配置审批模型时，/auto 会提示并拒绝需要 AI 审批的边界；
 /auto_all 仍是独立的显式全同意模式。cmd 和 powershell 在 AUTO_ALL 下还
 要求调用参数包含 auto_all=true 与 purpose。
 
@@ -200,13 +207,15 @@ Linux/macOS 用户继续使用 pi 原生 bash，不需要为本扩展额外安�
 ├── stream-compat/          # 双轨流式调度与中转防崩兼容层
 ├── work-mode/              # 阶段、授权、计划、路径保护和安全评审
 ├── mcp/                    # 独立的 stdio MCP Bridge
-└── skills/pi-wiki/         # Pwiki 使用纪律和工具流程
+├── skills/pi-wiki/         # Pwiki 使用纪律和工具流程
+├── AGENTS.md               # PiAgent 行为与判断准则契约
+└── SYSTEM.md               # 系统阶段、授权与硬安全边界契约
 ```
 
-GitHub 特供版只包含公开运行时代码、MCP Bridge、Pwiki 使用 skill、README 和
+本仓库包含公开运行时代码、MCP Bridge、Pwiki 使用 skill、README、AGENTS.md、SYSTEM.md 和
 .gitignore。开发树中的测试目录、报告/笔记、完整 Pwiki 工程、本地索引、
-node_modules 和凭据不属于公开分发内容。仓库根目录如果保留 AGENTS.md 或
-SYSTEM.md，它们只服务于贡献协作，不会被 pi 当作扩展加载。
+node_modules 和凭据不属于公开分发内容。根目录的 AGENTS.md 和 SYSTEM.md
+作为规范契约，定义了 Agent 行为风格与执行权限边界。
 
 ### 更新与排错
 
@@ -262,25 +271,32 @@ API and does not modify pi core.
   Contracts, plan management, path protection, command safety checks, and
   sanitized audit context.
 - **AUTO_FLASH:** configure the AI reviewer used by /auto with
-  /auto_flash <provider>/<model>. A reviewer can decide an approval-boundary
-  call, but cannot promote guarded work or grant AUTO_ALL. Provider stream
-  failures and aborts are surfaced as failures instead of being misread as an
-  invalid boolean response.
+  /auto_flash <provider>/<model>. Features complete parameter transparency for
+  MCP calls (`call_mcp_tool`, `mcp_call`, and direct tools), intelligent
+  large-text argument compression (`compactReviewValue`) to protect key fields
+  from truncation, automatic purpose inference, and workspace-configurable
+  categorized review guidelines (`.agents/auto_flash_system.md`). Surfaced failures
+  explicitly differentiate network/auth/parse errors from safety rejections.
 - **Parallel agents:** spawn_agent, check_agent_results, read_agent_output,
   control_agent, send_agent_message, update_agent_task, manage_skills, and
   manage_tools, with task panels, stage reports, persistence, and timeout
   recovery metadata.
 - **Models and providers:** switch_model, L0/L1/L2 tiers, thinking levels,
   custom provider persistence and discovery, dual-track streaming (auto/builtin/tolerant),
-  OpenAI-compatible and Anthropic streaming compatibility helpers, and adaptive finish-reason protection.
+  OpenAI-compatible and Anthropic streaming compatibility helpers, adaptive finish-reason
+  protection for third-party relays, default 32k output limit, and 1m context window preset
+  for deepseek-flash.
 - **Windows execution:** cmd and powershell with code-page selection, timeouts,
   bounded output, process-tree cleanup, and explicit command purpose.
 - **Context and goals:** context/token status, long-attention PS reminders,
   work-goal lifecycle tools, and persisted phase/goal state.
-- **MCP Bridge:** manage local stdio servers, inspect their tools and metadata,
-  call tools through verified schemas, and apply strict or pwiki risk policies.
+- **MCP Bridge:** manage local stdio servers, automatic discovery and direct exposure
+  of server tools (e.g. `wiki_*`), namespace collision handling, verified schema calls,
+  and local risk policies (read, persistent, destructive).
 - **Pwiki integration:** the repository contains a skills/pi-wiki/SKILL.md usage
   discipline; Pwiki itself remains a separately installed CLI/MCP project.
+- **Contract documents:** root-level `AGENTS.md` and `SYSTEM.md` define the behavioral
+  taste, initiatives, execution phases, hard safety boundaries, and verification criteria.
 
 ### Installation
 
@@ -355,11 +371,10 @@ by risk. It must not be used as a reason to edit Pwiki data files directly.
 ### Public distribution boundary
 
 The public bundle contains extension source, the MCP bridge, the Pwiki usage
-skill, README, and .gitignore. It intentionally excludes development tests,
-private reports and notes, the full Pwiki project, local indexes, runtime
-dependencies, and credentials. Root-level AGENTS.md and SYSTEM.md, when
-present in the repository, are contribution documents rather than runtime
-extensions.
+skill, README, AGENTS.md, SYSTEM.md, and .gitignore. It intentionally excludes development
+tests, private reports and notes, the full Pwiki project, local indexes, runtime
+dependencies, and credentials. Root-level AGENTS.md and SYSTEM.md define the agent
+behavioral guidelines and runtime security contracts.
 
 ### Troubleshooting and contribution
 
