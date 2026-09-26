@@ -111,6 +111,83 @@ export async function showPathConfirm(
   return "no";
 }
 
+export interface AutoFlashFallbackResult {
+  action: "allow" | "deny";
+  reason?: string;
+  timeout?: boolean;
+}
+
+export async function showAutoFlashFallbackConfirm(
+  ctx: ExtensionContext,
+  request: {
+    command: string;
+    toolName?: string;
+    purpose?: string;
+  },
+  review: {
+    reason: string;
+    modelRef?: string;
+  },
+  isSubAgent: boolean,
+  timeoutMs = 10_000,
+): Promise<AutoFlashFallbackResult> {
+  const shortTarget = request.command.length > 120
+    ? request.command.slice(0, 117) + "..."
+    : request.command;
+  const toolName = request.toolName ?? "工具/命令";
+  const purposeText = shortPurpose(request.purpose);
+  const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+
+  const title = [
+    `⚠️ AI 自动审批已拦截 [${toolName}]${review.modelRef ? ` (${review.modelRef})` : ""}`,
+    `目标: ${shortTarget}`,
+    `AI 拒绝原因: ${review.reason}`,
+    ...(purposeText ? [`用途: ${purposeText}`] : []),
+    `⏳ 倒计时 ${seconds}s: 超时未响应将自动拒绝并继续执行任务`,
+  ].join("\n");
+
+  const options = ["仅允许本次 (推翻AI拦截)", "确认拒绝 (立即终止本次调用)"];
+
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<"__timeout__">((resolve) => {
+    timer = setTimeout(() => resolve("__timeout__"), timeoutMs);
+  });
+
+  const promptPromise = (async () => {
+    try {
+      if (isSubAgent) {
+        return await requestConfirm("bash", title, request.command, options, timeoutMs);
+      }
+      return await ctx.ui.select(title, options, { timeout: timeoutMs });
+    } catch {
+      return undefined;
+    }
+  })();
+
+  const choice = await Promise.race([promptPromise, timeoutPromise]);
+  if (timer) clearTimeout(timer);
+
+  if (choice === "仅允许本次 (推翻AI拦截)") {
+    ctx.ui.notify("已由人工推翻 AI 拦截，允许本次调用执行", "info");
+    return { action: "allow" };
+  }
+
+  if (choice === "__timeout__" || choice === undefined) {
+    ctx.ui.notify(`人工审核已超时（${seconds}s），按 AI 审查意见自动拒绝`, "warning");
+    return {
+      action: "deny",
+      reason: `AUTO_FLASH 拒绝：${review.reason}（人工审核超时${seconds}s自动拒绝）`,
+      timeout: true,
+    };
+  }
+
+  return {
+    action: "deny",
+    reason: `AUTO_FLASH 拒绝：${review.reason}（经人工审核确认拒绝）`,
+    timeout: false,
+  };
+}
+
 export async function confirmAndRemember(
   ctx: ExtensionContext,
   allowlist: Set<string>,

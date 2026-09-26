@@ -14,7 +14,7 @@ import {
 } from "../lib/audit-sanitize.js";
 import { getExecutionContext } from "../lib/execution-context.js";
 import { type ConversationPhase, type PlanStep } from "./types.js";
-import { confirmAndRemember } from "./confirm-dialog.js";
+import { confirmAndRemember, showAutoFlashFallbackConfirm } from "./confirm-dialog.js";
 import { reviewWithAutoFlash } from "./auto-flash.js";
 import { profileFromPhase } from "./execution-profile.js";
 import {
@@ -56,12 +56,19 @@ async function applyDecision(
     if (decision.flashReview) {
       const review = await reviewWithAutoFlash(ctx, decision.flashReview);
       if (!review.allow) {
-        return {
-          block: true,
-          reason: review.reason,
-        };
-      }
-      if (!review.skipped) {
+        const fallback = await showAutoFlashFallbackConfirm(
+          ctx,
+          decision.flashReview,
+          review,
+          state.isSubAgent,
+        );
+        if (fallback.action === "deny") {
+          return {
+            block: true,
+            reason: fallback.reason ?? review.reason,
+          };
+        }
+      } else if (!review.skipped) {
         ctx.ui.notify(`AUTO_FLASH 已通过${review.modelRef ? `（${review.modelRef}）` : ""}：${review.reason}`, "info");
       }
     }
