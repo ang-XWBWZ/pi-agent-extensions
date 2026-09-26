@@ -319,6 +319,8 @@ export interface AgentInstance {
   _abortExternally?: () => void;
   /** 内部：重置超时计时器 */
   _resetTimer?: () => void;
+  /** 内部：超时过半警告定时器 */
+  _warningTimer?: ReturnType<typeof setTimeout> | null;
   /** 内部：空闲检测定时器 */
   _idleTimer?: ReturnType<typeof setTimeout>;
   /** 内部：agent_end 时捕获的消息快照（session dispose 后仍可用） */
@@ -1524,7 +1526,7 @@ export function onJobComplete(
 
 // ---- 等待（阻塞式，仅用于 check_agent_results 兼容） ----
 
-export function waitForJob(jobId: string, timeoutMs: number = 300_000, signal?: AbortSignal): Promise<AgentJob> {
+export function waitForJob(jobId: string, timeoutMs: number = 600_000, signal?: AbortSignal): Promise<AgentJob> {
   const job = state.jobs.get(jobId);
   if (job && (job.status === "complete" || job.status === "error" || job.status === "killed")) {
     return Promise.resolve(job);

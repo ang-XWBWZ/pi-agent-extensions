@@ -20,6 +20,8 @@ import { spawnAllBackground } from "../lib/spawner.js";
 import { formatJobFullResult } from "../lib/result-format.js";
 
 // 硬编码安全网
+export const DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 600;
+
 const TOOL_SAFETY_NET: ReadonlySet<string> = new Set([
   "spawn_agent",
   "check_agent_results",
@@ -68,7 +70,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
           notes: Type.Optional(Type.Array(Type.String({ description: "任务面板初始备注" }))),
         }),
       ),
-      timeout: Type.Optional(Type.Number({ description: "单任务超时秒（默认 60）" })),
+      timeout: Type.Optional(Type.Number({ description: "单任务超时秒（默认 600，即 10 分钟）" })),
       autoInject: Type.Optional(Type.Boolean({ description: "完成后自动推送结果到主对话（默认 true）" })),
     }),
     renderCall(args, theme, context) {
@@ -89,7 +91,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
     },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const total = params.tasks.length;
-      const timeoutSeconds = params.timeout ?? 60;
+      const timeoutSeconds = params.timeout ?? DEFAULT_SUBAGENT_TIMEOUT_SECONDS;
       const autoInject = params.autoInject !== false;
 
       if (signal?.aborted) throw new Error("操作已取消");

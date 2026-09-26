@@ -59,6 +59,16 @@ function fallbackFinalConclusion(output: string): string {
   return normalizeFinalConclusion(output) ?? "任务已完成，但未生成文本结论。";
 }
 
+export function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) {
+    return totalSeconds === 0 ? `${ms}毫秒` : `${totalSeconds}秒`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `${minutes}分钟` : `${minutes}分${seconds}秒`;
+}
+
 export function runSingleAgent(
   task: SubTask,
   order: number,
@@ -79,6 +89,7 @@ export function runSingleAgent(
     void (async () => {
       let unsubRef: (() => void) | undefined;
       let timerRef: ReturnType<typeof setTimeout> | null = null;
+      let warningTimer: ReturnType<typeof setTimeout> | null = null;
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
       let autoContinueTimer: ReturnType<typeof setTimeout> | null = null;
       let instRef: AgentInstance | undefined;
@@ -95,6 +106,13 @@ export function runSingleAgent(
         if (timerRef) {
           clearTimeout(timerRef);
           timerRef = null;
+        }
+        if (warningTimer) {
+          clearTimeout(warningTimer);
+          warningTimer = null;
+        }
+        if (instRef) {
+          instRef._warningTimer = null;
         }
         if (idleTimer) {
           clearTimeout(idleTimer);
@@ -213,7 +231,54 @@ export function runSingleAgent(
       };
 
       const resetTimer = () => {
-        if (timerRef) clearTimeout(timerRef);
+        if (timerRef) {
+          clearTimeout(timerRef);
+          timerRef = null;
+        }
+        if (warningTimer) {
+          clearTimeout(warningTimer);
+          warningTimer = null;
+        }
+        if (instRef) {
+          instRef._warningTimer = null;
+        }
+
+        const halfDeadline = Math.floor(deadline / 2);
+        if (halfDeadline > 0) {
+          warningTimer = setTimeout(() => {
+            warningTimer = null;
+            if (instRef) instRef._warningTimer = null;
+            if (settled) return;
+            const targetInst = instRef;
+            if (!targetInst || targetInst._settled) return;
+
+            const warnMsg = `[任务超时警告] 当前子任务执行时间已达到超时限制的一半（已运行约 ${formatDuration(halfDeadline)}，剩余时间约 ${formatDuration(deadline - halfDeadline)}，总超时限制 ${formatDuration(deadline)}）。请评估当前任务进展，加快核心结论收敛，避免陷入冗长重试或死循环，及时通过 update_agent_task 提交阶段性结论并准备输出最终答案。`;
+
+            try {
+              if (targetInst.session && !targetInst._settled) {
+                void Promise.resolve(targetInst.session.steer(warnMsg)).catch((error) => {
+                  console.warn(`[agent-runner] 子任务 ${task.id} 注入超时警告失败:`, error);
+                });
+              }
+            } catch (error) {
+              console.warn(`[agent-runner] 子任务 ${task.id} 触发超时警告异常:`, error);
+            }
+
+            try {
+              updateAgentTaskPanel(jobId, task.id, {
+                note: warnMsg,
+                noteSource: "system",
+              });
+            } catch (error) {
+              console.warn(`[agent-runner] 子任务 ${task.id} 更新任务面板警告失败:`, error);
+            }
+          }, halfDeadline);
+
+          if (instRef) {
+            instRef._warningTimer = warningTimer;
+          }
+        }
+
         timerRef = setTimeout(() => {
           void finish({
             id: task.id,

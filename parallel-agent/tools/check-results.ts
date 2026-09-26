@@ -115,7 +115,7 @@ export function registerCheckResults(pi: ExtensionAPI): void {
     parameters: Type.Object({
       jobId: Type.Optional(Type.String({ description: "Job ID（不传则列出所有）" })),
       wait: Type.Optional(Type.Boolean({ description: "是否阻塞等待完成（默认 false）" })),
-      timeout: Type.Optional(Type.Number({ description: "等待超时秒（默认 300）" })),
+      timeout: Type.Optional(Type.Number({ description: "等待超时秒（默认 600，即 10 分钟）" })),
     }),
     renderCall(args, theme, context) {
       return renderStructuredToolCall(theme, context, "check_agent_results", [
@@ -218,7 +218,7 @@ export function registerCheckResults(pi: ExtensionAPI): void {
         };
       }
 
-      const waitTimeout = (params.timeout ?? 300) * 1000;
+      const waitTimeout = (params.timeout ?? 600) * 1000;
       ctx.ui.notify(`⏳ 等待 Job ${params.jobId.slice(0, 8)} 完成...`, "info");
 
       const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
