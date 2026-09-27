@@ -12,7 +12,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSpeedTracker } from "./lib/speed-tracker.js";
-import { getAutoStatusSummary } from "./work-mode/auto-status.js";
+import { getAutoStatusSummary, onAutoStatusChange } from "./work-mode/auto-status.js";
 
 /**
  * 格式化 Token 计数 (与官方原生保持一致)
@@ -189,14 +189,21 @@ export function buildTwoLineFooter(
 
   const rightSide = autoStatus ? `${autoStatus} · ${modelDesc}` : modelDesc;
 
-  // 6. 左右对齐与自适应截断
+  // 6. 左右对齐与自适应截断 (确保工作模式/阶段状态优先保留)
+  const minPadding = 2;
+  const autoStatusWidth = autoStatus ? visibleWidth(autoStatus) : 0;
   let statsLeftWidth = visibleWidth(statsLeft);
-  if (statsLeftWidth > width) {
+
+  // 当屏幕宽度较紧凑时，优先保障工作模式与状态展示 (WORK · GUARDED / PLAN 等)
+  const maxStatsLeftWidth = width - minPadding - autoStatusWidth;
+  if (maxStatsLeftWidth > 0 && statsLeftWidth > maxStatsLeftWidth) {
+    statsLeft = truncateToWidth(statsLeft, maxStatsLeftWidth, "...");
+    statsLeftWidth = visibleWidth(statsLeft);
+  } else if (statsLeftWidth > width) {
     statsLeft = truncateToWidth(statsLeft, width, "...");
     statsLeftWidth = visibleWidth(statsLeft);
   }
 
-  const minPadding = 2;
   const rightSideWidth = visibleWidth(rightSide);
   const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
   let statsLine = "";
@@ -232,11 +239,13 @@ export default function (pi: ExtensionAPI) {
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       activeTui = tui;
-      const unsub = footerData.onBranchChange(() => tui.requestRender());
+      const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
+      const unsubStatus = onAutoStatusChange(() => tui.requestRender());
 
       return {
         dispose: () => {
-          unsub();
+          unsubBranch();
+          unsubStatus();
           if (activeTui === tui) {
             activeTui = null;
           }

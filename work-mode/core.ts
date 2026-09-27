@@ -16,6 +16,7 @@ import {
 import { formatProfileForPrompt, profileFromPhase } from "./execution-profile.js";
 import { ensureAutoFlashSystemContext, getAutoFlashModel, registerAutoFlashCommand } from "./auto-flash.js";
 import {
+  notifyAutoStatusChange,
   resetAutoSessionState,
   resetAutoStateForTurn,
   setAutoStopped,
@@ -83,6 +84,7 @@ export function setupCore(
     );
     ctx.ui.setStatus("work-auth", "");
     updateAutoStatusBar(ctx);
+    notifyAutoStatusChange();
   }
 
   function applyProfile(

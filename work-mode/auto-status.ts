@@ -22,6 +22,32 @@ let stopAbortController: AbortController | undefined;
 type PlanChecker = () => boolean;
 let activePlanChecker: PlanChecker | undefined;
 
+type StatusChangeListener = () => void;
+const statusListeners = new Set<StatusChangeListener>();
+
+/**
+ * 订阅 AUTO / 工作模式状态变更事件（供底栏或 UI 实时重绘）
+ */
+export function onAutoStatusChange(listener: StatusChangeListener): () => void {
+  statusListeners.add(listener);
+  return () => {
+    statusListeners.delete(listener);
+  };
+}
+
+/**
+ * 触发状态变更通知
+ */
+export function notifyAutoStatusChange(): void {
+  for (const listener of statusListeners) {
+    try {
+      listener();
+    } catch {
+      // 忽略单个监听器异常
+    }
+  }
+}
+
 /**
  * 注册未完成计划检查器
  */
@@ -74,10 +100,12 @@ export function setAutoStopped(stopped: boolean): void {
     stopAbortController?.abort();
     stopAbortController = undefined;
   }
+  notifyAutoStatusChange();
 }
 
 export function resetAutoStopped(): void {
   autoStopped = false;
+  notifyAutoStatusChange();
 }
 
 export function isAutoCircuitBroken(): boolean {
@@ -86,6 +114,7 @@ export function isAutoCircuitBroken(): boolean {
 
 export function resetAutoCircuitBreaker(): void {
   autoCircuitBroken = false;
+  notifyAutoStatusChange();
 }
 
 export function getAutoStepCount(): number {
@@ -99,10 +128,12 @@ export function recordAutoStep(): number {
 
 export function resetAutoSteps(): void {
   consecutiveAutoSteps = 0;
+  notifyAutoStatusChange();
 }
 
 export function setAutoAction(action: string | undefined): void {
   currentAutoAction = action;
+  notifyAutoStatusChange();
 }
 
 export function getAutoAction(): string | undefined {
@@ -113,6 +144,7 @@ export function checkAutoCircuitBreaker(): { broken: boolean; reason?: string } 
   const maxSteps = getMaxAutoSteps();
   if (consecutiveAutoSteps >= maxSteps) {
     autoCircuitBroken = true;
+    notifyAutoStatusChange();
     const hasContext = hasActivePlanOrGoal();
     const contextDesc = hasContext ? "（有计划/目标进行中，限额200步）" : "（无计划/目标，限额100步）";
     return {
@@ -190,6 +222,7 @@ export function resetAutoStateForTurn(): void {
   if (stopAbortController) {
     stopAbortController = undefined;
   }
+  notifyAutoStatusChange();
 }
 
 export function resetAutoSessionState(): void {
@@ -198,6 +231,7 @@ export function resetAutoSessionState(): void {
   consecutiveAutoSteps = 0;
   currentAutoAction = undefined;
   stopAbortController = undefined;
+  notifyAutoStatusChange();
 }
 
 /**
@@ -212,27 +246,27 @@ export function getAutoStatusSummary(): string | undefined {
   }
 
   if (autoStopped) {
-    return "AUTO [已终止]";
+    return "WORK · AUTO [已终止]";
   }
 
   if (autoCircuitBroken) {
-    return `AUTO [已熔断: 超${getMaxAutoSteps()}步]`;
+    return `WORK · AUTO [已熔断: 超${getMaxAutoSteps()}步]`;
   }
 
   const isAuto = executionContext?.autonomy === "auto";
   const isAutoAll = executionContext?.approval?.autoAll;
 
   if (currentAutoAction) {
-    return `AUTO [${currentAutoAction}]`;
+    return `WORK · AUTO [${currentAutoAction}]`;
   }
 
   if (isAutoAll) {
-    return "AUTO_ALL [就绪]";
+    return "WORK · AUTO_ALL [就绪]";
   }
 
   if (isAuto) {
-    return "AUTO [就绪]";
+    return "WORK · AUTO [就绪]";
   }
 
-  return "GUARDED";
+  return "WORK · GUARDED";
 }
