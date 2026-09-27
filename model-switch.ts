@@ -13,8 +13,40 @@ import { registerTierCmds } from "./model-switch/commands/tier-cmds.js";
 import { registerDefaultCmds } from "./model-switch/commands/default-cmds.js";
 import { registerSwitchModel } from "./model-switch/tools/switch-model.js";
 import { KEY_PROVIDER, KEY_MODEL, KEY_TIER } from "./model-switch/lib/types.js";
+import { registerCapability } from "./lib/capability-router.js";
 
 export default function (pi: ExtensionAPI) {
+  registerCapability({
+    id: "model_switch",
+    name: "Model Switch & Thinking Tier",
+    summary: "Switch active model, manage reasoning/thinking depth, and configure model tiers.",
+    keywords: ["model", "switch_model", "thinking", "tier", "reasoning", "model_select"],
+    phases: ["work", "plan"],
+    tools: ["switch_model"],
+    toolDescriptions: {
+      switch_model: "切换当前会话模型、查询可用模型列表、设置思考深度(thinkingLevel)及配置 L0/L1/L2 模型分级",
+    },
+    usageDoc: `# Model Switch & Thinking Tier Subsystem (model_switch)
+
+### Available Tool:
+- \`switch_model\`: Switch models, query model list, manage model tier configuration and thinking/reasoning depth.
+
+### Usage Guidelines:
+1. Use switch_model only when task complexity, context, cost, or requested reasoning depth materially benefits from a change.
+2. Use switch_model tiers (L0/L1/L2) for normal routing and manage_providers only for provider registration.
+3. If switch_model cannot resolve a requested tier or model, continue with the current model and report the missing configuration.
+
+### Common Actions:
+- \`switch_model({})\`: List available models and current active model/tier/thinking depth.
+- \`switch_model({ provider: "...", model: "..." })\`: Switch to a specific provider and model.
+- \`switch_model({ tier: "L0" | "L1" | "L2" })\`: Switch to a preconfigured model tier.
+- \`switch_model({ thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" })\`: Set thinking/reasoning depth and persist it.
+- \`switch_model({ action: "show_tier_config" })\`: Inspect current L0/L1/L2 configuration.
+- \`switch_model({ action: "add_to_tier", tier: "...", provider: "...", model: "...", thinkingLevel?: "..." })\`: Add a model to a tier.
+- \`switch_model({ action: "remove_from_tier", tier: "...", provider?: "...", model?: "..." })\`: Remove model from a tier.
+- \`switch_model({ action: "set_tier_thinking", tier: "...", thinkingLevel: "..." })\`: Set tier-specific thinking depth.`,
+  });
+
   let defaultRef: { provider: string; model: string } | null = null;
   let currentTier: TierKey | null = null;
   let tierConfig: Record<TierKey, TierConfig> = {};

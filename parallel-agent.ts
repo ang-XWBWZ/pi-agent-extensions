@@ -50,6 +50,16 @@ export default function (pi: ExtensionAPI) {
       "manage_skills",
       "manage_tools",
     ],
+    toolDescriptions: {
+      spawn_agent: "并行派发后台子 Agent 执行探索、调研或独立验证任务，返回 jobId",
+      check_agent_results: "轮询或阻塞等待子 Agent 执行结果，支持结果自动注入主上下文",
+      send_agent_message: "向指定运行中的子 Agent 点对点发送通信消息或广播指令",
+      control_agent: "子 Agent 完整生命周期控制（列出/状态/暂停/恢复/终止/保存/加载）",
+      update_agent_task: "更新子任务进度面板、单调递增进度、阶段性结论与备忘录",
+      read_agent_output: "分页按需读取子任务原始日志输出字节，避免上下文污染",
+      manage_skills: "管理子任务可用的 Skill 技能黑白名单",
+      manage_tools: "管理子任务可用的 Tool 工具黑白名单",
+    },
     usageDoc: `# Parallel Agent Subsystem (parallel_agent)
 
 ### Available Tools:

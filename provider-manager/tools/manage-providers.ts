@@ -44,12 +44,6 @@ export function registerManageProviders(pi: ExtensionAPI): void {
     name: "manage_providers",
     label: "Manage Providers",
     description: "Register, remove, and list custom model providers.",
-    promptSnippet: "Register/list/remove custom model providers. Use switch_model only after provider registration.",
-    promptGuidelines: [
-      "Use manage_providers only for explicit provider inspection or persistent registration, repair, refresh, and removal.",
-      "Use manage_providers list before mutation; use switch_model for active model selection after registration succeeds.",
-      "If manage_providers connection tests fail, report the capability diagnostics instead of cycling through random compatibility modes.",
-    ],
     parameters: Type.Object({
       action: Type.Optional(Type.String({ description: "register|remove|list|set_reasoning_models|set_context_window|set_model_limits|set_stream_compat_mode|refresh_models" })),
       provider: Type.Optional(Type.String({ description: "Provider name" })),

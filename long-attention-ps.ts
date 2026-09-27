@@ -9,6 +9,7 @@
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { renderStructuredToolCall, renderToolResult } from "./lib/tui-render.js";
+import { registerCapability } from "./lib/capability-router.js";
 
 type PsPriority = "low" | "medium" | "high" | "critical";
 type PsType =
@@ -361,16 +362,43 @@ function updateStatus(ctx: ExtensionContext, st: PsState): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  registerCapability({
+    id: "long_attention",
+    name: "Long Attention Runtime Reminders",
+    summary: "Record and manage persistent runtime reminders (PS) across conversation turns.",
+    keywords: ["ps", "long_attention", "reminder", "constraint", "memory", "note"],
+    phases: ["work"],
+    tools: [
+      "long_attention_add_ps",
+      "long_attention_list_ps",
+      "long_attention_clear_ps",
+      "long_attention_config_ps",
+    ],
+    toolDescriptions: {
+      long_attention_add_ps: "添加一条跨轮次的长程注意力短提醒（保存约束、决策、风险或待办）",
+      long_attention_list_ps: "查看当前所有生效的 PS 提醒列表与注入配置",
+      long_attention_clear_ps: "清理或按过期作用域 (turn/task/phase/session) 删除 PS 提醒",
+      long_attention_config_ps: "查看或动态调整长程注意力注入策略与阈值配置",
+    },
+    usageDoc: `# Long Attention Runtime Reminders Subsystem (long_attention)
+
+### Available Tools:
+- \`long_attention_add_ps(message, type?, priority?, expires?, phase?, mode?, keywords?)\`: Add a runtime reminder PS for the main agent.
+- \`long_attention_list_ps()\`: Inspect all active PS reminders and current injection configuration.
+- \`long_attention_clear_ps(scope?)\`: Clear reminders (scope: all|turn|task|phase|session|project|persistent).
+- \`long_attention_config_ps(key?, value?)\`: Inspect or update injection configuration.
+
+### Usage Guidelines:
+- Use long_attention_add_ps only for a compact constraint, decision, risk, or open loop that must survive future turns.
+- Keep PS messages short, concrete, and actionable.`,
+  });
+
   const st = loadState();
 
   pi.registerTool({
     name: "long_attention_add_ps",
     label: "Long Attention Add PS",
     description: "添加一条长程注意力 PS。用于保存主 agent 后续需要被短提醒的约束、决策、风险或未闭环事项。",
-    promptSnippet: "Add a Runtime PS reminder for the main agent",
-    promptGuidelines: [
-      "Use long_attention_add_ps only for a compact constraint, decision, risk, or open loop that must survive future turns.",
-    ],
     parameters: Type.Object({
       message: Type.String({ description: "PS 内容，必须短、具体、可行动" }),
       type: Type.Optional(Type.String({ description: "user_preference|project_constraint|prior_decision|open_loop|rejected_option|risk_memory|environment_fact|task_state|note" })),

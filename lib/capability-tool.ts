@@ -9,7 +9,11 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { activateCapability, getRegisteredCapabilities } from "./capability-router.js";
+import {
+  activateCapability,
+  getRegisteredCapabilities,
+  formatFullCapabilityCatalog,
+} from "./capability-router.js";
 import { renderStructuredToolCall, renderToolResult } from "./tui-render.js";
 
 export function registerCapabilityTool(pi: ExtensionAPI): void {
@@ -18,35 +22,48 @@ export function registerCapabilityTool(pi: ExtensionAPI): void {
     name: "load_capability",
     label: "load_capability",
     description:
-      "按需激活进阶能力子系统（如 parallel_agent、work_goal 等）。激活后将即时挂载对应新工具并返回该能力的深度指南。普通任务无需激活。",
+      "按需激活进阶能力子系统（如 model_switch、provider_manager、parallel_agent、work_goal 等），或查看系统功能与工具完整清单。激活后将即时挂载对应新工具并返回该能力的深度指南。",
     parameters: Type.Object({
-      capability: Type.String({
-        description: "要激活的能力 ID，参见初始 <subsystems> 列表（如 parallel_agent, work_goal）",
-      }),
+      capability: Type.Optional(
+        Type.String({
+          description:
+            "要激活的能力 ID（如 model_switch, provider_manager, parallel_agent, work_goal 等）。留空或配合 action='list' 可查看系统全量能力与工具功能清单。",
+        }),
+      ),
+      action: Type.Optional(
+        Type.String({
+          description: "操作类型：'load'（激活指定能力，默认）或 'list'（列出全量能力与工具功能清单）",
+        }),
+      ),
     }),
     renderCall(args, theme, context) {
       return renderStructuredToolCall(theme, context, "load_capability", [
         { name: "capability", value: args.capability, tone: "accent" },
+        { name: "action", value: args.action, tone: "warning" },
       ]);
     },
     renderResult(result, options, theme, context) {
       return renderToolResult(result, options, theme, context, {
-        previewLines: 8,
+        previewLines: 12,
       });
     },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
+      const action = (params as { action?: string }).action?.trim();
       const capId = (params as { capability?: string }).capability?.trim();
-      if (!capId) {
-        const available = getRegisteredCapabilities()
-          .map((c) => `- ${c.id}: ${c.name} (${c.summary})`)
-          .join("\n");
+
+      if (action === "list" || !capId) {
+        const catalog = formatFullCapabilityCatalog();
         return {
           content: [
             {
               type: "text",
-              text: `请提供有效的能力 ID。当前系统可用能力清单：\n${available || "(暂无注册能力)"}`,
+              text: catalog,
             },
           ],
+          details: {
+            action: "list",
+            totalCapabilities: getRegisteredCapabilities().length,
+          },
         };
       }
 

@@ -23,6 +23,7 @@ import {
 } from "./auto-status.js";
 import {
   formatImmutableCapabilityIndex,
+  formatFullCapabilityCatalog,
   syncActiveToolsForPhase,
 } from "../lib/capability-router.js";
 import { registerCapabilityTool } from "../lib/capability-tool.js";
@@ -278,5 +279,20 @@ export function setupCore(
       applyProfile("work", "auto", ctx);
       ctx.ui.notify("/yolo 已兼容映射到 /auto", "warning");
     },
+  });
+
+  const capabilitiesHandler = async (_a: string, ctx: ExtensionContext) => {
+    const catalog = formatFullCapabilityCatalog();
+    ctx.ui.notify(catalog, "info");
+  };
+
+  pi.registerCommand("capabilities", {
+    description: "查看系统可用能力与工具功能清单 (PCS)",
+    handler: capabilitiesHandler,
+  });
+
+  pi.registerCommand("caps", {
+    description: "查看系统可用能力与工具功能清单别名 (/capabilities)",
+    handler: capabilitiesHandler,
   });
 }

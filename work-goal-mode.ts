@@ -133,6 +133,13 @@ export default function (pi: ExtensionAPI) {
       "work_goal_finish",
       "work_goal_abort",
     ],
+    toolDescriptions: {
+      work_goal_start: "启动当前工作阶段的结构化任务审计账本与进度跟踪",
+      work_goal_status: "查看当前工作目标账本状态、运行时长与阶段性审计日志",
+      work_goal_log: "查看当前工作目标账本的历史审计条目列表",
+      work_goal_finish: "完成当前工作目标账本并提交最终交付物审计摘要",
+      work_goal_abort: "终止当前工作目标账本并记录终止原因（保留历史审计记录）",
+    },
     usageDoc: `# Work Goal Ledger Subsystem (work_goal)
 Provides structured audit logging and progress tracking for execution in WORK mode.
 

@@ -35,6 +35,9 @@ export interface CapabilityManifest {
   /** 该能力包含的工具名称列表 */
   tools: string[];
 
+  /** 每个工具的简要功能说明字典（用于生成功能清单，让 AI 知道具体工具是做什么的） */
+  toolDescriptions?: Record<string, string>;
+
   /**
    * 深度使用说明文档（Markdown 格式）
    * ！！！绝不能进入首轮 System Prompt ！！！
@@ -60,6 +63,7 @@ export const BASELINE_CORE_TOOLS = [
   "bash",
   "cmd",
   "powershell",
+  "manage_plan",
   "load_capability",
 ];
 
@@ -142,9 +146,62 @@ export function formatImmutableCapabilityIndex(): string {
     "Specialized capabilities are loaded on demand via load_capability({ capability: string }).",
   ];
   for (const cap of caps) {
-    lines.push(`- ${cap.id}: ${cap.summary}`);
+    const toolsStr = cap.tools.length > 0 ? ` [tools: ${cap.tools.join(", ")}]` : "";
+    lines.push(`- ${cap.id}: ${cap.summary}${toolsStr}`);
   }
   lines.push("</subsystems>");
+  return lines.join("\n");
+}
+
+/**
+ * 格式化输出全量功能清单与每个工具的具体用途说明
+ * 用于 /capabilities 命令与 load_capability action="list" / 未提供参数时的 AI 指引
+ */
+export function formatFullCapabilityCatalog(): string {
+  const caps = getRegisteredCapabilities().sort((a, b) => a.id.localeCompare(b.id));
+  const lines: string[] = [
+    "================================================================================",
+    "                     系统能力与工具功能清单 (Capability Catalog)",
+    "================================================================================",
+    "【常驻核心基础工具 (Baseline Core Tools)】",
+    "  - read: 读取工作区或允许路径下的文件内容",
+    "  - edit: 按指定文本块修改文件内容",
+    "  - write: 创建新文件或覆盖已有文件",
+    "  - bash: 执行 Linux / macOS / Unix Bash 终端命令",
+    "  - cmd: 执行 Windows CMD 命令行指令",
+    "  - powershell: 执行 Windows PowerShell 命令行指令",
+    "  - manage_plan: WORK 阶段多步骤任务执行计划管理 (新增/更新/完成/重排步骤)",
+    "  - load_capability: 按需激活进阶能力子系统 (load_capability({ capability: '<id>' }))",
+    "",
+    "【可用进阶能力清单 (通过 load_capability 按需挂载)】",
+  ];
+
+  if (caps.length === 0) {
+    lines.push("  (暂无注册的进阶能力)");
+  } else {
+    for (const cap of caps) {
+      const phases = cap.phases && cap.phases.length > 0 ? cap.phases.join(", ") : "work";
+      lines.push(`- [${cap.id}] ${cap.name} (阶段: ${phases})`);
+      lines.push(`  摘要: ${cap.summary}`);
+      lines.push("  包含工具与具体用途:");
+      if (cap.tools.length === 0) {
+        lines.push("    (无独立工具)");
+      } else {
+        for (const tool of cap.tools) {
+          const desc = cap.toolDescriptions?.[tool] ?? "该能力提供的子系统扩展工具";
+          lines.push(`    * ${tool}: ${desc}`);
+        }
+      }
+      lines.push("");
+    }
+  }
+
+  lines.push("--------------------------------------------------------------------------------");
+  lines.push("使用方式:");
+  lines.push("  - AI 调用工具: load_capability({ capability: '<id>' }) 挂载指定能力及工具");
+  lines.push("  - AI 查询清单: load_capability({ action: 'list' }) 查看最新全量能力清单");
+  lines.push("  - 用户终端命令: /capabilities 或 /caps 随时查看此功能卡片");
+  lines.push("================================================================================");
   return lines.join("\n");
 }
 
@@ -162,7 +219,7 @@ export async function activateCapability(
     const available = Array.from(state.manifests.keys()).join(", ");
     return {
       success: false,
-      message: `未找到指定能力标识符: "${id}"。当前可用能力: [${available}]`,
+      message: `未找到指定能力标识符: "${id}"。当前可用能力: [${available}]。\n\n${formatFullCapabilityCatalog()}`,
     };
   }
 

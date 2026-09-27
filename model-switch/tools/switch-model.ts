@@ -34,12 +34,6 @@ export function registerSwitchModel(
     name: "switch_model",
     label: "Switch Model",
     description: "切换模型、查看模型列表、管理模型层级和思考深度。",
-    promptSnippet: "List/switch models; manage tier config; set thinking level",
-    promptGuidelines: [
-      "Use switch_model only when task complexity, context, cost, or requested reasoning depth materially benefits from a change.",
-      "Use switch_model tiers for normal routing and manage_providers only for provider registration.",
-      "If switch_model cannot resolve a requested tier or model, continue with the current model and report the missing configuration.",
-    ],
     parameters: Type.Object({
       provider: Type.Optional(Type.String({ description: "模型 provider" })),
       model: Type.Optional(Type.String({ description: "模型 ID" })),
