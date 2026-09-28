@@ -14,6 +14,7 @@ import {
   getRegisteredCapabilities,
   formatFullCapabilityCatalog,
 } from "./capability-router.js";
+import { getExecutionContext } from "./execution-context.js";
 import { renderStructuredToolCall, renderToolResult } from "./tui-render.js";
 
 export function registerCapabilityTool(pi: ExtensionAPI): void {
@@ -67,7 +68,13 @@ export function registerCapabilityTool(pi: ExtensionAPI): void {
         };
       }
 
-      const res = await activateCapability(capId, pi, ctx);
+      let currentPhase: any = "work";
+      try {
+        currentPhase = getExecutionContext()?.phase ?? "work";
+      } catch {
+        currentPhase = "work";
+      }
+      const res = await activateCapability(capId, pi, ctx, currentPhase);
       const text = [
         res.message,
         ...(res.doc ? ["", "---", `【${capId} 能力深度使用指南】`, res.doc] : []),

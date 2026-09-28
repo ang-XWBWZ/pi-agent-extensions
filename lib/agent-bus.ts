@@ -28,6 +28,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import {
+  ensurePrivateDir,
+  writePrivateFile,
+  appendPrivateFile,
+} from "./secure-fs.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage as SessionMessage } from "@earendil-works/pi-agent-core";
 import type {
@@ -141,8 +146,17 @@ export interface SubResult {
   };
 }
 
+export type ResultDeliveryState =
+  | "none"
+  | "pending"
+  | "claimed_by_poll"
+  | "delivering"
+  | "delivered"
+  | "delivery_failed";
+
 export interface AgentJob {
   jobId: string;
+  ownerSessionId?: string;
   tasks: SubTask[];
   total: number;
   completed: number;
@@ -150,12 +164,51 @@ export interface AgentJob {
   status: "dispatched" | "running" | "complete" | "error" | "killed";
   createdAt: number;
   finishedAt?: number;
+  terminalTaskIds?: Set<string>;
+  delivery?: {
+    requested: boolean;
+    state: ResultDeliveryState;
+    claimedAt?: number;
+    deliveredAt?: number;
+    lastError?: string;
+  };
   /** spawn_agent(autoInject=true) 请求自动注入完整结果 */
   _autoInjectRequested?: boolean;
   /** 自动注入进行中，防止完成事件重入造成重复完整结果 */
   _autoInjecting?: boolean;
   /** 是否已通过 autoInject 自动推送过完整结果，防止重复 */
   _autoInjected?: boolean;
+}
+
+export function claimDelivery(
+  job: AgentJob,
+  consumer: "poll" | "auto",
+): boolean {
+  if (!job.delivery) {
+    job.delivery = {
+      requested: !!job._autoInjectRequested,
+      state: job._autoInjected ? "delivered" : job._autoInjecting ? "delivering" : (job._autoInjectRequested ? "pending" : "none"),
+    };
+  }
+
+  if (
+    job.delivery.state === "delivered" ||
+    job.delivery.state === "claimed_by_poll" ||
+    job.delivery.state === "delivering"
+  ) {
+    return false;
+  }
+
+  job.delivery.state = consumer === "poll" ? "claimed_by_poll" : "delivering";
+  job.delivery.claimedAt = Date.now();
+
+  if (consumer === "poll") {
+    job._autoInjected = true;
+  } else {
+    job._autoInjecting = true;
+  }
+
+  return true;
 }
 
 export type AgentTaskPanelStatus =
@@ -409,16 +462,20 @@ function agentDataDir(): string {
 
 function saveDir(): string {
   const dir = join(agentDataDir(), "sub-agent-saves");
-  mkdirSync(dir, { recursive: true });
+  ensurePrivateDir(dir);
   return dir;
 }
 
 function taskPanelDir(): string {
-  return join(agentDataDir(), "sub-agent-tasks");
+  const dir = join(agentDataDir(), "sub-agent-tasks");
+  ensurePrivateDir(dir);
+  return dir;
 }
 
 function taskOutputDir(): string {
-  return join(agentDataDir(), "sub-agent-output");
+  const dir = join(agentDataDir(), "sub-agent-output");
+  ensurePrivateDir(dir);
+  return dir;
 }
 
 /** 用户可控 ID 绝不直接成为路径片段，避免越界写入和 Windows 非法字符。 */
@@ -438,7 +495,7 @@ function savePath(saveId: string): string {
 
 function panelPath(jobId: string, taskId: string): string {
   const dir = join(taskPanelDir(), safeStorageName(jobId));
-  mkdirSync(dir, { recursive: true });
+  ensurePrivateDir(dir);
   return join(dir, `${safeStorageName(taskId)}.json`);
 }
 
@@ -448,7 +505,7 @@ function taskOutputPath(
   createDirectory = false,
 ): string {
   const dir = join(taskOutputDir(), safeStorageName(jobId));
-  if (createDirectory) mkdirSync(dir, { recursive: true });
+  if (createDirectory) ensurePrivateDir(dir);
   return join(dir, `${safeStorageName(taskId)}.log`);
 }
 
@@ -527,7 +584,7 @@ function sliceUtf8Buffer(
  */
 export function resetAgentTaskOutput(jobId: string, taskId: string): boolean {
   try {
-    writeFileSync(taskOutputPath(jobId, taskId, true), "", "utf8");
+    writePrivateFile(taskOutputPath(jobId, taskId, true), "");
     return true;
   } catch (error) {
     console.warn("[agent-bus] 初始化子 Agent 原始输出失败:", error);
@@ -542,7 +599,7 @@ export function appendAgentTaskOutput(
 ): boolean {
   if (!text) return true;
   try {
-    appendFileSync(taskOutputPath(jobId, taskId, true), text, "utf8");
+    appendPrivateFile(taskOutputPath(jobId, taskId, true), text);
     return true;
   } catch (error) {
     console.warn("[agent-bus] 追加子 Agent 原始输出失败:", error);
@@ -556,7 +613,7 @@ export function replaceAgentTaskOutput(
   text: string,
 ): boolean {
   try {
-    writeFileSync(taskOutputPath(jobId, taskId, true), text, "utf8");
+    writePrivateFile(taskOutputPath(jobId, taskId, true), text);
     return true;
   } catch (error) {
     console.warn("[agent-bus] 写入子 Agent 原始输出失败:", error);
@@ -688,16 +745,9 @@ export function readAgentTaskOutput(
 }
 
 function writeJson(target: string, value: unknown): void {
-  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    writeFileSync(temporary, JSON.stringify(value, null, 2), "utf-8");
-    renameSync(temporary, target);
+    writePrivateFile(target, JSON.stringify(value, null, 2));
   } catch (error) {
-    try {
-      if (existsSync(temporary)) unlinkSync(temporary);
-    } catch {
-      // 临时文件清理失败不掩盖原始持久化错误。
-    }
     throw new AgentPersistenceError("写入子 Agent 状态", target, error);
   }
 }
@@ -1088,7 +1138,7 @@ hydratePersistedTaskPanels();
 
 // ---- Job API ----
 
-export function createJob(tasks: SubTask[]): AgentJob {
+export function createJob(tasks: SubTask[], ownerSessionId?: string): AgentJob {
   if (tasks.length === 0) {
     throw new Error("AgentJob 至少需要一个子任务");
   }
@@ -1104,12 +1154,18 @@ export function createJob(tasks: SubTask[]): AgentJob {
   const jobId = randomUUID();
   const job: AgentJob = {
     jobId,
+    ownerSessionId,
     tasks,
     total: tasks.length,
     completed: 0,
     results: [],
     status: "dispatched",
     createdAt: Date.now(),
+    terminalTaskIds: new Set<string>(),
+    delivery: {
+      requested: false,
+      state: "none",
+    },
   };
   state.jobs.set(jobId, job);
   for (const task of tasks) createAgentTaskPanel(jobId, task);
@@ -1127,6 +1183,14 @@ export function listJobs(): AgentJob[] {
 export function publishTaskResult(jobId: string, result: SubResult): void {
   const job = state.jobs.get(jobId);
   if (!job) return;
+
+  if (!job.terminalTaskIds) {
+    job.terminalTaskIds = new Set<string>();
+  }
+  if (job.terminalTaskIds.has(result.id)) {
+    return;
+  }
+  job.terminalTaskIds.add(result.id);
 
   const panelStatus: AgentTaskPanelStatus =
     result.ok ? "completed" :
@@ -1152,7 +1216,7 @@ export function publishTaskResult(jobId: string, result: SubResult): void {
   });
 
   job.results.push(result);
-  job.completed++;
+  job.completed = job.terminalTaskIds.size;
 
   emitSafely(Events.TASK_RESULT, {
     jobId,
@@ -1164,6 +1228,7 @@ export function publishTaskResult(jobId: string, result: SubResult): void {
     if (job.status !== "killed") job.status = "complete";
     job.finishedAt = Date.now();
     emitSafely(Events.JOB_COMPLETE, { jobId, job });
+    emitSafely(Events.JOB_TERMINAL, { jobId, job, reason: "complete" });
   }
 }
 
@@ -1173,6 +1238,7 @@ export function publishJobError(jobId: string, error: string): void {
   job.status = "error";
   job.finishedAt = Date.now();
   emitSafely(Events.JOB_ERROR, { jobId, error });
+  emitSafely(Events.JOB_TERMINAL, { jobId, job, reason: "error", error });
 }
 
 // ---- Instance API（生命周期管理） ----
@@ -1357,6 +1423,7 @@ export async function killJob(jobId: string): Promise<number> {
   if (job) {
     job.status = "killed";
     job.finishedAt = Date.now();
+    emitSafely(Events.JOB_TERMINAL, { jobId, job, reason: "killed" });
   }
   return count;
 }
@@ -1475,7 +1542,7 @@ export function onMessage(
 // ---- 异步完成回调（不阻塞，用于 push 注入） ----
 
 /**
- * 注册 job 完成回调。当 job 完成或出错时触发。
+ * 注册 job 完成回调。当 job 完成、出错或被终止时触发。
  * 如果 job 已完成则立即异步回调。
  * 返回取消注册函数。
  */
@@ -1500,28 +1567,23 @@ export function onJobComplete(
     return () => {};
   }
 
-  const handler = (data: { jobId: string; job: AgentJob }) => {
+  const handler = (data: { jobId: string; job?: AgentJob }) => {
     if (data.jobId !== jobId) return;
-    globalBus.off(Events.JOB_COMPLETE, handler);
-    globalBus.off(Events.JOB_ERROR, errorHandler);
+    cleanup();
     const job = state.jobs.get(jobId);
     if (job) return invoke(job);
   };
 
-  const errorHandler = (data: { jobId: string }) => {
-    if (data.jobId !== jobId) return;
+  const cleanup = () => {
     globalBus.off(Events.JOB_COMPLETE, handler);
-    globalBus.off(Events.JOB_ERROR, errorHandler);
-    const job = state.jobs.get(jobId);
-    if (job) return invoke(job);
+    globalBus.off(Events.JOB_ERROR, handler);
+    globalBus.off(Events.JOB_TERMINAL, handler);
   };
 
   globalBus.on(Events.JOB_COMPLETE, handler);
-  globalBus.on(Events.JOB_ERROR, errorHandler);
-  return () => {
-    globalBus.off(Events.JOB_COMPLETE, handler);
-    globalBus.off(Events.JOB_ERROR, errorHandler);
-  };
+  globalBus.on(Events.JOB_ERROR, handler);
+  globalBus.on(Events.JOB_TERMINAL, handler);
+  return cleanup;
 }
 
 // ---- 等待（阻塞式，仅用于 check_agent_results 兼容） ----
@@ -1539,19 +1601,24 @@ export function waitForJob(jobId: string, timeoutMs: number = 600_000, signal?: 
       resolve(j ?? { jobId, tasks: [], total: 0, completed: 0, results: [], status: "error", createdAt: 0, finishedAt: Date.now() });
       return;
     }
-    const onAbort = () => {
+
+    const cleanup = () => {
       clearTimeout(timer);
-      globalBus.off(Events.JOB_COMPLETE, onComplete);
-      globalBus.off(Events.JOB_ERROR, onError);
+      signal?.removeEventListener("abort", onAbort);
+      globalBus.off(Events.JOB_COMPLETE, onTerminal);
+      globalBus.off(Events.JOB_ERROR, onTerminal);
+      globalBus.off(Events.JOB_TERMINAL, onTerminal);
+    };
+
+    const onAbort = () => {
+      cleanup();
       const j = state.jobs.get(jobId);
       resolve(j ?? { jobId, tasks: [], total: 0, completed: 0, results: [], status: "error", createdAt: 0, finishedAt: Date.now() });
     };
     signal?.addEventListener("abort", onAbort, { once: true });
 
     const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      globalBus.off(Events.JOB_COMPLETE, onComplete);
-      globalBus.off(Events.JOB_ERROR, onError);
+      cleanup();
       const j = state.jobs.get(jobId);
       resolve(
         j ?? {
@@ -1567,28 +1634,17 @@ export function waitForJob(jobId: string, timeoutMs: number = 600_000, signal?: 
       );
     }, timeoutMs);
 
-    const onComplete = (data: { jobId: string }) => {
+    const onTerminal = (data: { jobId: string }) => {
       if (data.jobId !== jobId) return;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      globalBus.off(Events.JOB_COMPLETE, onComplete);
-      globalBus.off(Events.JOB_ERROR, onError);
-      resolve(state.jobs.get(jobId)!);
-    };
-
-    const onError = (data: { jobId: string }) => {
-      if (data.jobId !== jobId) return;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      globalBus.off(Events.JOB_COMPLETE, onComplete);
-      globalBus.off(Events.JOB_ERROR, onError);
+      cleanup();
       resolve(state.jobs.get(jobId)!);
     };
 
     // 不能用 once：并发多个 Job 时，其他 Job 的完成事件会先触发并移除监听器，
     // 导致当前 waitForJob 永远等不到目标 Job。
-    globalBus.on(Events.JOB_COMPLETE, onComplete);
-    globalBus.on(Events.JOB_ERROR, onError);
+    globalBus.on(Events.JOB_COMPLETE, onTerminal);
+    globalBus.on(Events.JOB_ERROR, onTerminal);
+    globalBus.on(Events.JOB_TERMINAL, onTerminal);
   });
 }
 

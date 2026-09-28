@@ -10,6 +10,7 @@ import {
   listAgentTaskPanels,
   getAgentTaskOutputInfo,
   waitForJob,
+  claimDelivery,
   type AgentJob,
   type AgentTaskPanel,
 } from "../../lib/agent-bus.js";
@@ -176,7 +177,12 @@ export function registerCheckResults(pi: ExtensionAPI): void {
         const elapsed = job.finishedAt
           ? ((job.finishedAt - job.createdAt) / 1000).toFixed(1)
           : "?";
-        const wasAutoInjected = job._autoInjected === true;
+        const wasAutoInjected = job._autoInjected === true || job.delivery?.state === "delivered";
+        claimDelivery(job, "poll");
+        if (job.delivery) {
+          job.delivery.state = "delivered";
+          job.delivery.deliveredAt = Date.now();
+        }
         job._autoInjected = true;
         return formatJobResult(job, elapsed, wasAutoInjected);
       }
@@ -221,11 +227,16 @@ export function registerCheckResults(pi: ExtensionAPI): void {
       ctx.ui.notify(`⏳ 等待 Job ${params.jobId.slice(0, 8)} 完成...`, "info");
 
       // 先行加锁锁定，避免任务完成时 onJobComplete 竞态排队触发重复的 followUp 消息
+      claimDelivery(job, "poll");
       job._autoInjected = true;
       job._autoInjectRequested = false;
 
       const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
       ctx.ui.setStatus("sub-agent", undefined);
+      if (completedJob.delivery) {
+        completedJob.delivery.state = "delivered";
+        completedJob.delivery.deliveredAt = Date.now();
+      }
       completedJob._autoInjected = true;
       const elapsed = completedJob.finishedAt
         ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)

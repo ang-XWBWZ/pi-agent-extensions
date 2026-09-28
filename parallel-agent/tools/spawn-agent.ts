@@ -10,6 +10,7 @@ import {
   createJob,
   onJobComplete,
   loadAgentState,
+  claimDelivery,
   type SubTask,
   type AgentJob,
 } from "../../lib/agent-bus.js";
@@ -190,9 +191,12 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
           task.parentExecutionContext ?? inheritableExecutionContext,
       }));
 
-      const job = createJob(inheritedTasks);
+      const job = createJob(inheritedTasks, (ctx as any).session?.id);
       job.status = "running";
       job._autoInjectRequested = autoInject;
+      if (job.delivery) {
+        job.delivery.requested = autoInject;
+      }
 
       try {
         pi.appendEntry("agent-job", {
@@ -220,7 +224,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
       if (autoInject) {
         onJobComplete(job.jobId, async (completedJob) => {
           if (completedJob._autoInjected || completedJob._autoInjecting) return;
-          completedJob._autoInjecting = true;
+          if (!claimDelivery(completedJob, "auto")) return;
           try {
             if (completedJob._autoInjected) return;
             const elapsed = completedJob.finishedAt
@@ -238,7 +242,17 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
               },
               { deliverAs: "followUp", triggerTurn: true },
             );
+            if (completedJob.delivery) {
+              completedJob.delivery.state = "delivered";
+              completedJob.delivery.deliveredAt = Date.now();
+            }
             completedJob._autoInjected = true;
+          } catch (error: any) {
+            if (completedJob.delivery) {
+              completedJob.delivery.state = "delivery_failed";
+              completedJob.delivery.lastError = error?.message ?? String(error);
+            }
+            throw error;
           } finally {
             completedJob._autoInjecting = false;
           }

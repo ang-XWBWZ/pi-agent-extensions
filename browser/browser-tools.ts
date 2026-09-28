@@ -14,6 +14,7 @@ import { isToolResultError, renderStructuredToolCall, renderToolResult } from ".
 import { connectActiveChrome, getActivePage, listActiveChromeTabs } from "./cdp-client.js";
 import { headlessPool } from "./headless-pool.js";
 import { purifyHtmlToMarkdown } from "./page-purifier.js";
+import { assertPublicHttpUrl, isForbiddenBrowserScheme } from "./url-policy.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -112,6 +113,17 @@ export function registerBrowserTools(pi: ExtensionAPI) {
             details: { error: "missing_url" },
           };
         }
+
+        let safeUrl: URL;
+        try {
+          safeUrl = await assertPublicHttpUrl(params.url);
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `网络安全拦截: ${err instanceof Error ? err.message : String(err)}` }],
+            details: { error: "blocked_url", message: err instanceof Error ? err.message : String(err) },
+          };
+        }
+
         const { browser, error } = await headlessPool.getBrowser();
         if (!browser) {
           return {
@@ -121,7 +133,33 @@ export function registerBrowserTools(pi: ExtensionAPI) {
         }
         const page = await browser.newPage();
         try {
-          await page.goto(params.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+          await page.setRequestInterception(true);
+          page.on("request", (req) => {
+            try {
+              const reqUrl = new URL(req.url());
+              if (reqUrl.protocol !== "http:" && reqUrl.protocol !== "https:") {
+                req.abort();
+                return;
+              }
+              const host = reqUrl.hostname.toLowerCase();
+              if (
+                host === "localhost" ||
+                host.endsWith(".localhost") ||
+                host === "127.0.0.1" ||
+                host === "0.0.0.0" ||
+                host === "::1" ||
+                host === "169.254.169.254"
+              ) {
+                req.abort();
+                return;
+              }
+              req.continue();
+            } catch {
+              req.abort();
+            }
+          });
+
+          await page.goto(safeUrl.href, { waitUntil: "domcontentloaded", timeout: 30_000 });
           if (signal?.aborted) throw new Error("操作已被用户中止");
           const html = await page.content();
           const title = await page.title();
@@ -201,11 +239,17 @@ export function registerBrowserTools(pi: ExtensionAPI) {
       scrollDelta: Type.Optional(Type.Number({ description: "Vertical scroll distance in pixels (default 500)" })),
     }),
     renderCall(args, theme, context) {
-      const isSensitive = /password|token|secret|key|auth|credential/i.test(args.selector || "");
       return renderStructuredToolCall(theme, context, "chrome_act", [
         { name: "action", value: args.action, tone: "accent" },
         { name: "selector", value: args.selector, maxLength: 40 },
-        { name: "text", value: isSensitive ? "******" : (args.text ? `"${args.text}"` : undefined) },
+        {
+          name: "text",
+          value:
+            args.action === "type" && args.text !== undefined
+              ? `[redacted: ${String(args.text).length} chars]`
+              : undefined,
+          sensitive: true,
+        },
         { name: "url", value: args.url, maxLength: 50 },
       ]);
     },
@@ -237,6 +281,12 @@ export function registerBrowserTools(pi: ExtensionAPI) {
           case "navigate": {
             if (!params.url) {
               return { content: [{ type: "text", text: "错误: navigate 需要提供 url" }], details: { error: "missing_url" } };
+            }
+            if (isForbiddenBrowserScheme(params.url)) {
+              return {
+                content: [{ type: "text", text: `安全阻断: 禁止前台桌面 Chrome 导航至特权内部或危险协议 (${params.url})` }],
+                details: { error: "forbidden_scheme", url: params.url },
+              };
             }
             await page.goto(params.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
             return {

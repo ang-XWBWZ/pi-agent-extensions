@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { writePrivateFile } from "../../lib/secure-fs.js";
 
 export type McpServerPolicy = "strict" | "pwiki";
 
@@ -178,8 +179,7 @@ export function writeMcpConfig(config: McpConfigFile, path = defaultMcpConfigPat
   for (const [name, server] of Object.entries(config.mcpServers)) {
     checked.mcpServers[assertServerName(name)] = normalizeServerConfig(server, `mcpServers.${name}`);
   }
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(checked, null, 2)}\n`, "utf-8");
+  writePrivateFile(path, `${JSON.stringify(checked, null, 2)}\n`);
 }
 
 export function summarizeServer(name: string, server: McpServerConfig): McpServerSummary {

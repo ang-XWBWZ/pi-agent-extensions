@@ -4,6 +4,28 @@ const SECRET_ASSIGNMENT =
   /((?:api[_-]?key|token|password|secret|authorization|credential)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|(?:bearer\s+)?[^\s;&]+)/gi;
 const BEARER_TOKEN = /\bbearer\s+[a-z0-9._~+/=-]+/gi;
 
+export function sanitizeToolInput(toolName: string, raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return raw;
+  }
+
+  const input = raw as Record<string, unknown>;
+
+  if (
+    toolName === "chrome_act" &&
+    input.action === "type" &&
+    typeof input.text === "string"
+  ) {
+    return {
+      ...input,
+      text: "[redacted]",
+      textLength: input.text.length,
+    };
+  }
+
+  return input;
+}
+
 export function redactAuditText(value: string): string {
   return value
     .replace(SECRET_ASSIGNMENT, "$1[redacted]")

@@ -6,10 +6,12 @@ import {
   isUnder,
   resolvePath,
 } from "./path-guard.js";
+import { sanitizeToolInput } from "../lib/audit-sanitize.js";
 
 export type DecisionAction = "allow" | "ask" | "deny";
 export type ToolEffect =
   | "read"
+  | "private_read"
   | "progress"
   | "workspace_write"
   | "persistent"
@@ -183,7 +185,7 @@ function hasUnverifiableCommandPath(command: string): boolean {
 }
 
 function isToolEffect(value: unknown): value is ToolEffect {
-  return value === "read" || value === "progress" || value === "workspace_write"
+  return value === "read" || value === "private_read" || value === "progress" || value === "workspace_write"
     || value === "persistent" || value === "destructive" || value === "unknown";
 }
 
@@ -337,6 +339,7 @@ function mcpMethodForTool(toolName: string, input: Record<string, unknown>): str
 }
 
 function mcpReviewInput(toolName: string, input: Record<string, unknown>): unknown {
+  const sanitized = sanitizeToolInput(toolName, input);
   const mcp = parseMcpCallInfo(toolName, input);
   if (mcp) {
     return {
@@ -345,7 +348,7 @@ function mcpReviewInput(toolName: string, input: Record<string, unknown>): unkno
       arguments: mcp.arguments,
     };
   }
-  return Object.keys(input).length > 0 ? input : undefined;
+  return sanitized && typeof sanitized === "object" && Object.keys(sanitized).length > 0 ? sanitized : undefined;
 }
 
 function isMcpAliasTool(toolName: string): boolean {
@@ -483,8 +486,11 @@ export function classifyCustomToolEffect(
     if (action === "save") return "persistent";
     return "progress";
   }
-  if (toolName === "browser_read" || toolName === "chrome_tabs" || toolName === "chrome_screenshot") {
-    return "read";
+  if (toolName === "browser_read") {
+    return input.mode === "active" ? "private_read" : "read";
+  }
+  if (toolName === "chrome_tabs" || toolName === "chrome_screenshot") {
+    return "private_read";
   }
   if (toolName === "chrome_act") {
     if (action === "wait" || action === "scroll") return "progress";
@@ -943,6 +949,18 @@ function decideToolCallBase(
   }
 
   if (profile.intent === "plan") {
+    if (effect === "private_read") {
+      return ask(
+        effect,
+        "action",
+        "Access private desktop browser session",
+        target,
+        "action",
+        undefined,
+        true,
+        purpose,
+      );
+    }
     if (
       event.toolName === "manage_requirements" &&
       input.action === "clear" &&
@@ -1009,6 +1027,19 @@ function decideToolCallBase(
   // cannot promote a phase or turn unknown/destructive actions into safe ones.
   if (effect === "persistent" && isAlwaysAllowedMcpCall(input, event.toolName)) {
     return allow(effect, target);
+  }
+
+  if (effect === "private_read") {
+    return ask(
+      effect,
+      "action",
+      "Access private desktop browser session",
+      target,
+      "action",
+      undefined,
+      true,
+      purpose,
+    );
   }
 
   if (effect === "progress" || effect === "workspace_write") {

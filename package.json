@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-extensions",
-  "version": "1.0.0",
+  "version": "7.1.1",
   "description": "Comprehensive engineering extensions suite for Pi Coding Agent",
   "type": "module",
   "keywords": [
@@ -14,9 +14,6 @@
     "extensions": [
       "./*.ts",
       "./mcp/index.ts"
-    ],
-    "skills": [
-      "./skills"
     ]
   },
   "peerDependencies": {

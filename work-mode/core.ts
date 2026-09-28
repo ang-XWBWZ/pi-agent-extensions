@@ -26,6 +26,7 @@ import {
   formatImmutableCapabilityIndex,
   formatFullCapabilityCatalog,
   syncActiveToolsForPhase,
+  resetActivatedCapabilities,
 } from "../lib/capability-router.js";
 import { registerCapabilityTool } from "../lib/capability-tool.js";
 
@@ -73,6 +74,7 @@ export function setupCore(
     pi.on("session_shutdown", () => {
       unregBus?.();
       unregInput?.();
+      resetActivatedCapabilities();
     });
   }
 
@@ -122,6 +124,7 @@ export function setupCore(
   }
 
   pi.on("session_start", (_event, ctx) => {
+    resetActivatedCapabilities();
     const inheritedContext = getExecutionContext();
     const restoredAutonomy = autonomyForSessionStart(
       s.isSubAgent,

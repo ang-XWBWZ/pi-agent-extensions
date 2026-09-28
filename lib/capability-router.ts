@@ -67,7 +67,7 @@ export const BASELINE_CORE_TOOLS = [
   "load_capability",
 ];
 
-export const CHAT_CORE_TOOLS = ["read"];
+export const CHAT_CORE_TOOLS = ["read", "load_capability"];
 
 export const PLAN_CORE_TOOLS = [
   "read",
@@ -75,7 +75,47 @@ export const PLAN_CORE_TOOLS = [
   "cmd",
   "powershell",
   "manage_requirements",
+  "load_capability",
 ];
+
+export interface RegistryCatalog {
+  manifests: Map<string, CapabilityManifest>;
+  toolToCapability: Map<string, string>;
+}
+
+export interface CapabilityActivationState {
+  activated: Set<string>;
+  activating: Map<string, Promise<void>>;
+}
+
+const CATALOG_KEY = "__pi_capability_catalog";
+const ACTIVATION_KEY = "__pi_capability_activation_state";
+
+export function createCapabilityActivationState(): CapabilityActivationState {
+  return {
+    activated: new Set<string>(),
+    activating: new Map<string, Promise<void>>(),
+  };
+}
+
+function getRegistryCatalog(): RegistryCatalog {
+  const globals = globalThis as Record<string, unknown>;
+  if (!globals[CATALOG_KEY]) {
+    globals[CATALOG_KEY] = {
+      manifests: new Map<string, CapabilityManifest>(),
+      toolToCapability: new Map<string, string>(),
+    };
+  }
+  return globals[CATALOG_KEY] as RegistryCatalog;
+}
+
+export function getDefaultActivationState(): CapabilityActivationState {
+  const globals = globalThis as Record<string, unknown>;
+  if (!globals[ACTIVATION_KEY]) {
+    globals[ACTIVATION_KEY] = createCapabilityActivationState();
+  }
+  return globals[ACTIVATION_KEY] as CapabilityActivationState;
+}
 
 interface RegistryState {
   manifests: Map<string, CapabilityManifest>;
@@ -83,54 +123,76 @@ interface RegistryState {
   activated: Set<string>;
 }
 
-const REGISTRY_KEY = "__pi_capability_registry";
-
+/** 兼容旧代码访问 */
 function getRegistryState(): RegistryState {
-  const globals = globalThis as Record<string, unknown>;
-  if (!globals[REGISTRY_KEY]) {
-    globals[REGISTRY_KEY] = {
-      manifests: new Map<string, CapabilityManifest>(),
-      toolToCapability: new Map<string, string>(),
-      activated: new Set<string>(),
-    };
-  }
-  return globals[REGISTRY_KEY] as RegistryState;
+  const catalog = getRegistryCatalog();
+  const activation = getDefaultActivationState();
+  return {
+    manifests: catalog.manifests,
+    toolToCapability: catalog.toolToCapability,
+    activated: activation.activated,
+  };
 }
 
 /** 注册插件能力清单 */
 export function registerCapability(manifest: CapabilityManifest): void {
-  const state = getRegistryState();
-  state.manifests.set(manifest.id, manifest);
+  const catalog = getRegistryCatalog();
+  const previous = catalog.manifests.get(manifest.id);
+
+  // 清除旧 manifest 关联工具的反向映射，避免 hot reload 留下脏映射
+  if (previous) {
+    for (const tool of previous.tools) {
+      if (catalog.toolToCapability.get(tool) === manifest.id) {
+        catalog.toolToCapability.delete(tool);
+      }
+    }
+  }
+
+  catalog.manifests.set(
+    manifest.id,
+    Object.freeze({
+      ...manifest,
+      tools: Object.freeze([...manifest.tools]),
+      keywords: Object.freeze([...manifest.keywords]),
+    }) as CapabilityManifest,
+  );
+
   for (const tool of manifest.tools) {
-    state.toolToCapability.set(tool, manifest.id);
+    catalog.toolToCapability.set(tool, manifest.id);
   }
 }
 
 /** 获取所有已注册的能力清单 */
 export function getRegisteredCapabilities(): CapabilityManifest[] {
-  return Array.from(getRegistryState().manifests.values());
+  return Array.from(getRegistryCatalog().manifests.values());
 }
 
 /** 获取单个能力清单 */
 export function getCapability(id: string): CapabilityManifest | undefined {
-  return getRegistryState().manifests.get(id);
+  return getRegistryCatalog().manifests.get(id);
 }
 
 /** 通过工具名反查所属能力清单 */
 export function findCapabilityByTool(toolName: string): CapabilityManifest | undefined {
-  const state = getRegistryState();
-  const capId = state.toolToCapability.get(toolName);
-  return capId ? state.manifests.get(capId) : undefined;
+  const catalog = getRegistryCatalog();
+  const capId = catalog.toolToCapability.get(toolName);
+  return capId ? catalog.manifests.get(capId) : undefined;
 }
 
 /** 检查某能力是否已被激活 */
-export function isCapabilityActive(id: string): boolean {
-  return getRegistryState().activated.has(id);
+export function isCapabilityActive(
+  id: string,
+  activation: CapabilityActivationState = getDefaultActivationState(),
+): boolean {
+  return activation.activated.has(id);
 }
 
-/** 重置激活状态（主要用于会话重置或测试） */
-export function resetActivatedCapabilities(): void {
-  getRegistryState().activated.clear();
+/** 重置激活状态（支持传入特定 session 状态或重置全局默认状态） */
+export function resetActivatedCapabilities(
+  activation: CapabilityActivationState = getDefaultActivationState(),
+): void {
+  activation.activated.clear();
+  activation.activating.clear();
 }
 
 /**
@@ -212,38 +274,54 @@ export async function activateCapability(
   id: string,
   pi: ExtensionAPI,
   ctx: ExtensionContext,
+  currentPhase: ConversationPhase = "work",
+  activation: CapabilityActivationState = getDefaultActivationState(),
 ): Promise<ActivationResult> {
-  const state = getRegistryState();
-  const manifest = state.manifests.get(id);
+  const catalog = getRegistryCatalog();
+  const manifest = catalog.manifests.get(id);
   if (!manifest) {
-    const available = Array.from(state.manifests.keys()).join(", ");
+    const available = Array.from(catalog.manifests.keys()).join(", ");
     return {
       success: false,
       message: `未找到指定能力标识符: "${id}"。当前可用能力: [${available}]。\n\n${formatFullCapabilityCatalog()}`,
     };
   }
 
-  // 触发插件自定义激活生命周期
-  if (manifest.onActivate && !state.activated.has(id)) {
+  const allowedPhases = manifest.phases ?? ["work"];
+  if (!allowedPhases.includes(currentPhase)) {
+    return {
+      success: false,
+      message: `能力 [${manifest.name}] 在当前阶段 (${currentPhase.toUpperCase()}) 不可用。允许阶段: [${allowedPhases.join(", ")}]`,
+    };
+  }
+
+  // 并发 Single-Flight 机制：避免同一 turn 或并行调用中重复触发 onActivate
+  if (manifest.onActivate && !activation.activated.has(id)) {
+    let inFlight = activation.activating.get(id);
+    if (!inFlight) {
+      inFlight = Promise.resolve(manifest.onActivate(ctx)).then(() => undefined);
+      activation.activating.set(id, inFlight);
+    }
+
     try {
-      await manifest.onActivate(ctx);
+      await inFlight;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
         success: false,
         message: `激活能力 [${manifest.name}] 时发生初始化异常: ${msg}`,
       };
+    } finally {
+      if (activation.activating.get(id) === inFlight) {
+        activation.activating.delete(id);
+      }
     }
   }
 
-  // 纯追加式扩展活跃工具（Purely Additive）
-  const currentTools = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
-  const nextTools = Array.from(new Set([...currentTools, ...manifest.tools]));
-  if (typeof pi.setActiveTools === "function") {
-    pi.setActiveTools(nextTools);
-  }
+  activation.activated.add(id);
 
-  state.activated.add(id);
+  // 阶段感知投影：按当前 phase 重新计算并挂载活跃工具集合
+  syncActiveToolsForPhase(currentPhase, pi, activation);
 
   return {
     success: true,
@@ -254,35 +332,44 @@ export async function activateCapability(
 }
 
 /**
- * 阶段流转时的活跃工具白名单同步
+ * 纯函数计算指定 phase 与激活状态下的活跃工具集
  */
-export function syncActiveToolsForPhase(phase: ConversationPhase, pi: ExtensionAPI): void {
-  if (typeof pi.setActiveTools !== "function") return;
+export function computeActiveTools(
+  phase: ConversationPhase,
+  activation: CapabilityActivationState = getDefaultActivationState(),
+): string[] {
+  const coreList =
+    phase === "chat"
+      ? CHAT_CORE_TOOLS
+      : phase === "plan"
+        ? PLAN_CORE_TOOLS
+        : BASELINE_CORE_TOOLS;
 
-  const state = getRegistryState();
+  const activeTools = new Set<string>(coreList);
+  const catalog = getRegistryCatalog();
 
-  if (phase === "chat") {
-    pi.setActiveTools(CHAT_CORE_TOOLS);
-    return;
-  }
-
-  if (phase === "plan") {
-    pi.setActiveTools(PLAN_CORE_TOOLS);
-    return;
-  }
-
-  // WORK 模式：基础核心工具 + 所有处于激活状态且允许在 WORK 模式使用的工具
-  const activeTools = new Set<string>(BASELINE_CORE_TOOLS);
-  for (const capId of state.activated) {
-    const manifest = state.manifests.get(capId);
+  for (const capId of activation.activated) {
+    const manifest = catalog.manifests.get(capId);
     if (!manifest) continue;
     const allowedPhases = manifest.phases ?? ["work"];
-    if (allowedPhases.includes("work")) {
+    if (allowedPhases.includes(phase)) {
       for (const t of manifest.tools) {
         activeTools.add(t);
       }
     }
   }
 
-  pi.setActiveTools(Array.from(activeTools));
+  return Array.from(activeTools);
+}
+
+/**
+ * 阶段流转时的活跃工具白名单同步
+ */
+export function syncActiveToolsForPhase(
+  phase: ConversationPhase,
+  pi: ExtensionAPI,
+  activation: CapabilityActivationState = getDefaultActivationState(),
+): void {
+  if (typeof pi.setActiveTools !== "function") return;
+  pi.setActiveTools(computeActiveTools(phase, activation));
 }
