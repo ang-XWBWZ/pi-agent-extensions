@@ -3,8 +3,58 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getKeybindings } from "@earendil-works/pi-tui";
 import { requestConfirm, requestInput } from "../lib/confirm-bus.js";
 import { wildcardMatch, guessPathPattern, guessCmdPattern } from "./path-guard.js";
+import { updateAutoStatusBar } from "./auto-status.js";
+
+/**
+ * 判断终端输入事件是否属于上下选择导航按键（包括方向键、vim键、翻页键及鼠标滚轮）
+ */
+export function isNavigationKey(data: string): boolean {
+  if (!data) return false;
+  try {
+    const kb = getKeybindings();
+    if (
+      kb.matches(data, "tui.select.up") ||
+      kb.matches(data, "tui.select.down") ||
+      kb.matches(data, "tui.select.pageUp") ||
+      kb.matches(data, "tui.select.pageDown")
+    ) {
+      return true;
+    }
+  } catch {
+    // 忽略异常，降级到标准按键检测
+  }
+
+  // 终端上下方向键（ANSI / SS3）与 vim 导航键
+  if (
+    data === "\x1b[A" ||
+    data === "\x1bOA" ||
+    data === "\x1b[B" ||
+    data === "\x1bOB" ||
+    data === "k" ||
+    data === "j" ||
+    data === "K" ||
+    data === "J" ||
+    data === "\x1b[5~" ||
+    data === "\x1b[6~"
+  ) {
+    return true;
+  }
+
+  // 鼠标滚轮向上/向下滚动
+  if (
+    data.startsWith("\x1b[<64;") ||
+    data.startsWith("\x1b[<65;") ||
+    data.startsWith("\x1b[M`") ||
+    data.startsWith("\x1b[Ma")
+  ) {
+    return true;
+  }
+
+  return false;
+}
 
 export interface RejectionDecision {
   rejected: true;
@@ -132,6 +182,7 @@ export async function showAutoFlashFallbackConfirm(
   },
   isSubAgent: boolean,
   timeoutMs = 10_000,
+  resetTimeoutMs = 60_000,
 ): Promise<AutoFlashFallbackResult> {
   const shortTarget = request.command.length > 120
     ? request.command.slice(0, 117) + "..."
@@ -139,36 +190,65 @@ export async function showAutoFlashFallbackConfirm(
   const toolName = request.toolName ?? "工具/命令";
   const purposeText = shortPurpose(request.purpose);
   const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+  const resetSeconds = Math.max(1, Math.round(resetTimeoutMs / 1000));
 
   const title = [
     `⚠️ AI 自动审批已拦截 [${toolName}]${review.modelRef ? ` (${review.modelRef})` : ""}`,
     `目标: ${shortTarget}`,
     `AI 拒绝原因: ${review.reason}`,
     ...(purposeText ? [`用途: ${purposeText}`] : []),
-    `⏳ 倒计时 ${seconds}s: 超时未响应将自动拒绝并继续执行任务`,
+    `⏳ 倒计时 ${seconds}s: 超时未响应将自动拒绝（上下选择可重置为 ${resetSeconds}s）`,
   ].join("\n");
 
   const options = ["仅允许本次 (推翻AI拦截)", "确认拒绝 (立即终止本次调用)"];
 
   let choice: string | undefined;
+  let hasNavigated = false;
+
   if (isSubAgent) {
     // 子 Agent 审批进入前端队列排队，排队等待时间不消耗用户决策倒计时，给予充足的排队与决策窗口
-    choice = await requestConfirm("bash", title, request.command, options, Math.max(timeoutMs, 60_000));
+    choice = await requestConfirm("bash", title, request.command, options, Math.max(timeoutMs, resetTimeoutMs));
   } else {
-    // 主 Agent 本地直接弹窗，启动超时倒计时
+    // 主 Agent 本地直接弹窗，启动超时倒计时与上下导航监听
     const timeoutController = new AbortController();
     let timer: NodeJS.Timeout | undefined;
+    let resolveTimeout: ((val: "__timeout__") => void) | undefined;
+
     const timeoutPromise = new Promise<"__timeout__">((resolve) => {
+      resolveTimeout = resolve;
       timer = setTimeout(() => {
         timeoutController.abort();
         resolve("__timeout__");
       }, timeoutMs);
     });
 
+    const resetTimer = () => {
+      hasNavigated = true;
+      try {
+        updateAutoStatusBar(ctx, `已拦截: ${toolName} | 倒计时已重置为${resetSeconds}s`);
+      } catch {
+        // ignore
+      }
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timeoutController.abort();
+        resolveTimeout?.("__timeout__");
+      }, resetTimeoutMs);
+    };
+
+    let unsubInput: (() => void) | undefined;
+    if (typeof ctx.ui?.onTerminalInput === "function") {
+      unsubInput = ctx.ui.onTerminalInput((data: string) => {
+        if (isNavigationKey(data)) {
+          resetTimer();
+        }
+        return undefined;
+      });
+    }
+
     const promptPromise = (async () => {
       try {
         return await ctx.ui.select(title, options, {
-          timeout: timeoutMs,
           signal: timeoutController.signal,
         });
       } catch {
@@ -176,9 +256,18 @@ export async function showAutoFlashFallbackConfirm(
       }
     })();
 
-    const result = await Promise.race([promptPromise, timeoutPromise]);
-    if (timer) clearTimeout(timer);
-    choice = result;
+    try {
+      choice = await Promise.race([promptPromise, timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (typeof unsubInput === "function") {
+        try {
+          unsubInput();
+        } catch {
+          // ignore
+        }
+      }
+    }
   }
 
   if (choice === "仅允许本次 (推翻AI拦截)") {
@@ -187,10 +276,11 @@ export async function showAutoFlashFallbackConfirm(
   }
 
   if (choice === "__timeout__" || choice === undefined) {
-    ctx.ui.notify(`人工审核已超时（${seconds}s），按 AI 审查意见自动拦截`, "warning");
+    const finalSeconds = hasNavigated ? resetSeconds : seconds;
+    ctx.ui.notify(`人工审核已超时（${finalSeconds}s），按 AI 审查意见自动拦截`, "warning");
     return {
       action: "deny",
-      reason: `AUTO_FLASH 拒绝：${review.reason}（人工审核超时${seconds}s自动拒绝）`,
+      reason: `AUTO_FLASH 拒绝：${review.reason}（人工审核超时${finalSeconds}s自动拒绝）`,
       timeout: true,
     };
   }
