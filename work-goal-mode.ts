@@ -23,7 +23,6 @@ import {
   getActiveWorkGoal,
   getWorkGoal,
 } from "./lib/work-goal-store.js";
-import { resetAutoSteps } from "./work-mode/auto-status.js";
 import type { ExecutionContext, WorkGoalLog, WorkGoalState } from "./lib/workflow-types.js";
 
 const DEDICATED_COMMAND_TOOLS = new Set(["cmd", "powershell"]);
@@ -281,7 +280,6 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         },
       });
       ctx?.ui?.setStatus?.("work-goal", `GOAL: ${goal.title}`);
-      resetAutoSteps();
       return {
         content: [
           {
@@ -423,7 +421,6 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         active: false,
       });
       ctx?.ui?.setStatus?.("work-goal", "");
-      resetAutoSteps();
       return {
         content: [
           {
@@ -473,7 +470,6 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         active: false,
       });
       ctx?.ui?.setStatus?.("work-goal", "");
-      resetAutoSteps();
       return {
         content: [{ type: "text", text: `Work goal aborted: ${goal.title}\n${reason}` }],
         details: { goal: aborted },

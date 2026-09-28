@@ -1,0 +1,13 @@
+{
+  "name": "pi-browser-automation",
+  "version": "1.0.0",
+  "description": "Desktop Chrome CDP bridge and headless browser capability for PiAgent",
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "^22.15.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

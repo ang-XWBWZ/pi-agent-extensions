@@ -94,6 +94,7 @@ const AUTO_CONFIRM_TOOLS = new Set([
   "long_attention_config_ps",
   "mcp_manage",
   "mcp_call",
+  "chrome_act",
 ]);
 
 export function inputOf(event: { input?: unknown }): Record<string, unknown> {
@@ -481,6 +482,13 @@ export function classifyCustomToolEffect(
     }
     if (action === "save") return "persistent";
     return "progress";
+  }
+  if (toolName === "browser_read" || toolName === "chrome_tabs" || toolName === "chrome_screenshot") {
+    return "read";
+  }
+  if (toolName === "chrome_act") {
+    if (action === "wait" || action === "scroll") return "progress";
+    return "persistent";
   }
   return "unknown";
 }
