@@ -24,7 +24,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
     name: "browser_read",
     label: "Browser Read",
     description:
-      "Read webpage content converted to clean markdown. Defaults to silent background headless mode; set mode='active' to read from currently active desktop Chrome tab.",
+      "Read webpage content converted to clean markdown. Defaults to silent background headless mode (fetches url); set mode='active' to read from currently active desktop Chrome tab without navigation.",
     parameters: Type.Object({
       url: Type.Optional(Type.String({ description: "Target URL to read (required for headless mode)" })),
       tabId: Type.Optional(Type.String({ description: "Tab ID for active mode (defaults to current tab)" })),
@@ -67,7 +67,19 @@ export function registerBrowserTools(pi: ExtensionAPI) {
             };
           }
           if (params.url) {
-            await page.goto(params.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+            const currentUrl = page.url();
+            const normalize = (u: string) => u.replace(/#.*$/, "").replace(/\/$/, "");
+            if (normalize(currentUrl) !== normalize(params.url)) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `安全限制: browser_read 在 active 模式下是纯只读工具，禁止隐式跳转导航现有标签页（当前页面: ${currentUrl}）。\n- 如需抓取目标 URL，请使用默认的 headless 模式: browser_read({ url: "${params.url}" })\n- 如需在前台导航现有标签页，请调用受控审批工具: chrome_act({ action: "navigate", url: "${params.url}" })`,
+                  },
+                ],
+                details: { error: "navigation_forbidden_in_read_mode", currentUrl, requestedUrl: params.url },
+              };
+            }
           }
           if (signal?.aborted) throw new Error("操作已被用户中止");
           const html = await page.content();
@@ -189,10 +201,11 @@ export function registerBrowserTools(pi: ExtensionAPI) {
       scrollDelta: Type.Optional(Type.Number({ description: "Vertical scroll distance in pixels (default 500)" })),
     }),
     renderCall(args, theme, context) {
+      const isSensitive = /password|token|secret|key|auth|credential/i.test(args.selector || "");
       return renderStructuredToolCall(theme, context, "chrome_act", [
         { name: "action", value: args.action, tone: "accent" },
         { name: "selector", value: args.selector, maxLength: 40 },
-        { name: "text", value: args.text ? `"${args.text}"` : undefined },
+        { name: "text", value: isSensitive ? "******" : (args.text ? `"${args.text}"` : undefined) },
         { name: "url", value: args.url, maxLength: 50 },
       ]);
     },
@@ -250,9 +263,22 @@ export function registerBrowserTools(pi: ExtensionAPI) {
             }
             await page.waitForSelector(params.selector, { timeout: 10_000 });
             await page.type(params.selector, params.text);
+
+            const isSensitiveElement = await page.$eval(params.selector, (el) => {
+              if (el instanceof HTMLInputElement) {
+                const type = (el.type || "").toLowerCase();
+                const name = (el.name || el.id || el.getAttribute("autocomplete") || "").toLowerCase();
+                return type === "password" || name.includes("password") || name.includes("token") || name.includes("secret") || name.includes("apikey");
+              }
+              return false;
+            }).catch(() => false);
+
+            const isSensitive = isSensitiveElement || /password|token|secret|key|auth|credential/i.test(params.selector);
+            const displayText = isSensitive ? "****** (敏感内容已脱敏)" : params.text;
+
             return {
-              content: [{ type: "text", text: `已向元素 ${params.selector} 输入内容: ${params.text}` }],
-              details: { action: "type", selector: params.selector, text: params.text },
+              content: [{ type: "text", text: `已向元素 ${params.selector} 输入内容: ${displayText}` }],
+              details: { action: "type", selector: params.selector, text: isSensitive ? "******" : params.text },
             };
           }
 
@@ -330,7 +356,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
           };
         }
         const dir = join(tmpdir(), "pi-browser-screenshots");
-        mkdirSync(dir, { recursive: true });
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
         const filePath = join(dir, `screenshot-${Date.now()}.png`);
         await page.screenshot({ path: filePath, fullPage: false });
         const title = await page.title();

@@ -53,16 +53,22 @@ class HeadlessPool {
     }
 
     try {
+      const args = [
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+      ];
+
+      // 仅在 root 用户环境或显式配置环境变量时才启用 --no-sandbox，普通用户完整保留 Chrome 原生沙箱隔离
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      if (isRoot || process.env.CHROME_NO_SANDBOX === "1") {
+        args.unshift("--no-sandbox", "--disable-setuid-sandbox");
+      }
+
       this.browser = await puppeteer.launch({
         executablePath: execPath,
         headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-gpu",
-          "--disable-dev-shm-usage",
-          "--no-first-run",
-        ],
+        args,
       });
       return { browser: this.browser };
     } catch (err) {

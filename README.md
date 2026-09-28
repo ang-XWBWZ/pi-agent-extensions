@@ -6,7 +6,7 @@
 ![Pi Coding Agent](https://img.shields.io/badge/Pi%20Coding%20Agent-Pi%20Package-blueviolet)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Status](https://img.shields.io/badge/Dashboard-2--Line%20Minimal%20HUD-orange)
-![Tests](https://img.shields.io/badge/Tests-97%20Passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-100%20Passing-brightgreen)
 
 **给 Pi Coding Agent 装上工业级工程引擎、双轨浏览器中枢与极简 HUD 仪表盘。**  
 不改内核一行代码，通过官方 Pi Package 扩展规范与 PCS 渐进能力路由器，赋予其一键安装、子 Agent 并行调度、前台 Chrome CDP 真实接管、静默无头抓取、极简两行状态底栏、生成速率追踪、受控工作流、上下文深度监控、模型热切换与 MCP 接入等企业级能力。
