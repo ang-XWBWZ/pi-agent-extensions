@@ -35,7 +35,7 @@ Pi 原生仅提供 `read` / `write` / `edit` / `bash` 四个基础工具与简�
 | **工作流管控** | ❌ 无统一授权与阶段防线 | ✅ Chat / Plan / Work 阶段 + Guarded / Auto / Auto_All 授权 + 风险矩阵智能拦截 |
 | **AUTO 审批** | ❌ 盲目放行或频繁弹窗 | ✅ **轻量模型语义判定**，支持目录外安全只读，防误触 10s 倒计时支持上下键交互自适应延时 |
 | **防死循环** | ❌ 依赖人工手动打断 | ✅ **动态步数熔断保护**（无计划 100 步 / 有计划 200 步）+ `/auto_stop` 一键掐断 |
-| **MCP 生态** | ❌ 无内置 MCP Client | ✅ 通用 stdio MCP Bridge，自动按工具 Schema 注册，支持 Pwiki 等本地知识库 |
+| **MCP 生态** | ❌ 无内置 MCP Client | ✅ 通用 stdio MCP Bridge，自动按工具 Schema 注册，支持各类本地外部知识库与数据库 |
 | **模型热切换** | ❌ 需改配置重启 | ✅ `switch_model` 热切换，L0/L1/L2 三级阶梯 + 七级思考深度持久化微调 |
 | **Windows 适配**| ❌ `bash` 依赖环境，中文常乱码 | ✅ **`cmd` + `powershell` 双引擎**，Base64 原生 UTF-8 + 智能 GBK 跨编码搜索 |
 
@@ -181,8 +181,8 @@ Line 2: ↑67k ↓22k R50k W2.0k CH42.0% $0.085 3.2%/1.0M (auto) · 48.2 t/s    
 - **按需加载（JIT）**：当需要浏览器、MCP、子 Agent 等复杂工具时，AI 调用 `load_capability` 动态增量暴露工具并注入完整 Usage 文档，保障大模型推理准确性。
 
 ### 4. 通用 stdio MCP Bridge — `mcp/`
-- 原生工具映射：将外部 MCP Server（如 Pwiki 知识库、数据库）声明的工具自动无缝注册为 Pi 本地原生工具；
-- 安全分级与策略审查：支持按服务配置 strict/allow/pwiki 等安全准入规则。
+- 原生工具映射：将外部 MCP Server（如各类本地知识库、外部数据库服务）声明的工具自动无缝注册为 Pi 本地原生工具；
+- 安全分级与策略审查：支持按服务配置 strict / allow 等细粒度安全准入规则。
 
 ### 5. 模型热切换与阶梯体系 — `model-switch/`
 - **L0 / L1 / L2 阶梯管理**：快速（Flash/Haiku）、主力（Sonnet/GPT-4o）、高阶（DeepSeek R1/Opus）；
