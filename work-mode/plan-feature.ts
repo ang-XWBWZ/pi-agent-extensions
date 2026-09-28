@@ -106,7 +106,10 @@ export function setupPlanFeature(
   function clearPlanPanel(ctx: ExtensionContext) {
     clearPlanDismissTimer();
     clearState();
-    if (!s.isSubAgent) ctx.ui.setWidget("plan-panel", undefined);
+    if (!s.isSubAgent) {
+      ctx.ui.setWidget("plan-panel", undefined);
+      ctx.ui.notify("执行计划已清除", "info");
+    }
     persistPlan(false);
     resetAutoSteps();
   }
@@ -228,7 +231,6 @@ export function setupPlanFeature(
     description: "按用户指令放弃当前计划并保留审计快照",
     handler: async (_a, ctx) => {
       clearPlanPanel(ctx);
-      ctx.ui.notify("当前计划已由用户终止", "warning");
     },
   });
 
