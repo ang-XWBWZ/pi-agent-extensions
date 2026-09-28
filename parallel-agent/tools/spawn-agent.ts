@@ -222,6 +222,7 @@ export function registerSpawnAgent(pi: ExtensionAPI): void {
           if (completedJob._autoInjected || completedJob._autoInjecting) return;
           completedJob._autoInjecting = true;
           try {
+            if (completedJob._autoInjected) return;
             const elapsed = completedJob.finishedAt
               ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
               : "?";

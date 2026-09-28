@@ -176,10 +176,9 @@ export function registerCheckResults(pi: ExtensionAPI): void {
         const elapsed = job.finishedAt
           ? ((job.finishedAt - job.createdAt) / 1000).toFixed(1)
           : "?";
-        if (job._autoInjected) {
-          return formatJobResult(job, elapsed, true);
-        }
-        return formatJobResult(job, elapsed);
+        const wasAutoInjected = job._autoInjected === true;
+        job._autoInjected = true;
+        return formatJobResult(job, elapsed, wasAutoInjected);
       }
 
       if (!params.wait) {
@@ -224,6 +223,7 @@ export function registerCheckResults(pi: ExtensionAPI): void {
       const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
       ctx.ui.setStatus("sub-agent", undefined);
       const alreadyInjected = completedJob._autoInjected === true;
+      completedJob._autoInjected = true;
       const elapsed = completedJob.finishedAt
         ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
         : "?";

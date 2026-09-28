@@ -123,8 +123,18 @@ export default function (pi: ExtensionAPI) {
     }
     if (hasMsgs) {
       const batch = pendingMsgs.splice(0);
-      const lines = batch.map((m) => `[${m.from}] ${m.payload}`);
-      parts.push(`[agent-message]\n${lines.join("\n")}`);
+      const uniqueLines: string[] = [];
+      const seen = new Set<string>();
+      for (const m of batch) {
+        const key = `${m.from}:::${(m.payload ?? "").trim()}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniqueLines.push(`[${m.from}] ${m.payload}`);
+        }
+      }
+      if (uniqueLines.length > 0) {
+        parts.push(`[agent-message]\n${uniqueLines.join("\n")}`);
+      }
     }
     return {
       messages: [

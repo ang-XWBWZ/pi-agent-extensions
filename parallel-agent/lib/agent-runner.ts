@@ -321,6 +321,7 @@ export function runSingleAgent(
           "note 仅用于不属于阶段结论的短暂持久备注；summary 只是兼容旧字段，新调用优先使用 conclusion。",
           `最终回答前必须将状态设为 completed、进度设为 100，并写入不超过 ${FINAL_CONCLUSION_MAX_CHARS} 字的最终 conclusion。结论先写最终结果、完成项、验证证据和阻塞项；detail 按需补充。`,
           `最终回答的前 ${FINAL_ANSWER_LEAD_CHARS} 字也应包含同一结论；详细过程、命令输出和逐行证据放在后面。主 Agent 需要原文时会按需分页读取，不会主动加载完整存档。`,
+          "通信与汇报规范：任务完成后系统会自动汇总你的最终回答与面板结论并统一通知主 Agent；严禁调用 send_agent_message 向 main 发送重复的完成汇报。send_agent_message 仅限执行过程中的协作或紧急求助。",
         ].join("\n");
         const prompt = `${basePrompt}\n\n${taskPanelProtocol}`;
 
