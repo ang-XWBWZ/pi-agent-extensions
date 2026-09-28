@@ -29,6 +29,19 @@ export function renderPlanPanel(
 ): string[] {
   if (steps.length === 0) return [];
 
+  // 当全部步骤均已完成（done 或 skipped）且未主动展开时，原地折叠为极简完成状态行
+  const isAllComplete = steps.every((s) => s.status === "done" || s.status === "skipped");
+  if (isAllComplete && !expanded) {
+    const doneCount = steps.filter((s) => s.status === "done").length;
+    const skippedCount = steps.filter((s) => s.status === "skipped").length;
+    const detail = skippedCount > 0
+      ? `${doneCount} 完成, ${skippedCount} 跳过`
+      : `${doneCount}/${steps.length} 全部达成`;
+    const title = theme?.fg("success", theme?.bold ? theme.bold("✓ 执行计划已全部完成") : "✓ 执行计划已全部完成") ?? "✓ 执行计划已全部完成";
+    const sub = theme?.fg("muted", `(${detail})`) ?? `(${detail})`;
+    return [`${title} ${sub}`];
+  }
+
   const currentIdx = steps.findIndex(s => s.status === "current");
   const header = theme?.fg("accent", theme?.bold("执行计划")) ?? "执行计划";
   const lines: string[] = [header, ""];

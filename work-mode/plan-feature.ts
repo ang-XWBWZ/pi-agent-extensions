@@ -64,8 +64,18 @@ export function setupPlanFeature(
     });
   }
 
+  let planDismissTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearPlanDismissTimer() {
+    if (planDismissTimer) {
+      clearTimeout(planDismissTimer);
+      planDismissTimer = undefined;
+    }
+  }
+
   function updatePlanPanel(ctx: ExtensionContext) {
     if (s.isSubAgent) return;
+    clearPlanDismissTimer();
     if (s.planSteps.length === 0) {
       ctx.ui.setWidget("plan-panel", undefined);
       return;
@@ -75,6 +85,16 @@ export function setupPlanFeature(
         renderPlanPanel(s.planSteps, theme, getToolsExpandedState(pi)),
       invalidate: () => _tui.requestRender?.(),
     }));
+
+    // 若全部完成，启动自动清理定时器（10秒后释放顶部空间，不作为消息提交）
+    if (isPlanComplete(s.planSteps)) {
+      planDismissTimer = setTimeout(() => {
+        planDismissTimer = undefined;
+        if (isPlanComplete(s.planSteps)) {
+          ctx.ui.setWidget("plan-panel", undefined);
+        }
+      }, 10_000);
+    }
   }
 
   function clearState() {
@@ -84,6 +104,7 @@ export function setupPlanFeature(
   }
 
   function clearPlanPanel(ctx: ExtensionContext) {
+    clearPlanDismissTimer();
     clearState();
     if (!s.isSubAgent) ctx.ui.setWidget("plan-panel", undefined);
     persistPlan(false);
@@ -351,15 +372,23 @@ export function setupPlanFeature(
               details: result,
             };
           }
+          const justCompleted = isPlanComplete(s.planSteps);
           updatePlanPanel(ctx);
-          persistPlan(false);
+          persistPlan(justCompleted);
+          if (justCompleted) {
+            resetAutoSteps();
+            ctx.ui.notify(
+              `执行计划已全部完成（共 ${s.planSteps.length} 步）`,
+              "info",
+            );
+          }
           return {
             content: [
               {
                 type: "text",
                 text: result.next
                   ? `步骤 #${result.target.id} → ${result.status}（${result.target.evidence}）；下一步 #${result.next.id}: ${result.next.text}`
-                  : `步骤 #${result.target.id} → ${result.status}（${result.target.evidence}）；没有剩余待办`,
+                  : `步骤 #${result.target.id} → ${result.status}（${result.target.evidence}）；没有剩余待办，计划已全部完成`,
               },
             ],
             details: { action: "advance", ...result },
@@ -392,8 +421,16 @@ export function setupPlanFeature(
               details: result,
             };
           }
+          const justCompleted = isPlanComplete(s.planSteps);
           updatePlanPanel(ctx);
-          persistPlan(false);
+          persistPlan(justCompleted);
+          if (justCompleted) {
+            resetAutoSteps();
+            ctx.ui.notify(
+              `执行计划已全部完成（共 ${s.planSteps.length} 步）`,
+              "info",
+            );
+          }
           return {
             content: [
               {
@@ -560,6 +597,10 @@ export function setupPlanFeature(
           updatePlanPanel(ctx);
           persistPlan(true);
           resetAutoSteps();
+          ctx.ui.notify(
+            `执行计划已全部完成（共 ${s.planSteps.length} 步）`,
+            "info",
+          );
           return {
             content: [
               { type: "text", text: "计划已完成，最终状态保留用于审计" },
