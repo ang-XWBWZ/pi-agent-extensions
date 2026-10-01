@@ -7,6 +7,8 @@ import type { AgentJob, SubResult } from "../../lib/agent-bus.js";
 const CHECK_PREVIEW_CHARS = 1_200;
 const INJECT_OUTPUT_CHARS = 12_000;
 const CONCLUSION_PREVIEW_CHARS = 8_000;
+/** E07：整个 Job 自动注入的总预算，超限折叠为摘要 + 按需读取入口。 */
+const JOB_INJECT_BUDGET_CHARS = 40_000;
 
 export function jobElapsedSeconds(job: AgentJob): string {
   return job.finishedAt
@@ -49,7 +51,16 @@ function formatResultBody(
   }
 
   if (!result.ok) {
-    parts.push(`错误: ${result.error ?? "未知"}`);
+    const outcomeLabel = result.outcome ?? result.errorCode ?? "failed";
+    parts.push(`错误: ${result.error ?? "未知"}（${outcomeLabel}）`);
+    if (result.lastUsefulConclusion?.trim()) {
+      parts.push(
+        `最后有效结论:\n${truncateText(result.lastUsefulConclusion, CONCLUSION_PREVIEW_CHARS)}`,
+      );
+    }
+    if (result.terminalReason) {
+      parts.push(`终止原因: ${result.terminalReason}`);
+    }
     if (result.output?.trim()) {
       parts.push(
         `已保留的中间产出:\n${truncateText(result.output, maxChars)}`,
@@ -89,22 +100,48 @@ export function formatJobPreview(job: AgentJob, elapsed: string = jobElapsedSeco
 }
 
 export function formatJobFullResult(job: AgentJob, elapsed: string = jobElapsedSeconds(job)): string {
-  const body = [...job.results]
-    .sort((a, b) => a.order - b.order)
-    .map((r) => {
-      const icon = r.ok ? "✅" : "❌";
-      return [
-        `${icon} [${r.order}/${job.total}] ${r.name}`,
-        formatResultBody(job.jobId, r, INJECT_OUTPUT_CHARS),
-      ].join("\n");
-    });
+  const ordered = [...job.results].sort((a, b) => a.order - b.order);
+  const body = ordered.map((r) => {
+    const icon = r.ok ? "✅" : "❌";
+    return [
+      `${icon} [${r.order}/${job.total}] ${r.name}`,
+      formatResultBody(job.jobId, r, INJECT_OUTPUT_CHARS),
+    ].join("\n");
+  });
 
-  return [
+  const full = [
     `[sub-agent-results]`,
     formatJobStatusLine(job, elapsed),
     `Job ID: ${job.jobId}`,
     "",
     ...body,
+    "[/sub-agent-results]",
+  ].join("\n\n");
+
+  if (full.length <= JOB_INJECT_BUDGET_CHARS) return full;
+
+  // E07：超出 Job 总预算时只展示最终结论、任务状态和 read_agent_output 入口。
+  const condensed = ordered.map((r) => {
+    const icon = r.ok ? "✅" : "❌";
+    const conclusion =
+      r.summary?.trim() ||
+      r.lastUsefulConclusion?.trim() ||
+      r.error ||
+      "(无结论)";
+    return [
+      `${icon} [${r.order}/${job.total}] ${r.name}`,
+      `   ${truncateText(conclusion, 600)}`,
+      `   ${readOutputHint(job.jobId, r)}`,
+    ].join("\n");
+  });
+
+  return [
+    `[sub-agent-results]`,
+    formatJobStatusLine(job, elapsed),
+    `Job ID: ${job.jobId}`,
+    `结果总量超出自动注入预算（${full.length} > ${JOB_INJECT_BUDGET_CHARS} 字），已折叠为摘要；原文请按需读取。`,
+    "",
+    ...condensed,
     "[/sub-agent-results]",
   ].join("\n\n");
 }

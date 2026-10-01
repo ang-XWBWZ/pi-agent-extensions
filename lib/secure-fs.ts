@@ -14,9 +14,17 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
 /**
+ * G05：已确认私有权限的目录缓存。原始输出按 delta 高频追加，不能每次都同步
+ * mkdir + chmod；目录由本进程创建且不会被主动删除时直接复用。
+ */
+const ensuredPrivateDirs = new Set<string>();
+
+/**
  * 确保目录存在并强制为私有权限 (0700)
  */
 export function ensurePrivateDir(dirPath: string): void {
+  if (ensuredPrivateDirs.has(dirPath)) return;
+
   mkdirSync(dirPath, {
     recursive: true,
     mode: 0o700,
@@ -29,6 +37,8 @@ export function ensurePrivateDir(dirPath: string): void {
       // 忽略无法 chmod 的文件系统错误
     }
   }
+
+  ensuredPrivateDirs.add(dirPath);
 }
 
 /**

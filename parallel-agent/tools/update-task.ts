@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * update-task.ts — 子 Agent 专属任务面板与任务备注
  */
@@ -47,7 +48,7 @@ function formatPanel(panel: AgentTaskPanel): string {
 }
 
 export function registerUpdateAgentTask(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "update_agent_task",
     label: "Update Agent Task",
     description:

@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * send-message.ts — send_agent_message 工具注册
  */
@@ -5,12 +6,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { getAgentTaskPanel, sendMessage } from "../../lib/agent-bus.js";
+import {
+  deliverAgentMessage,
+  getAgentTaskPanel,
+  type AgentMessageDeliveryStatus,
+} from "../../lib/agent-bus.js";
+import { getSessionRuntime } from "../../lib/session-runtime.js";
 import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 import { subAgentIdentity } from "../lib/helpers.js";
 
 export function registerSendMessage(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "send_agent_message",
     label: "Send Agent Message",
     description:
@@ -62,10 +68,36 @@ export function registerSendMessage(pi: ExtensionAPI): void {
         }
       }
 
-      const msgId = sendMessage(fromId, params.to, params.type ?? "info", params.payload);
+      // D04：返回真实投递状态，未知/歧义目标绝不显示为“已发送成功”。
+      // D06：发往 main 的消息带上所属根会话，只有对应 owner 消费。
+      const runtime = getSessionRuntime(ctx?.sessionManager);
+      const ownerSessionId =
+        runtime?.parentSessionId ?? runtime?.sessionId;
+      const delivery = deliverAgentMessage(
+        fromId,
+        params.to,
+        params.type ?? "info",
+        params.payload,
+        { jobId: identity?.jobId, ownerSessionId },
+      );
+      const statusText: Record<AgentMessageDeliveryStatus, string> = {
+        queued: `消息已投递 → ${params.to}（已交给接收器，queued 不等于已消费）`,
+        not_found: `投递失败：目标不存在或没有活动接收器 → ${params.to}`,
+        ambiguous_target: `投递失败：目标歧义，多个 Job 存在同名 taskId ${params.to}；请改用 jobId 或从所属任务域发送`,
+        queue_full: `投递失败：目标队列已满或接收器拒绝 → ${params.to}`,
+        expired: `投递失败：目标已过期 → ${params.to}`,
+        rejected: `投递失败：目标拒绝接收 → ${params.to}`,
+        duplicate: `重复消息已忽略（id: ${delivery.msgId.slice(0, 8)}）`,
+      };
       return {
-        content: [{ type: "text", text: `📨 消息已发送 → ${params.to} (id: ${msgId.slice(0, 8)})` }],
-        details: { msgId, to: params.to, type: params.type ?? "info" },
+        content: [{ type: "text", text: statusText[delivery.status] }],
+        details: {
+          ...delivery,
+          // D07：协作消息与用户授权分开标记，不伪装成用户确认。
+          collaboration: true,
+          to: params.to,
+          type: params.type ?? "info",
+        },
       };
     },
   });

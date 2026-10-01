@@ -14,11 +14,13 @@ import {
   unregisterInstance,
   getInstance,
   getAgentTaskPanel,
+  isTaskCancelled,
   saveAgentState,
   appendAgentTaskOutput,
   replaceAgentTaskOutput,
   updateInstanceStatus,
   updateAgentTaskPanel,
+  projectTerminalResultToPanel,
   type SubTask,
   type SubResult,
   type AgentInstance,
@@ -30,7 +32,16 @@ import {
   subAgentIdentity,
 } from "./helpers.js";
 import { loadSkillConfig } from "./tier-resolver.js";
-import { setExecutionContext } from "../../lib/execution-context.js";
+import {
+  bindSessionExecutionContext,
+  ensureSessionRuntime,
+} from "../../lib/execution-context.js";
+import {
+  classifyTerminal,
+  extractFinalAssistantText,
+  readFinalAssistantSignal,
+} from "./result-classifier.js";
+import { runBoundedCleanup } from "./cleanup.js";
 
 // ---- Session 创建串行化（防止并发 globalThis 写入） ----
 let sessionChain: Promise<void> = Promise.resolve();
@@ -101,6 +112,19 @@ export function runSingleAgent(
       let abortedExternally = false;
       let lastOutputCheckpointAt = 0;
       let outputLogWritable = true;
+      // G04：文本 delta 有界批量刷盘，避免每个 delta 都同步落盘。
+      const OUTPUT_FLUSH_THRESHOLD = 4_096;
+      const OUTPUT_FLUSH_INTERVAL_MS = 250;
+      let outputFlushBuffer = "";
+      let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
+      // 先声明为空实现：finish 可能在初始化完成前触发，不能命中 TDZ。
+      let flushOutputLog: (force?: boolean) => void = () => undefined;
+      // C01/C02：活跃执行预算（不含暂停时间）与清理时间边界。
+      const CLEANUP_TIMEOUT_MS = 5_000;
+      // C01：初始化超时与活跃执行预算分离；timeout 只表示活跃预算。
+      const INIT_TIMEOUT_MS = Math.min(deadline, 120_000);
+      let activeElapsedMs = 0;
+      let activeStartedAt = 0;
 
       const clearTimers = () => {
         if (timerRef) {
@@ -122,6 +146,10 @@ export function runSingleAgent(
           clearTimeout(autoContinueTimer);
           autoContinueTimer = null;
         }
+        if (outputFlushTimer) {
+          clearTimeout(outputFlushTimer);
+          outputFlushTimer = null;
+        }
       };
 
       /**
@@ -131,6 +159,8 @@ export function runSingleAgent(
       const finish = async (result: SubResult) => {
         if (settled) return;
         settled = true;
+        // G04：结算前强制 flush，避免丢失尚未落盘的输出。
+        flushOutputLog(true);
         const inst = instRef;
         const cleanupErrors: string[] = [];
 
@@ -153,32 +183,10 @@ export function runSingleAgent(
           );
         }
 
-        const panelStatus =
-          result.ok ? "completed" :
-          result.errorCode === "timeout" ? "timed_out" :
-          result.errorCode === "killed" ? "killed" :
-          "failed";
-        const panelBeforeFinish = getAgentTaskPanel(jobId, task.id);
-        const panelConclusion = normalizeFinalConclusion(
-          panelBeforeFinish?.summary,
-        );
-        const completionConclusion = normalizeFinalConclusion(result.summary) || (
-          result.ok
-            ? panelConclusion || fallbackFinalConclusion(result.output ?? output)
-            : result.error ?? panelConclusion ?? "任务异常结束"
-        );
-        const hasTerminalReport = panelBeforeFinish?.stageReports.some(
-          (report) => report.status === panelStatus,
-        );
-        updateAgentTaskPanel(jobId, task.id, {
-          status: panelStatus,
-          progress: result.ok ? 100 : undefined,
-          summary: completionConclusion,
-          // 子 Agent 未能在终止前主动提交时，系统仅补一条明确标注的终态结论。
-          conclusion: hasTerminalReport ? undefined : completionConclusion,
-          reportSource: "system",
-          outputSnapshot: (result.output ?? output.trim()) || undefined,
-          outputLength: result.outputLength ?? totalOutputChars,
+        // B05：终态面板投影走统一路径，与 publishTaskResult 完全一致。
+        projectTerminalResultToPanel(jobId, result, {
+          output: output.trim() || undefined,
+          outputLength: totalOutputChars,
         });
 
         const shouldCheckpoint =
@@ -200,20 +208,19 @@ export function runSingleAgent(
         }
 
         if (inst) {
-          try {
-            await inst.session.abort();
-          } catch (error) {
-            cleanupErrors.push(
-              `abort: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-          try {
-            await Promise.resolve(inst.session.dispose());
-          } catch (error) {
-            cleanupErrors.push(
-              `dispose: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
+          // C05/C06：清理有时间边界；超时或拒绝都降级为结构化错误，不挂起结算。
+          await runBoundedCleanup(
+            "abort",
+            () => inst.session.abort(),
+            CLEANUP_TIMEOUT_MS,
+            (message) => cleanupErrors.push(message),
+          );
+          await runBoundedCleanup(
+            "dispose",
+            () => inst.session.dispose(),
+            CLEANUP_TIMEOUT_MS,
+            (message) => cleanupErrors.push(message),
+          );
         }
 
         try {
@@ -230,7 +237,10 @@ export function runSingleAgent(
         resolve(result);
       };
 
-      const resetTimer = () => {
+      const resetTimer = (
+        windowMs: number = deadline,
+        terminalReason = "达到活跃执行预算上限",
+      ) => {
         if (timerRef) {
           clearTimeout(timerRef);
           timerRef = null;
@@ -243,7 +253,8 @@ export function runSingleAgent(
           instRef._warningTimer = null;
         }
 
-        const halfDeadline = Math.floor(deadline / 2);
+        activeStartedAt = Date.now();
+        const halfDeadline = Math.floor(windowMs / 2);
         if (halfDeadline > 0) {
           warningTimer = setTimeout(() => {
             warningTimer = null;
@@ -252,7 +263,7 @@ export function runSingleAgent(
             const targetInst = instRef;
             if (!targetInst || targetInst._settled) return;
 
-            const warnMsg = `[任务超时警告] 当前子任务执行时间已达到超时限制的一半（已运行约 ${formatDuration(halfDeadline)}，剩余时间约 ${formatDuration(deadline - halfDeadline)}，总超时限制 ${formatDuration(deadline)}）。请评估当前任务进展，加快核心结论收敛，避免陷入冗长重试或死循环，及时通过 update_agent_task 提交阶段性结论并准备输出最终答案。`;
+            const warnMsg = `[任务超时警告] 当前子任务执行时间已达到超时限制的一半（已运行约 ${formatDuration(halfDeadline)}，剩余时间约 ${formatDuration(windowMs - halfDeadline)}，总超时限制 ${formatDuration(windowMs)}）。请评估当前任务进展，加快核心结论收敛，避免陷入冗长重试或死循环，及时通过 update_agent_task 提交阶段性结论并准备输出最终答案。`;
 
             try {
               if (targetInst.session && !targetInst._settled) {
@@ -287,18 +298,43 @@ export function runSingleAgent(
             ok: false,
             error: "timeout",
             errorCode: "timeout",
+            outcome: "timed_out",
+            terminalReason,
+            lastUsefulConclusion: output.trim() || undefined,
+            hasCompletionEvidence: false,
             output: output.trim() || undefined,
           });
-        }, Math.max(1, deadline));
+        }, Math.max(1, windowMs));
+      };
+
+      // C02：暂停冻结活跃预算与所有定时器；恢复按剩余预算重建。
+      const pauseTimers = () => {
+        if (activeStartedAt > 0) {
+          activeElapsedMs += Date.now() - activeStartedAt;
+          activeStartedAt = 0;
+        }
+        // G04：暂停时也强制 flush，避免缓冲输出丢失。
+        flushOutputLog(true);
+        clearTimers();
+      };
+
+      const resumeTimers = () => {
+        activeStartedAt = Date.now();
+        const remaining = Math.max(1, deadline - activeElapsedMs);
+        resetTimer(remaining);
       };
 
       // 覆盖上下文加载与 session 创建，避免初始化卡死形成永不结算的任务。
-      resetTimer();
+      resetTimer(INIT_TIMEOUT_MS, "初始化超时");
 
       try {
         // 上下文 + skill 注入
         let extra = "";
         if (task.context?.length) extra += await loadContext(task.context, cwd);
+        // F01：内联恢复文本与文件路径型 context 分离注入。
+        if (task.contextText?.trim()) {
+          extra += `\n${task.contextText.trim()}`;
+        }
         if (settled) return;
         if (task.skills?.length) {
           const config = loadSkillConfig();
@@ -314,7 +350,7 @@ export function runSingleAgent(
         const taskPanelProtocol = [
           "[子 Agent 任务面板协议]",
           "你有一个仅属于当前子任务的持久化任务面板。",
-          "开始工作时调用 update_agent_task，写入 currentStep 和初始进度。",
+          "开始工作时通过 call_capability({capability: 'parallel_agent', operation: 'update_agent_task', arguments: {currentStep: '当前步骤', progress: 0}}) 更新面板。parallel_agent 已为你加载；其他能力先用 load_capability 获取操作 Schema。",
           "每完成一个有意义的阶段、发现可复用结论、遇到阻塞或准备输出最终答案时，主动再次调用 update_agent_task。",
           "每次阶段提交使用 conclusion，说明实际结果、证据、影响或阻塞；结论以能完整说明结果为准，不必刻意压成短摘要。",
           "detail 是可选的详细控制面板，适合写必要的命令、文件、边界或推理；没有有用补充就省略。不要把完整日志或原始输出放进 conclusion/detail。",
@@ -332,10 +368,6 @@ export function runSingleAgent(
               `${task.id} 在 session 创建前已超时`,
             );
           }
-          if (task.parentExecutionContext?.approval?.inheritToChildren) {
-            setExecutionContext(task.parentExecutionContext);
-          }
-
           (globalThis as Record<string, unknown>).__pi_default_phase =
             task.phase || "work";
           (globalThis as Record<string, unknown>).__pi_is_sub_agent = true;
@@ -344,6 +376,21 @@ export function runSingleAgent(
 
           try {
             const sm = SessionManager.inMemory();
+            // F01/A10：子会话总是先拥有自己的 guarded runtime，绝不借用父会话
+            // 或其他会话的全局状态；仅在显式可继承时才覆盖为父授权快照。
+            const childRuntime = ensureSessionRuntime(sm);
+            childRuntime.isSubAgent = true;
+            // D06：记录父会话身份，子会话发往 main 的消息只归其 owner 消费。
+            if (task.parentExecutionContext?.sessionId) {
+              childRuntime.parentSessionId = task.parentExecutionContext.sessionId;
+            }
+            // A08：记录子任务工具上限，能力激活/阶段切换时工具投影必须与其求交。
+            if (tools && tools.length > 0) {
+              childRuntime.allowedTools = new Set(tools);
+            }
+            if (task.parentExecutionContext?.approval?.inheritToChildren) {
+              bindSessionExecutionContext(sm, task.parentExecutionContext);
+            }
             subAgentIdentity.set(sm, { jobId, taskId: task.id });
             const opts: Record<string, unknown> = {
               sessionManager: sm,
@@ -377,6 +424,24 @@ export function runSingleAgent(
           return;
         }
 
+        // C04：注册实例前复查取消标记，防止 kill_job 后仍启动。
+        if (isTaskCancelled(jobId, task.id)) {
+          try { await session.abort(); } catch { /* 取消兜底清理 */ }
+          try { await Promise.resolve(session.dispose()); } catch { /* 同上 */ }
+          await finish({
+            id: task.id,
+            name,
+            order,
+            ok: false,
+            error: "cancelled before start",
+            errorCode: "cancelled",
+            outcome: "cancelled",
+            terminalReason: "在注册实例前发现任务已被取消",
+            hasCompletionEvidence: false,
+          });
+          return;
+        }
+
         // ---- 注册实例 ----
         instRef = {
           jobId,
@@ -407,26 +472,9 @@ export function runSingleAgent(
         };
         registerInstance(instRef);
 
-        const extractAssistantText = (messages: unknown): string => {
-          if (!Array.isArray(messages)) return "";
-          const parts: string[] = [];
-          for (const msg of messages) {
-            const m = msg as { role?: string; content?: unknown };
-            if (m.role !== "assistant") continue;
-            if (typeof m.content === "string" && m.content.trim()) {
-              parts.push(m.content);
-              continue;
-            }
-            if (!Array.isArray(m.content)) continue;
-            for (const block of m.content) {
-              const b = block as { type?: string; text?: unknown };
-              if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
-                parts.push(b.text);
-              }
-            }
-          }
-          return parts.join("\n\n").trim();
-        };
+        // 446 处已一次性确定赋值，此后不再变动。捕获为 const 别名，让下方各嵌套
+        // 闭包保持非空收窄——let 的收窄不会透传进嵌套函数体。
+        const liveInst: AgentInstance = instRef;
 
         const rebuildOutputSnapshot = () => {
           const omitted =
@@ -445,14 +493,35 @@ export function runSingleAgent(
           });
         };
 
+        /** 把缓冲的原始输出写入日志；force 时忽略大小阈值。 */
+        flushOutputLog = (force = false) => {
+          if (!outputFlushBuffer) return;
+          if (!force && outputFlushBuffer.length < OUTPUT_FLUSH_THRESHOLD) return;
+          const chunk = outputFlushBuffer;
+          outputFlushBuffer = "";
+          if (outputLogWritable && !appendAgentTaskOutput(jobId, task.id, chunk)) {
+            markOutputLogUnavailable();
+          }
+        };
+
+        const scheduleOutputFlush = () => {
+          if (outputFlushTimer) return;
+          outputFlushTimer = setTimeout(() => {
+            outputFlushTimer = null;
+            flushOutputLog(true);
+          }, OUTPUT_FLUSH_INTERVAL_MS);
+          (outputFlushTimer as unknown as { unref?: () => void }).unref?.();
+        };
+
         const appendOutput = (delta: string, persistRawOutput = true) => {
           if (!delta) return;
-          if (
-            persistRawOutput &&
-            outputLogWritable &&
-            !appendAgentTaskOutput(jobId, task.id, delta)
-          ) {
-            markOutputLogUnavailable();
+          if (persistRawOutput && outputLogWritable) {
+            outputFlushBuffer += delta;
+            if (outputFlushBuffer.length >= OUTPUT_FLUSH_THRESHOLD) {
+              flushOutputLog(true);
+            } else {
+              scheduleOutputFlush();
+            }
           }
           totalOutputChars += delta.length;
 
@@ -476,6 +545,7 @@ export function runSingleAgent(
           outputHead = "";
           outputTail = "";
           totalOutputChars = 0;
+          outputFlushBuffer = "";
           if (
             outputLogWritable &&
             !replaceAgentTaskOutput(jobId, task.id, value)
@@ -493,13 +563,13 @@ export function runSingleAgent(
 
         const startIdleDetection = () => {
           clearIdle();
-          if (instRef.detailedStatus === "done") return;
+          if (liveInst.detailedStatus === "done") return;
           idleTimer = setTimeout(() => {
             updateInstanceStatus(jobId, task.id, { detailedStatus: "idle" });
-            instRef._idleTimer = idleTimer;
-            if (instRef.autoContinue && !instRef._settled) {
+            liveInst._idleTimer = idleTimer;
+            if (liveInst.autoContinue && !liveInst._settled) {
               autoContinueTimer = setTimeout(() => {
-                if (!instRef._settled) {
+                if (!liveInst._settled) {
                   void Promise.resolve(
                     session.steer("继续执行未完成的任务。"),
                   ).catch((error) => {
@@ -512,14 +582,16 @@ export function runSingleAgent(
                     });
                   });
                 }
-              }, instRef.autoContinueDelay * 1000);
+              }, liveInst.autoContinueDelay * 1000);
             }
           }, 5000);
-          instRef._idleTimer = idleTimer;
+          liveInst._idleTimer = idleTimer;
         };
 
-        instRef._resetTimer = resetTimer;
-        instRef._dispose = async (reason = "disposed") => {
+        liveInst._resetTimer = resetTimer;
+        liveInst._pauseTimers = pauseTimers;
+        liveInst._resumeTimers = resumeTimers;
+        liveInst._dispose = async (reason = "disposed") => {
           const killed = reason === "killed by main agent";
           await finish({
             id: task.id,
@@ -528,6 +600,10 @@ export function runSingleAgent(
             ok: false,
             error: reason,
             errorCode: killed ? "killed" : "disposed",
+            outcome: killed ? "killed" : "cancelled",
+            terminalReason: killed ? "被主 Agent 终止" : "会话被显式销毁",
+            lastUsefulConclusion: output.trim() || undefined,
+            hasCompletionEvidence: false,
             output: output.trim() || undefined,
           });
         };
@@ -535,6 +611,7 @@ export function runSingleAgent(
         resetTimer();
 
         const checkpointOutput = (force = false) => {
+          if (force) flushOutputLog(true);
           const now = Date.now();
           if (!force && now - lastOutputCheckpointAt < 1_500) return;
           lastOutputCheckpointAt = now;
@@ -559,12 +636,12 @@ export function runSingleAgent(
           if (event.type === "message_update") {
             if (event.assistantMessageEvent.type === "text_delta") {
               appendOutput(event.assistantMessageEvent.delta);
-              instRef.outputTokens += estimateTokens(event.assistantMessageEvent.delta);
-              instRef.outputLength = totalOutputChars;
+              liveInst.outputTokens += estimateTokens(event.assistantMessageEvent.delta);
+              liveInst.outputLength = totalOutputChars;
               updateInstanceStatus(jobId, task.id, {
                 detailedStatus: "thinking",
-                outputLength: instRef.outputLength,
-                outputTokens: instRef.outputTokens,
+                outputLength: liveInst.outputLength,
+                outputTokens: liveInst.outputTokens,
               });
               checkpointOutput();
             }
@@ -609,8 +686,8 @@ export function runSingleAgent(
               const stats = session.getSessionStats();
               const cu = session.getContextUsage();
               updateInstanceStatus(jobId, task.id, {
-                inputTokens: stats.tokens.input || instRef.inputTokens,
-                outputTokens: stats.tokens.output || instRef.outputTokens,
+                inputTokens: stats.tokens.input || liveInst.inputTokens,
+                outputTokens: stats.tokens.output || liveInst.outputTokens,
                 cacheTokens: (stats.tokens.cacheRead || 0) + (stats.tokens.cacheWrite || 0),
                 cost: stats.cost,
                 contextPercent: cu?.percent ?? null,
@@ -618,12 +695,17 @@ export function runSingleAgent(
               });
             } catch { /* */ }
           }
-          // ---- agent end → done ----
+          // ---- agent end → 集中式终态判定 ----
           if (event.type === "agent_end") {
+            // willRetry=true 表示 SDK 还会自动重试，不是终态；等待下一轮。
+            if ((event as { willRetry?: boolean }).willRetry) {
+              updateInstanceStatus(jobId, task.id, { detailedStatus: "running" });
+              return;
+            }
             clearIdle();
             updateInstanceStatus(jobId, task.id, { detailedStatus: "done" });
             try {
-              instRef._savedMessages = session.state.messages;
+              liveInst._savedMessages = session.state.messages;
             } catch {
               // finish/saveAgentState 会使用现有快照
             }
@@ -631,8 +713,8 @@ export function runSingleAgent(
               const stats = session.getSessionStats();
               const cu = session.getContextUsage();
               updateInstanceStatus(jobId, task.id, {
-                inputTokens: stats.tokens.input || instRef.inputTokens,
-                outputTokens: stats.tokens.output || instRef.outputTokens,
+                inputTokens: stats.tokens.input || liveInst.inputTokens,
+                outputTokens: stats.tokens.output || liveInst.outputTokens,
                 cacheTokens: (stats.tokens.cacheRead || 0) + (stats.tokens.cacheWrite || 0),
                 cost: stats.cost,
                 contextPercent: cu?.percent ?? null,
@@ -643,63 +725,82 @@ export function runSingleAgent(
               abortedExternally = false;
               return;
             }
+            // B04：只取最后一条最终回答，不拼接历史中间摘要。
             if (!output.trim()) {
               replaceOutput(
-                extractAssistantText(event.messages) ||
-                  extractAssistantText(instRef._savedMessages),
+                extractFinalAssistantText(event.messages) ||
+                  extractFinalAssistantText(liveInst._savedMessages),
               );
-              instRef.outputLength = totalOutputChars;
+              liveInst.outputLength = totalOutputChars;
             }
             checkpointOutput(true);
             const panelBeforeCompletion = getAgentTaskPanel(jobId, task.id);
-            const finalConclusion =
-              normalizeFinalConclusion(panelBeforeCompletion?.summary) ||
-              fallbackFinalConclusion(output);
-            const hasCompletedReport = panelBeforeCompletion?.stageReports.some(
-              (report) => report.status === "completed",
-            );
-            updateAgentTaskPanel(jobId, task.id, {
-              status: "completed",
-              progress: 100,
-              currentStep: "任务完成，正在提交最终结果",
-              summary: finalConclusion,
-              conclusion: hasCompletedReport ? undefined : finalConclusion,
-              reportSource: "system",
-              outputSnapshot: output.trim() || undefined,
-              outputLength: totalOutputChars,
-            });
-            const saved = saveAgentState(jobId, task.id, {
-              reason: "completed",
+            // SDK 终止原因优先取本轮消息，缺失时回退到会话快照。
+            const finalSignal = readFinalAssistantSignal(event.messages);
+            if (finalSignal.stopReason === undefined) {
+              const snapshotSignal = readFinalAssistantSignal(
+                liveInst._savedMessages,
+              );
+              finalSignal.stopReason = snapshotSignal.stopReason;
+              finalSignal.errorMessage = snapshotSignal.errorMessage;
+            }
+            // B01/B02/B03：会话结束不等于任务成功。空结果、模型错误、主动
+            // failed/blocked 都不能被判为 ok=true。
+            const decision = classifyTerminal({
+              control: "none",
+              finalAssistant: finalSignal,
+              panelStatus: panelBeforeCompletion?.status,
+              stageReports: panelBeforeCompletion?.stageReports,
+              panelSummary: panelBeforeCompletion?.summary,
               output: output.trim() || undefined,
-              instance: instRef,
+            });
+            // 面板终态投影统一由 finish -> projectTerminalResultToPanel 完成。
+            const finalConclusion =
+              normalizeFinalConclusion(decision.lastUsefulConclusion) ??
+              fallbackFinalConclusion(output);
+            const saved = saveAgentState(jobId, task.id, {
+              reason: decision.ok ? "completed" : "runtime_error",
+              output: output.trim() || undefined,
+              instance: liveInst,
             });
             await finish({
               id: task.id,
               name,
               order,
-              ok: true,
-              summary: finalConclusion,
-              output: output.trim() || "(无输出)",
+              ok: decision.ok,
+              summary: decision.ok ? finalConclusion : undefined,
+              lastUsefulConclusion: decision.lastUsefulConclusion,
+              outcome: decision.outcome,
+              terminalReason: decision.terminalReason,
+              hasCompletionEvidence: decision.hasCompletionEvidence,
+              error: decision.ok ? undefined : decision.error,
+              errorCode: decision.errorCode,
+              output: output.trim() || (decision.ok ? "(无输出)" : undefined),
               outputLength: totalOutputChars,
               saveId: saved?.saveId,
+              checkpointError: saved ? undefined : "子 Agent 状态自动落盘失败",
               tokens: {
-                input: instRef.inputTokens,
-                output: instRef.outputTokens,
-                cache: instRef.cacheTokens,
-                cost: instRef.cost,
-                contextPercent: instRef.contextPercent,
-                contextWindow: instRef.contextWindow,
+                input: liveInst.inputTokens,
+                output: liveInst.outputTokens,
+                cache: liveInst.cacheTokens,
+                cost: liveInst.cost,
+                contextPercent: liveInst.contextPercent,
+                contextWindow: liveInst.contextWindow,
               },
             });
           }
           })().catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
             void finish({
               id: task.id,
               name,
               order,
               ok: false,
-              error: error instanceof Error ? error.message : String(error),
+              error: message,
               errorCode: "runtime",
+              outcome: "failed",
+              terminalReason: `运行期异常: ${message}`,
+              lastUsefulConclusion: output.trim() || undefined,
               output: output.trim() || undefined,
             });
           });
@@ -708,13 +809,17 @@ export function runSingleAgent(
         // 启动子 Agent
         await session.prompt(prompt);
       } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
         await finish({
           id: task.id,
           name,
           order,
           ok: false,
-          error: err instanceof Error ? err.message : String(err),
+          error: message,
           errorCode: "runtime",
+          outcome: "failed",
+          terminalReason: `初始化异常: ${message}`,
+          lastUsefulConclusion: output.trim() || undefined,
           output: output.trim() || undefined,
         });
       }

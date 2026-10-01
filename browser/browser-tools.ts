@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../lib/capability-dispatch.js";
 /**
  * extensions/browser/browser-tools.ts — 浏览器自动化核心工具集定义
  *
@@ -21,7 +22,7 @@ import { tmpdir } from "node:os";
 
 export function registerBrowserTools(pi: ExtensionAPI) {
   // 1. browser_read
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "browser_read",
     label: "Browser Read",
     description:
@@ -43,7 +44,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
     renderResult(result, options, theme, context) {
       return renderToolResult(result, options, theme, context, {
         previewLines: 4,
-        isError: isToolResultError(result),
+        isError: isToolResultError(result, context),
       });
     },
     async execute(_id, params, signal, _onUpdate, _ctx) {
@@ -187,7 +188,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   // 2. chrome_tabs
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "chrome_tabs",
     label: "Chrome Tabs",
     description: "List all currently open tabs in your active desktop Chrome browser (via CDP @ 9222).",
@@ -198,7 +199,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
     renderResult(result, options, theme, context) {
       return renderToolResult(result, options, theme, context, {
         previewLines: 4,
-        isError: isToolResultError(result),
+        isError: isToolResultError(result, context),
       });
     },
     async execute(_id, _params, _signal, _onUpdate, _ctx) {
@@ -225,7 +226,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   // 3. chrome_act
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "chrome_act",
     label: "Chrome Act",
     description: "Perform interactions (click, type, press_key, scroll, navigate) in your active desktop Chrome tab.",
@@ -256,7 +257,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
     renderResult(result, options, theme, context) {
       return renderToolResult(result, options, theme, context, {
         previewLines: 3,
-        isError: isToolResultError(result),
+        isError: isToolResultError(result, context),
       });
     },
     async execute(_id, params, signal, _onUpdate, _ctx) {
@@ -373,7 +374,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
   });
 
   // 4. chrome_screenshot
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "chrome_screenshot",
     label: "Chrome Screenshot",
     description: "Capture visual screenshot of current active desktop Chrome webpage. Only captures webpage rendering area, preserving OS desktop privacy.",
@@ -386,7 +387,7 @@ export function registerBrowserTools(pi: ExtensionAPI) {
     renderResult(result, options, theme, context) {
       return renderToolResult(result, options, theme, context, {
         previewLines: 2,
-        isError: isToolResultError(result),
+        isError: isToolResultError(result, context),
       });
     },
     async execute(_id, params, _signal, _onUpdate, _ctx) {

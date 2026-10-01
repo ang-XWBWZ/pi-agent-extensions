@@ -20,9 +20,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCapability } from "./lib/capability-router.js";
 import {
+  markOwnerUnavailable,
   onMessage,
   registerFrontendProcessor,
 } from "./lib/agent-bus.js";
+import { getSessionRuntime } from "./lib/session-runtime.js";
 import { setupWidget } from "./parallel-agent/lib/widget.js";
 import { registerSpawnAgent } from "./parallel-agent/tools/spawn-agent.js";
 import { registerCheckResults } from "./parallel-agent/tools/check-results.js";
@@ -86,17 +88,26 @@ export default function (pi: ExtensionAPI) {
       .__pi_parallel_agent_suppress_widget === true;
 
   // ---- 用 globalThis 收子进程消息 + steer 推送（不依赖 pi 实例，重载后仍有效） ----
+  // D06：main 待收消息按 ownerSessionId 分桶，只有对应根会话消费。
+  interface PendingAgentMsg {
+    from: string;
+    type: string;
+    payload: string;
+  }
   const STEER_KEY = "__pi_pending_steer_msgs";
-  const PENDING_KEY = "__pi_pending_agent_msgs";
-  if (!(globalThis as Record<string, unknown>)[PENDING_KEY]) {
-    (globalThis as Record<string, unknown>)[PENDING_KEY] = [];
+  const PENDING_BY_OWNER_KEY = "__pi_pending_agent_msgs_by_owner";
+  if (!(globalThis as Record<string, unknown>)[PENDING_BY_OWNER_KEY]) {
+    (globalThis as Record<string, unknown>)[PENDING_BY_OWNER_KEY] =
+      new Map<string, PendingAgentMsg[]>();
     (globalThis as Record<string, unknown>)[STEER_KEY] = [];
     onMessage("main", (msg) => {
-      ((globalThis as Record<string, unknown>)[PENDING_KEY] as Array<any>).push({
-        from: msg.from,
-        type: msg.type,
-        payload: msg.payload,
-      });
+      const buckets = (globalThis as Record<string, unknown>)[
+        PENDING_BY_OWNER_KEY
+      ] as Map<string, PendingAgentMsg[]>;
+      const ownerKey = msg.ownerSessionId ?? "default";
+      const bucket = buckets.get(ownerKey) ?? [];
+      bucket.push({ from: msg.from, type: msg.type, payload: msg.payload });
+      buckets.set(ownerKey, bucket);
     });
     registerFrontendProcessor("steer", async (data) => {
       const text = data as string;
@@ -104,16 +115,30 @@ export default function (pi: ExtensionAPI) {
       q.push(text);
     });
   }
-  const pendingMsgs = (globalThis as Record<string, unknown>)[PENDING_KEY] as Array<{
-    from: string;
-    type: string;
-    payload: string;
-  }>;
+  const pendingByOwner = (globalThis as Record<string, unknown>)[
+    PENDING_BY_OWNER_KEY
+  ] as Map<string, PendingAgentMsg[]>;
+
+  // C08：父会话关闭时只记录 owner 不可用，不隐式终止任务。
+  pi.on("session_shutdown", (_event, ctx) => {
+    const runtime = getSessionRuntime(
+      (ctx as unknown as { sessionManager?: object })?.sessionManager,
+    );
+    if (runtime) markOwnerUnavailable(runtime.sessionId);
+  });
 
   // ---- context 事件注入待收消息 + steer 消息 ----
-  pi.on("context", (event, _ctx) => {
+  pi.on("context", (event, ctx) => {
     const steerQ = (globalThis as Record<string, unknown>)[STEER_KEY] as string[];
     const hasSteer = steerQ && steerQ.length > 0;
+    // 只消费自己 owner 的桶；兼容无 owner 的历史消息。
+    const ownerKey =
+      getSessionRuntime(
+        (ctx as unknown as { sessionManager?: object })?.sessionManager,
+      )?.sessionId ?? "default";
+    const ownedMsgs = pendingByOwner.get(ownerKey) ?? [];
+    const legacyMsgs = ownerKey === "default" ? [] : pendingByOwner.get("default") ?? [];
+    const pendingMsgs = [...ownedMsgs, ...legacyMsgs];
     const hasMsgs = pendingMsgs.length > 0;
     if (!hasSteer && !hasMsgs) return;
     const parts: string[] = [];
@@ -122,6 +147,8 @@ export default function (pi: ExtensionAPI) {
       parts.push(batch.join("\n"));
     }
     if (hasMsgs) {
+      pendingByOwner.set(ownerKey, []);
+      if (ownerKey !== "default") pendingByOwner.set("default", []);
       const batch = pendingMsgs.splice(0);
       const uniqueLines: string[] = [];
       const seen = new Set<string>();

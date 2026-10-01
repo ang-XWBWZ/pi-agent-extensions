@@ -48,9 +48,12 @@ export interface FooterTheme {
 }
 
 export interface FooterDataProviderLike {
-  getGitBranch(): string | undefined;
-  onBranchChange(listener: (branch: string | undefined) => void): () => void;
-  getExtensionStatuses?(): Map<string, string>;
+  // 内核 FooterDataProvider.getGitBranch() 返回 string | null，这里放宽以保持结构兼容。
+  getGitBranch(): string | null | undefined;
+  // 与内核 ReadonlyFooterDataProvider 保持结构兼容：分支回调不接收参数，
+  // 扩展状态是只读映射。
+  onBranchChange(listener: () => void): () => void;
+  getExtensionStatuses?(): ReadonlyMap<string, string>;
   getAvailableProviderCount?(): number;
 }
 
@@ -171,7 +174,7 @@ export function buildTwoLineFooter(
   // 5. 构造第二行右侧: AUTO 状态与模型信息合并 (纯文本，彻底移除 🧠最大 等一切表情)
   let autoStatus: string | undefined;
   try {
-    autoStatus = getAutoStatusSummary?.();
+    autoStatus = getAutoStatusSummary?.(ctx.sessionManager);
   } catch {
     // 忽略异常，降级处理
   }

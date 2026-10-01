@@ -132,7 +132,10 @@ export function createOpenAITolerantStream() {
         }
 
         const reasoning = options?.reasoning;
-        if (reasoning && reasoning !== "off" && model.reasoning) {
+        // 项目级 ThinkingLevel 含 "off"，内核类型不含，因此直接比较会被判定为无重叠。
+        // 该分支是活的：model-switch 允许把 thinking level 设为 "off"。
+        const reasoningDisabled = reasoning !== undefined && (reasoning as string) === "off";
+        if (reasoning && !reasoningDisabled && model.reasoning) {
           reqBody.reasoning_effort = PI_TO_OPENAI_REASONING_EFFORT[reasoning] ?? reasoning;
         }
 
@@ -242,6 +245,8 @@ export function createOpenAITolerantStream() {
         const decoder = new TextDecoder();
         let buffer = "";
         let hasFinishReason = false;
+        let sawUsage = false;
+        let usageGraceDeadline = 0;
         let sawDoneMarker = false;
         let finishReason: string | null = null;
         let textBlock: any = null;
@@ -359,6 +364,7 @@ export function createOpenAITolerantStream() {
           refreshIdleTimer();
           if (data.usage) {
             output.usage = parseOpenAIUsage(data.usage, model);
+            sawUsage = true;
           }
 
           const choice = data.choices?.[0];
@@ -422,6 +428,7 @@ export function createOpenAITolerantStream() {
           if (data.usage) {
             output.usage = parseOpenAIUsage(data.usage, model);
             processedSseFrame = true;
+            sawUsage = true;
           }
 
           if (!data.choices?.length) return;
@@ -472,10 +479,23 @@ export function createOpenAITolerantStream() {
 
         while (true) {
           if (options?.signal?.aborted) throw new Error("Request was aborted");
-          const { done, value } = await awaitWithAbort(
-            () => reader!.read(),
-            controller.signal,
-          );
+          // finish_reason may precede a separate usage-only frame. Give that
+          // frame a bounded opportunity to arrive, without waiting for socket
+          // EOF indefinitely on non-conforming relays.
+          let graceTimer: ReturnType<typeof setTimeout> | undefined;
+          const read = awaitWithAbort(() => reader!.read(), controller.signal);
+          const next = usageGraceDeadline > 0
+            ? Promise.race([
+                read,
+                new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+                  graceTimer = setTimeout(() => resolve({ done: true, value: undefined }), Math.max(1, usageGraceDeadline - Date.now()));
+                }),
+              ])
+            : read;
+          let chunk: ReadableStreamReadResult<Uint8Array>;
+          try { chunk = await next; }
+          finally { if (graceTimer) clearTimeout(graceTimer); }
+          const { done, value } = chunk;
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           const events = buffer.split(/\r?\n\r?\n/);
@@ -485,7 +505,7 @@ export function createOpenAITolerantStream() {
           let reachedTerminalFrame = false;
           for (const raw of events) {
             processSseFrame(raw);
-            if (sawDoneMarker || hasFinishReason) {
+            if (sawDoneMarker) {
               reachedTerminalFrame = true;
               break;
             }
@@ -493,11 +513,19 @@ export function createOpenAITolerantStream() {
           if (processedSseFrame) {
             refreshIdleTimer();
           }
+          if (hasFinishReason && (sawUsage || reqBody.stream_options?.include_usage !== true)) {
+            reachedTerminalFrame = true;
+          }
+          if (hasFinishReason && !sawUsage && usageGraceDeadline === 0) {
+            usageGraceDeadline = Date.now() + 1_000;
+          }
           if (reachedTerminalFrame) {
             cancelReader(reader);
             break;
           }
         }
+
+        if (hasFinishReason) cancelReader(reader);
 
         if (controller.signal.aborted) throw createRequestAbortError();
 
@@ -578,7 +606,8 @@ export function createOpenAITolerantStream() {
           outer.push({ type: "toolcall_end", contentIndex: getIdx(b), toolCall: b, partial: output });
         }
 
-        let mapped: string = "stop";
+        // 收窄为 done 事件 reason 允许的取值，避免裸 string 流入事件类型。
+        let mapped: "stop" | "length" | "toolUse" | "deferred" = "stop";
         if (finishReason === "length") mapped = "length";
         else if (finishReason === "tool_calls") mapped = "toolUse";
         else if (finishReason === "end" || finishReason === "stop") mapped = "stop";

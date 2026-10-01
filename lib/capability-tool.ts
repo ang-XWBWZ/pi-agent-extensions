@@ -1,29 +1,48 @@
-/**
- * capability-tool.ts — JIT 按需能力激活工具 (load_capability)
- *
- * 核心机制：
- * - 纯净定义：严禁 promptGuidelines / promptSnippet，杜绝 System Prompt 重新编译导致缓存失效；
- * - 尾部注入：在 tool_result 中返回 usageDoc，向模型传递详细操作守则，前面所有历史与 System 缓存 100% 保持；
- * - 纯追加挂载：调用 activateCapability -> pi.setActiveTools 增量追加工具集。
+/** Fixed capability transport: load returns guides and schemas at the tail;
+ * call dispatches a reviewed operation without changing native tool definitions.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   activateCapability,
+  getDefaultActivationState,
   getRegisteredCapabilities,
   formatFullCapabilityCatalog,
 } from "./capability-router.js";
 import { getExecutionContext } from "./execution-context.js";
+import { executeCapabilityCall, describeCapabilityOperations } from "./capability-dispatch.js";
 import { renderStructuredToolCall, renderToolResult } from "./tui-render.js";
 
 export function registerCapabilityTool(pi: ExtensionAPI): void {
   if (typeof pi.registerTool !== "function") return;
   pi.registerTool({
+    name: "call_capability",
+    label: "Call capability",
+    description: "Call an operation from a previously loaded capability. First use load_capability to obtain exact operation names and argument schemas. Normal phase, approval, protected-path and child-tool restrictions apply to the actual operation. Calls execute sequentially; use spawn_agent for parallel tasks.",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      capability: Type.String({ description: "Loaded capability ID" }),
+      operation: Type.String({ description: "Exact operation name returned by load_capability" }),
+      arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Arguments matching that operation's returned JSON Schema" })),
+    }),
+    renderCall(args, theme, context) {
+      return renderStructuredToolCall(theme, context, "call_capability", [
+        { name: "capability", value: args.capability, tone: "accent" },
+        { name: "operation", value: args.operation, tone: "warning" },
+        { name: "arguments", value: args.arguments, maxLength: 180 },
+      ]);
+    },
+    renderResult(result, options, theme, context) {
+      return renderToolResult(result, options, theme, context, { previewLines: 12 });
+    },
+    execute: executeCapabilityCall,
+  });
+  pi.registerTool({
     name: "load_capability",
     label: "load_capability",
     description:
-      "按需激活进阶能力子系统（如 model_switch、provider_manager、parallel_agent、work_goal 等），或查看系统功能与工具完整清单。激活后将即时挂载对应新工具并返回该能力的深度指南。",
+      "按需激活进阶能力子系统（如 model_switch、provider_manager、parallel_agent、work_goal 等），或查看系统功能与工具完整清单。加载后返回操作 Schema 与深度指南；通过固定 call_capability 入口调用，不改变请求工具定义。",
     parameters: Type.Object({
       capability: Type.Optional(
         Type.String({
@@ -70,14 +89,22 @@ export function registerCapabilityTool(pi: ExtensionAPI): void {
 
       let currentPhase: any = "work";
       try {
-        currentPhase = getExecutionContext()?.phase ?? "work";
+        currentPhase = getExecutionContext(ctx?.sessionManager)?.phase ?? "work";
       } catch {
         currentPhase = "work";
       }
-      const res = await activateCapability(capId, pi, ctx, currentPhase);
+      const res = await activateCapability(
+        capId,
+        pi,
+        ctx,
+        currentPhase,
+        getDefaultActivationState(ctx?.sessionManager),
+        ctx?.sessionManager,
+      );
       const text = [
         res.message,
         ...(res.doc ? ["", "---", `【${capId} 能力深度使用指南】`, res.doc] : []),
+        ...(res.success ? ["", describeCapabilityOperations(capId, ctx)] : []),
       ].join("\n");
 
       return {

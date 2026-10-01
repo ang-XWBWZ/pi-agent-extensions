@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * read-output.ts — read_agent_output 工具注册
  *
@@ -14,7 +15,7 @@ import {
 import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 
 export function registerReadAgentOutput(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "read_agent_output",
     label: "Read Agent Output",
     description:

@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * manage-tools.ts — manage_tools 工具注册
  *
@@ -13,7 +14,7 @@ import {
 import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 
 export function registerManageTools(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "manage_tools",
     label: "Manage Tools",
     description:
@@ -85,7 +86,7 @@ export function registerManageTools(pi: ExtensionAPI): void {
             s.tools = { blacklist: newList };
             return s;
           });
-          ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 tool 到黑名单`, "warn");
+          ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 tool 到黑名单`, "warning");
           return {
             content: [{ type: "text", text: `🔴 已添加 ${toAdd.length} 个 tool 到黑名单:\n${toAdd.map((s) => `  • ${s}`).join("\n")}\n\n当前 blacklist (${newList.length}):\n${newList.map((s) => `  🔴 ${s}`).join("\n")}` }],
             details: { action, added: toAdd, blacklist: newList },
@@ -125,7 +126,7 @@ export function registerManageTools(pi: ExtensionAPI): void {
             s.tools = { blacklist: newList };
             return s;
           });
-          ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖 tool 黑名单: ${newList.length} 条` : "🟢 已清空 tool 黑名单", newList.length > 0 ? "warn" : "info");
+          ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖 tool 黑名单: ${newList.length} 条` : "🟢 已清空 tool 黑名单", newList.length > 0 ? "warning" : "info");
           return {
             content: [{ type: "text", text: newList.length > 0
               ? `🔴 已覆盖 tool 黑名单 (${newList.length}):\n${newList.map((s) => `  • ${s}`).join("\n")}`

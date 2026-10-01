@@ -19,8 +19,8 @@ function errorMessage(error: unknown): string {
   );
 }
 
-function shouldRecord(): string | null {
-  const ctx = getExecutionContext();
+function shouldRecord(sessionManager?: object): string | null {
+  const ctx = getExecutionContext(sessionManager);
   if (ctx.ledger !== "work_goal") return null;
   const goal = ctx.goalId ? getWorkGoal(ctx.goalId) : getActiveWorkGoal();
   if (!goal || goal.status !== "active") return null;
@@ -30,9 +30,11 @@ function shouldRecord(): string | null {
 export async function beforeCommand(input: {
   command: string;
   cwd: string;
+  /** 调用会话的 SessionManager；用于把审计写入正确会话的目标账本。 */
+  sessionManager?: object;
 }): Promise<{ logId?: string; goalId?: string; startedAt: number }> {
   const startedAt = Date.now();
-  const goalId = shouldRecord();
+  const goalId = shouldRecord(input.sessionManager);
   if (!goalId) return { startedAt };
   const command = redactAuditText(input.command);
   const log = appendWorkGoalLog(goalId, {
@@ -53,8 +55,10 @@ export async function afterCommand(input: {
   stdout?: string;
   stderr?: string;
   error?: unknown;
+  /** 调用会话的 SessionManager；用于把审计写入正确会话的目标账本。 */
+  sessionManager?: object;
 }): Promise<void> {
-  const goalId = input.goalId ?? shouldRecord();
+  const goalId = input.goalId ?? shouldRecord(input.sessionManager);
   if (!goalId) return;
 
   const failed =

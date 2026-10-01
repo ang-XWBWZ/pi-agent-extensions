@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * switch-model.ts — switch_model 工具注册
  */
@@ -30,7 +31,7 @@ export function registerSwitchModel(
     }
   }
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "switch_model",
     label: "Switch Model",
     description: "切换模型、查看模型列表、管理模型层级和思考深度。",
@@ -115,15 +116,17 @@ export function registerSwitchModel(
       // standalone thinking
       if (params.thinkingLevel && !params.tier && !params.provider) {
         if (!isValidThinkingLevel(params.thinkingLevel)) return { content: [{ type: "text", text: "无效思考等级" }], details: {} };
+        // 捕获为局部常量：闭包内 params 的属性收窄不成立。
+        const level = params.thinkingLevel;
         if (ctx.model) forceThinkingSupport(ctx.model);
-        setThinking(params.thinkingLevel, ctx.model);
+        setThinking(level, ctx.model);
         updateSettings((s) => {
-          s.defaultThinkingLevel = params.thinkingLevel;
+          s.defaultThinkingLevel = level;
           if (ctx.model) {
             if (!s.modelThinkingLevels || typeof s.modelThinkingLevels !== "object") {
               s.modelThinkingLevels = {};
             }
-            (s.modelThinkingLevels as Record<string, string>)[`${ctx.model.provider}/${ctx.model.id}`] = params.thinkingLevel;
+            (s.modelThinkingLevels as Record<string, string>)[`${ctx.model.provider}/${ctx.model.id}`] = level;
           }
           return s;
         });

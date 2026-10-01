@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../lib/capability-dispatch.js";
 /**
  * One-shot Work Contract confirmation.
  *
@@ -180,7 +181,7 @@ export function setupRequirementsFeature(
     if (restored) replaceState(stateFromStored(restored));
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "manage_requirements",
     label: "Work Contract",
     description:

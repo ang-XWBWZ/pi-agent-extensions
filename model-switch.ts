@@ -49,7 +49,8 @@ export default function (pi: ExtensionAPI) {
 
   let defaultRef: { provider: string; model: string } | null = null;
   let currentTier: TierKey | null = null;
-  let tierConfig: Record<TierKey, TierConfig> = {};
+  // 空对象起步：各 TierKey 在首次配置/加载前并未填充，用断言表达这个惰性初始状态。
+  let tierConfig: Record<TierKey, TierConfig> = {} as Record<TierKey, TierConfig>;
   let currentThinking: string = "";
 
   const getState = () => ({ currentTier, tierConfig, currentThinking, defaultRef });
@@ -190,12 +191,14 @@ export default function (pi: ExtensionAPI) {
       currentThinking = event.level;
       if (ctx.model) {
         forceThinkingSupport(ctx.model);
+        // 捕获为局部常量：闭包体内的属性收窄不成立，直接引用 ctx.model 会被判定为可能为空。
+        const selectedModel = ctx.model;
         // 用户通过原生快捷键/原生选择器切换思考深度时，自动持久化至当前模型专属配置与全局默认
         updateSettings((s) => {
           if (!s.modelThinkingLevels || typeof s.modelThinkingLevels !== "object") {
             s.modelThinkingLevels = {};
           }
-          (s.modelThinkingLevels as Record<string, string>)[`${ctx.model.provider}/${ctx.model.id}`] = event.level;
+          (s.modelThinkingLevels as Record<string, string>)[`${selectedModel.provider}/${selectedModel.id}`] = event.level;
           s.defaultThinkingLevel = event.level;
           return s;
         });

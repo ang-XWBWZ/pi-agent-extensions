@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "./lib/capability-dispatch.js";
 /**
  * powershell-tool extension — provides a `powershell` tool that executes
  * PowerShell commands with native UTF-8 output, Unicode-safe command encoding,
@@ -146,7 +147,7 @@ function wrapPowerShellCommand(userCommand: string): string {
 // ============================================================
 
 export default function (pi: ExtensionAPI) {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "powershell",
     label: "powershell",
 
@@ -260,8 +261,8 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const command = String(params.command ?? "");
       const cwd = ctx?.cwd ?? process.cwd();
-      const execCtx = getExecutionContext();
-      const started = await beforeCommand({ command, cwd });
+      const execCtx = getExecutionContext(ctx?.sessionManager);
+      const started = await beforeCommand({ command, cwd, sessionManager: ctx?.sessionManager });
 
       return new Promise((resolve) => {
         // ── 超时处理 ──
@@ -327,6 +328,7 @@ export default function (pi: ExtensionAPI) {
             exitCode: resultExitCode(result),
             stdout: resultText(result),
             error: resultError(result),
+            sessionManager: ctx?.sessionManager,
           }).finally(() => resolve(result));
         };
 

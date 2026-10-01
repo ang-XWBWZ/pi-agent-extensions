@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * manage-providers.ts - manage_providers tool registration
  */
@@ -40,7 +41,7 @@ function isAnthropicThinkingMode(value: unknown): value is AnthropicThinkingMode
 }
 
 export function registerManageProviders(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "manage_providers",
     label: "Manage Providers",
     description: "Register, remove, and list custom model providers.",

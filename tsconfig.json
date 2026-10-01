@@ -1,0 +1,32 @@
+{
+  // Strict typecheck for the flat GitHub distribution and manual cache probe.
+  "compilerOptions": {
+    "target": "ES2022",
+    // browser 扩展会在页面上下文里求值 DOM 表达式，需要 DOM 全局类型。
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+
+    // strict 不能省：strictNullChecks 关闭时 `if (!result.ok)` 这类判别联合收窄
+    // 不生效，会把正常代码误报成属性缺失。
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true
+  },
+  "include": ["**/*.ts"],
+  "exclude": [
+    "**/node_modules/**",
+    // 这两个是「本地实现 vs 参考构建」的对照测试，参考构建位于仓库之外
+    // (../../../github特供版/github-dist/)，当前检出中不存在，因此既无法解析
+    // 也无法运行；它们也未被 package.json 的 test 脚本覆盖。待补上「参考构建
+    // 缺失即跳过」的保护后再纳入检查。
+    "provider-manager/__tests__/message-utils.test.ts",
+    "provider-manager/__tests__/stream-resilience.test.ts"
+  ]
+}

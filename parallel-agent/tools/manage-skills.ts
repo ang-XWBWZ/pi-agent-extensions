@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * manage-skills.ts — manage_skills 工具注册
  *
@@ -13,7 +14,7 @@ import {
 import { isToolResultError, renderStructuredToolCall, renderToolResult } from "../../lib/tui-render.js";
 
 export function registerManageSkills(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "manage_skills",
     label: "Manage Skills",
     description:
@@ -84,7 +85,7 @@ export function registerManageSkills(pi: ExtensionAPI): void {
             s.skills = { blacklist: newList };
             return s;
           });
-          ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 skill 到黑名单`, "warn");
+          ctx.ui.notify(`🔴 已添加 ${toAdd.length} 个 skill 到黑名单`, "warning");
           return {
             content: [{
               type: "text",
@@ -130,7 +131,7 @@ export function registerManageSkills(pi: ExtensionAPI): void {
             s.skills = { blacklist: newList };
             return s;
           });
-          ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖黑名单: ${newList.length} 条` : "🟢 已清空黑名单", newList.length > 0 ? "warn" : "info");
+          ctx.ui.notify(newList.length > 0 ? `🔴 已覆盖黑名单: ${newList.length} 条` : "🟢 已清空黑名单", newList.length > 0 ? "warning" : "info");
           return {
             content: [{
               type: "text",

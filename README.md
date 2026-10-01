@@ -169,12 +169,15 @@ Line 2: ↑67k ↓22k R50k W2.0k CH42.0% $0.085 3.2%/1.0M (auto) · 48.2 t/s    
 - **任务面板与结论优先**：子 Agent 在每个里程碑提交结构化控制面板，避免海量原始日志撑爆主上下文；
 - **状态持久化与超时安全**：任务完成自动落盘会话，超时前自动保存快照并生成 `saveId`，支持随时 `resumeFrom` 克隆恢复。
 
-### 3. PCS 渐进式能力挂载（Progressive Capability Specification）
-- **Prompt Cache 字节级冻结**：首轮 System Prompt 仅注入简短的不可变元索引卡，初始 Token 底噪从 23K+ 压缩至 ~3K；
-- **按需加载（JIT）**：当需要浏览器、MCP、子 Agent 等复杂工具时，AI 调用 `load_capability` 动态增量暴露工具并注入完整 Usage 文档，保障大模型推理准确性。
+### 3. PCS 按需能力加载（Progressive Capability Specification）
+
+- **固定请求前缀**：会话开始时固定基础工具和 `load_capability` / `call_capability` 的定义。加载、重复加载与阶段切换均不增加、移除或重排原生工具，也不向系统提示词编译能力索引区。
+- **尾部加载说明**：`load_capability({ capability: "browser" })` 返回使用说明、操作名与参数 JSON Schema；`load_capability({ action: "list" })` 用于发现可用能力。
+- **统一调用**：例如 `call_capability({ capability: "browser", operation: "browser_read", arguments: { url: "https://example.com", mode: "headless" } })`。权限层审查实际操作及其参数；未加载能力、阶段越权、受保护路径与子任务工具上限仍会阻止调用。
+- **真实缓存验收**：`./node_modules/.bin/tsx scripts/verify-capability-cache.ts` 使用当前配置的模型发送合成测试数据，比较实际 HTTP 请求前缀并核对服务端缓存用量。会产生少量模型调用费用；没有缓存复用证据时返回非零退出码。
 
 ### 4. 通用 stdio MCP Bridge — `mcp/`
-- 原生工具映射：将外部 MCP Server（如各类本地知识库、外部数据库服务）声明的工具自动无缝注册为 Pi 本地原生工具；
+- 操作映射：外部 MCP Server 的工具注册到会话内部调用表，通过 `call_capability` 调用；动态发现不修改模型请求中的原生工具定义；
 - 安全分级与策略审查：支持按服务配置 strict / allow 等细粒度安全准入规则。
 
 ### 5. 模型热切换与阶梯体系 — `model-switch/`
@@ -248,7 +251,7 @@ pi-agent-extensions/
 
 ```bash
 npm test
-# ℹ tests 135 | pass 135 | fail 0
+# 213 tests passed, including strict typechecking and stream-compat regressions
 ```
 
 ---

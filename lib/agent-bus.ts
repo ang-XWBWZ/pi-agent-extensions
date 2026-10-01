@@ -59,7 +59,9 @@ const globalBus: EventEmitter =
 function emitSafely(eventName: string, payload: unknown): void {
   for (const listener of globalBus.rawListeners(eventName)) {
     try {
-      const result = listener.call(globalBus, payload);
+      // EventEmitter 的监听器签名返回 void，但运行时可能返回 Promise；
+      // 显式放宽调用结果的类型才能安全地做 thenable 探测。
+      const result = (listener as (...args: unknown[]) => unknown).call(globalBus, payload);
       if (result && typeof (result as PromiseLike<unknown>).then === "function") {
         void Promise.resolve(result).catch((error) => {
           console.warn(`[agent-bus] ${eventName} 异步监听器失败:`, error);
@@ -71,6 +73,12 @@ function emitSafely(eventName: string, payload: unknown): void {
   }
 }
 
+/** 活动实例的消息接收器（D01）：销毁实例时必须注销。 */
+interface MessageReceiverEntry {
+  handler: (msg: BusAgentMessage) => boolean | Promise<boolean>;
+  enqueuedAt: number;
+}
+
 /** 跨 reload 共享状态（globalThis 承载，不随模块重载丢失） */
 interface AgentBusState {
   jobs: Map<string, AgentJob>;
@@ -79,6 +87,10 @@ interface AgentBusState {
   frontendQueue: FrontendMsg[];
   frontendProcessors: Map<string, (data: unknown) => Promise<unknown>>;
   frontendProcessing: boolean;
+  /** jobId:taskId -> 接收器（D01）。 */
+  messageReceivers: Map<string, MessageReceiverEntry>;
+  /** msgId -> 首次见到的时间戳，用于去重与 TTL 清理（D05）。 */
+  messageSeen: Map<string, number>;
 }
 
 const state: AgentBusState =
@@ -91,6 +103,8 @@ const state: AgentBusState =
       frontendQueue: [],
       frontendProcessors: new Map(),
       frontendProcessing: false,
+      messageReceivers: new Map(),
+      messageSeen: new Map(),
     };
     (globalThis as Record<string, unknown>).__pi_agent_state = s;
     return s;
@@ -98,6 +112,8 @@ const state: AgentBusState =
 
 // 兼容从旧版扩展 reload 后遗留的 globalThis 状态。
 if (!state.taskPanels) state.taskPanels = new Map();
+if (!state.messageReceivers) state.messageReceivers = new Map();
+if (!state.messageSeen) state.messageSeen = new Map();
 
 // ---- types ----
 
@@ -114,8 +130,43 @@ export interface SubTask {
   tier?: string;
   thinkingLevel?: string;
   resumeFrom?: string;
+  /** F01：内联文本上下文，绝不与文件路径型 context 混用。 */
+  contextText?: string;
+  /** F05：从哪个存档恢复，以及源 job/task 归属。 */
+  resumedFrom?: string;
+  sourceJobId?: string;
+  sourceTaskId?: string;
   notes?: string[];
 }
+
+/** 终态错误码。新增值均为可选，旧调用方按原字段解释即可。 */
+export type SubResultErrorCode =
+  | "timeout"
+  | "runtime"
+  | "killed"
+  | "disposed"
+  | "configuration"
+  | "model_error"
+  | "empty_result"
+  | "blocked"
+  | "incomplete"
+  | "cancelled"
+  | "agent_failed";
+
+/**
+ * 任务终态类别。只有 succeeded 映射为 SubResult.ok=true：
+ *   - failed/blocked/incomplete 表示本次执行已结束但目标未成功；
+ *   - cancelled/killed 表示被外部终止；
+ *   - timed_out 表示达到活跃预算上限。
+ */
+export type TerminalOutcome =
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "incomplete"
+  | "timed_out"
+  | "cancelled"
+  | "killed";
 
 export interface SubResult {
   id: string;
@@ -128,7 +179,20 @@ export interface SubResult {
   /** 原始输出的字符数；output 本身可能是受限快照。 */
   outputLength?: number;
   error?: string;
-  errorCode?: "timeout" | "runtime" | "killed" | "disposed" | "configuration";
+  errorCode?: SubResultErrorCode;
+  /** 集中式终态类别（见 parallel-agent/lib/result-classifier.ts）。 */
+  outcome?: TerminalOutcome;
+  /** 终止原因；与 lastUsefulConclusion 分开保存，超时/取消不覆盖已有结论。 */
+  terminalReason?: string;
+  /** 最近一次有效工程结论，即使任务失败也保留。 */
+  lastUsefulConclusion?: string;
+  /** 是否有完成证据：结构化完成报告或有效最终结论。 */
+  hasCompletionEvidence?: boolean;
+  /** G03：实际执行的模型与降级信息。 */
+  model?: string;
+  requestedModel?: string;
+  requestedTier?: string;
+  fallbackReason?: string;
   /** 超时或异常时自动保存的会话存档 ID */
   saveId?: string;
   /** 存档失败时的非致命错误，避免掩盖原始任务错误 */
@@ -165,6 +229,13 @@ export interface AgentJob {
   createdAt: number;
   finishedAt?: number;
   terminalTaskIds?: Set<string>;
+  /** G02：在启动前被取消的排队任务；调度器据此跳过，不创建 SDK 会话。 */
+  cancelledTaskIds?: Set<string>;
+  /** C03：可选的总墙钟上限（含排队与暂停），缺省表示不限制。 */
+  wallClockSeconds?: number;
+  wallClockDeadline?: number;
+  /** C08：父会话/UI 不可用的时间；仅作记录，不隐式杀任务。 */
+  ownerUnavailableAt?: number;
   delivery?: {
     requested: boolean;
     state: ResultDeliveryState;
@@ -209,6 +280,43 @@ export function claimDelivery(
   }
 
   return true;
+}
+
+/** E04/E05：集中式投递终态转换，避免调用方散落修改内部标志。 */
+export function finalizeDelivery(job: AgentJob, consumer: "poll" | "auto"): void {
+  if (!job.delivery) {
+    job.delivery = { requested: !!job._autoInjectRequested, state: "none" };
+  }
+  job.delivery.state = "delivered";
+  job.delivery.deliveredAt = Date.now();
+  job.delivery.lastError = undefined;
+  job._autoInjected = true;
+  job._autoInjecting = false;
+  void consumer;
+}
+
+/** 推送失败：进入可重试状态，主动查询可以接管（E05）。 */
+export function failDelivery(job: AgentJob, error: string): void {
+  if (!job.delivery) {
+    job.delivery = { requested: !!job._autoInjectRequested, state: "none" };
+  }
+  job.delivery.state = "delivery_failed";
+  job.delivery.lastError = error;
+  job._autoInjecting = false;
+}
+
+/** 释放误占用的消费权，使自动推送仍可接管（E03）。 */
+export function releaseDelivery(job: AgentJob): void {
+  if (!job.delivery) return;
+  if (
+    job.delivery.state === "claimed_by_poll" ||
+    job.delivery.state === "delivering"
+  ) {
+    job.delivery.state = job._autoInjectRequested ? "pending" : "none";
+    job.delivery.claimedAt = undefined;
+  }
+  job._autoInjected = false;
+  job._autoInjecting = false;
 }
 
 export type AgentTaskPanelStatus =
@@ -372,10 +480,15 @@ export interface AgentInstance {
   _abortExternally?: () => void;
   /** 内部：重置超时计时器 */
   _resetTimer?: () => void;
+  /** 内部：暂停时冻结活跃预算与全部定时器（C02） */
+  _pauseTimers?: () => void;
+  /** 内部：恢复时按剩余预算重建定时器（C02） */
+  _resumeTimers?: () => void;
   /** 内部：超时过半警告定时器 */
   _warningTimer?: ReturnType<typeof setTimeout> | null;
   /** 内部：空闲检测定时器 */
-  _idleTimer?: ReturnType<typeof setTimeout>;
+  // 空闲计时器以 null 表示「已清除」，与调用方的本地约定保持一致。
+  _idleTimer?: ReturnType<typeof setTimeout> | null;
   /** 内部：agent_end 时捕获的消息快照（session dispose 后仍可用） */
   _savedMessages?: SessionMessage[];
   /** 内部：是否已完成（防重复终止） */
@@ -392,6 +505,8 @@ export interface BusAgentMessage {
   type: "info" | "request" | "response" | "error";
   payload: string;
   timestamp: number;
+  /** D06：main 目标所属的根会话；只有该 owner 的根会话消费。 */
+  ownerSessionId?: string;
 }
 
 // ---- 事件常量 ----
@@ -407,6 +522,8 @@ export const Events = {
   AGENT_RESUMED: "agent:resumed",
   STATUS_CHANGED: "instance:status_changed",
   TASK_PANEL_UPDATED: "task-panel:updated",
+  /** Job 终态事件。此前被多处引用却未声明，事件名为 undefined（F08/E01）。 */
+  JOB_TERMINAL: "job:terminal",
 } as const;
 
 // ---- 存储（通过 globalThis 跨 reload 共享） ----
@@ -827,7 +944,9 @@ function saveAgentStateOrThrow(
       const cleaned = {
         ...savedState,
         messages: messages.map((m) => {
-          const content = typeof m.content === "string" ? m.content : "(binary content)";
+          // AgentMessage 联合里并非每个成员都带 content，统一取值后再判断。
+          const raw = (m as { content?: unknown }).content;
+          const content = typeof raw === "string" ? raw : "(binary content)";
           return { ...m, content: content.slice(0, 5000) };
         }),
       };
@@ -874,6 +993,15 @@ export function loadAgentState(saveId: string): AgentSaveState | null {
     const parsed = JSON.parse(readFileSync(target, "utf-8")) as
       | AgentSaveState
       | Omit<AgentSaveState, "version" | "jobId" | "reason">;
+    // F07：旧存档最小结构校验，缺失字段按兼容默认补齐，不丢弃文件。
+    // 必须在 version 分支之前，legacy（无 version）存档同样受保护。
+    if (!Array.isArray(parsed.messages)) parsed.messages = [];
+    if (parsed.taskPanel && !Array.isArray(parsed.taskPanel.stageReports)) {
+      parsed.taskPanel.stageReports = [];
+    }
+    if (parsed.taskPanel && !Array.isArray(parsed.taskPanel.notes)) {
+      parsed.taskPanel.notes = [];
+    }
     if (!("version" in parsed)) {
       return {
         ...parsed,
@@ -881,9 +1009,6 @@ export function loadAgentState(saveId: string): AgentSaveState | null {
         jobId: "legacy",
         reason: "manual",
       };
-    }
-    if (parsed.taskPanel && !Array.isArray(parsed.taskPanel.stageReports)) {
-      parsed.taskPanel.stageReports = [];
     }
     return parsed;
   } catch {
@@ -1013,7 +1138,19 @@ export function updateAgentTaskPanel(
 
   if (update.status !== undefined) panel.status = update.status;
   if (update.progress !== undefined && Number.isFinite(update.progress)) {
-    panel.progress = Math.max(0, Math.min(100, Math.round(update.progress)));
+    const requested = Math.max(0, Math.min(100, Math.round(update.progress)));
+    // G07：进度按任务单调递增；回退请求保留较高值并记录备注，新恢复任务用新面板。
+    if (requested < panel.progress) {
+      panel.notes.push({
+        id: randomUUID(),
+        text: `进度回退请求 ${requested}% 被忽略（保持 ${panel.progress}%）`,
+        source: "system",
+        createdAt: Date.now(),
+      });
+      if (panel.notes.length > 100) panel.notes = panel.notes.slice(-100);
+    } else {
+      panel.progress = requested;
+    }
   }
   if (update.currentStep !== undefined) {
     panel.currentStep = update.currentStep.trim().slice(0, 2_000) || undefined;
@@ -1176,44 +1313,149 @@ export function getJob(jobId: string): AgentJob | undefined {
   return state.jobs.get(jobId);
 }
 
+/** G02：标记排队任务被取消，调度器启动前会跳过它。 */
+export function markTaskCancelled(jobId: string, taskId: string): void {
+  const job = state.jobs.get(jobId);
+  if (!job) return;
+  if (!job.cancelledTaskIds) job.cancelledTaskIds = new Set<string>();
+  job.cancelledTaskIds.add(taskId);
+}
+
+export function isTaskCancelled(jobId: string, taskId: string): boolean {
+  return state.jobs.get(jobId)?.cancelledTaskIds?.has(taskId) ?? false;
+}
+
+/** C03：整个 Job 是否已超过可选总墙钟上限。 */
+export function isPastWallClock(jobId: string): boolean {
+  const job = state.jobs.get(jobId);
+  return Boolean(job?.wallClockDeadline && Date.now() > job.wallClockDeadline);
+}
+
+/** C03：为因总墙钟超限而跳过的任务提交终态。 */
+export function publishWallClockExceeded(
+  jobId: string,
+  task: SubTask,
+  order: number,
+): boolean {
+  return publishTaskResult(jobId, {
+    id: task.id,
+    name: task.prompt.slice(0, 20).replace(/\n/g, " ").trim() || task.id,
+    order,
+    ok: false,
+    error: "wall clock exceeded",
+    errorCode: "timeout",
+    outcome: "timed_out",
+    terminalReason: "整个 Job 的可选总墙钟上限已到，任务未启动",
+  });
+}
+
+/**
+ * C08：父会话/UI 不可用时记录在 Job 上，便于事后判断“待领取结果”原因；
+ * 只做记录，不用全局状态切换隐式终止任务。
+ */
+export function markOwnerUnavailable(ownerSessionId: string): number {
+  let marked = 0;
+  for (const job of state.jobs.values()) {
+    if (job.ownerSessionId === ownerSessionId && !job.ownerUnavailableAt) {
+      job.ownerUnavailableAt = Date.now();
+      marked++;
+    }
+  }
+  return marked;
+}
+
+/** 为启动前取消的排队任务提交一个明确的 cancelled 终态。 */
+export function publishCancelledBeforeStart(
+  jobId: string,
+  task: SubTask,
+  order: number,
+): boolean {
+  return publishTaskResult(jobId, {
+    id: task.id,
+    name: task.prompt.slice(0, 20).replace(/\n/g, " ").trim() || task.id,
+    order,
+    ok: false,
+    error: "cancelled before start",
+    errorCode: "cancelled",
+    outcome: "cancelled",
+    terminalReason: "在启动前被取消，未创建 SDK 会话",
+  });
+}
+
 export function listJobs(): AgentJob[] {
   return Array.from(state.jobs.values());
 }
 
-export function publishTaskResult(jobId: string, result: SubResult): void {
-  const job = state.jobs.get(jobId);
-  if (!job) return;
-
-  if (!job.terminalTaskIds) {
-    job.terminalTaskIds = new Set<string>();
-  }
-  if (job.terminalTaskIds.has(result.id)) {
-    return;
-  }
-  job.terminalTaskIds.add(result.id);
-
-  const panelStatus: AgentTaskPanelStatus =
+/** 终态类别到面板状态的唯一映射（B05）。 */
+export function terminalPanelStatus(result: SubResult): AgentTaskPanelStatus {
+  return result.outcome === "blocked" ? "blocked" :
+    result.outcome === "cancelled" ? "interrupted" :
+    result.outcome === "killed" ? "killed" :
+    result.outcome === "timed_out" ? "timed_out" :
     result.ok ? "completed" :
     result.errorCode === "timeout" || result.error === "timeout" ? "timed_out" :
     result.errorCode === "killed" ? "killed" :
     "failed";
+}
+
+/**
+ * 终态面板投影的唯一路径（B05）：agent-runner.finish 与 publishTaskResult
+ * 共用，避免两处分别计算面板状态/结论导致不一致。
+ *
+ * B07：失败时也优先保留最近有效工程结论，terminalReason 已单独记录。
+ */
+export function projectTerminalResultToPanel(
+  jobId: string,
+  result: SubResult,
+  fallback: { output?: string; outputLength?: number } = {},
+): void {
+  const panelStatus = terminalPanelStatus(result);
   const existingPanel = getAgentTaskPanel(jobId, result.id);
-  const finalConclusion = result.summary ?? existingPanel?.summary ?? (result.ok
-    ? (result.output ?? "任务已完成")
-    : (result.error ?? "任务失败"));
+  const panelConclusion = existingPanel?.summary?.trim();
+  const finalConclusion =
+    result.summary?.trim() ||
+    result.lastUsefulConclusion?.trim() ||
+    (result.ok
+      ? panelConclusion ||
+        (result.output ?? fallback.output) ||
+        "任务已完成，但未生成文本结论。"
+      : result.error || panelConclusion || "任务失败");
   const hasTerminalReport = existingPanel?.stageReports.some(
     (report) => report.status === panelStatus,
   );
   updateAgentTaskPanel(jobId, result.id, {
     status: panelStatus,
     progress: result.ok ? 100 : undefined,
+    currentStep: result.ok ? "任务完成，正在提交最终结果" : undefined,
     summary: finalConclusion,
+    // 子 Agent 未能在终止前主动提交时，系统仅补一条明确标注的终态结论。
     conclusion: hasTerminalReport ? undefined : finalConclusion,
     reportSource: "system",
-    outputSnapshot: result.output,
-    outputLength: result.outputLength,
+    outputSnapshot: (result.output ?? fallback.output) || undefined,
+    outputLength: result.outputLength ?? fallback.outputLength,
     saveId: result.saveId,
   });
+}
+
+/**
+ * 幂等终态提交（B05）：同一任务的终态只提交一次，作为 Job 计数与结果推送的
+ * 唯一写入点。
+ *
+ * @returns true 表示本次调用提交了终态；false 表示 Job 不存在或该任务已提交过。
+ */
+export function publishTaskResult(jobId: string, result: SubResult): boolean {
+  const job = state.jobs.get(jobId);
+  if (!job) return false;
+
+  if (!job.terminalTaskIds) {
+    job.terminalTaskIds = new Set<string>();
+  }
+  if (job.terminalTaskIds.has(result.id)) {
+    return false;
+  }
+  job.terminalTaskIds.add(result.id);
+
+  projectTerminalResultToPanel(jobId, result);
 
   job.results.push(result);
   job.completed = job.terminalTaskIds.size;
@@ -1230,6 +1472,8 @@ export function publishTaskResult(jobId: string, result: SubResult): void {
     emitSafely(Events.JOB_COMPLETE, { jobId, job });
     emitSafely(Events.JOB_TERMINAL, { jobId, job, reason: "complete" });
   }
+
+  return true;
 }
 
 export function publishJobError(jobId: string, error: string): void {
@@ -1250,6 +1494,35 @@ function instanceKey(jobId: string, taskId: string): string {
 export function registerInstance(inst: AgentInstance): void {
   const key = instanceKey(inst.jobId, inst.taskId);
   state.instances.set(key, inst);
+
+  // D01：每个活动实例注册接收器，消息最终进入该子会话的 steer/follow-up 队列。
+  registerMessageReceiver(inst.jobId, inst.taskId, async (msg) => {
+    if (inst._settled || inst.status === "paused") return false;
+    const session = inst.session as unknown as {
+      steer?: (text: string) => Promise<void>;
+      followUp?: (text: string) => Promise<void>;
+      sendUserMessage?: (text: string) => Promise<void>;
+    };
+    const text = `[agent-message from ${msg.from}] ${msg.payload}`;
+    try {
+      if (typeof session.steer === "function") {
+        await session.steer(text);
+        return true;
+      }
+      if (typeof session.followUp === "function") {
+        await session.followUp(text);
+        return true;
+      }
+      if (typeof session.sendUserMessage === "function") {
+        await session.sendUserMessage(text);
+        return true;
+      }
+    } catch (error) {
+      console.warn("[agent-bus] 消息注入子会话失败:", error);
+    }
+    return false;
+  });
+
   updateAgentTaskPanel(inst.jobId, inst.taskId, {
     status: "running",
     currentStep: "子 Agent 会话已启动",
@@ -1262,6 +1535,7 @@ export function unregisterInstance(jobId: string, taskId: string): void {
   const inst = state.instances.get(key);
   if (inst?._idleTimer) clearTimeout(inst._idleTimer);
   state.instances.delete(key);
+  unregisterMessageReceiver(jobId, taskId);
   if (inst) {
     emitSafely(Events.INSTANCE_UNREGISTERED, { jobId, taskId, name: inst.name });
   }
@@ -1381,7 +1655,18 @@ export function updateInstanceStatus(
 /** 杀死子 Agent（统一走 _dispose 生命周期清理，兜底处理旧版 buggy _dispose） */
 export async function killAgent(jobId: string, taskId: string): Promise<boolean> {
   const inst = getInstance(jobId, taskId);
-  if (!inst) return false;
+  if (!inst) {
+    // C07：已结算或从未注册时，若该任务已是终态则幂等返回成功。
+    const job = state.jobs.get(jobId);
+    if (job?.terminalTaskIds?.has(taskId)) return true;
+    // G02：排队中的任务直接取消，不创建 SDK 会话。
+    const queued = job?.tasks.find((task) => task.id === taskId);
+    if (job && queued) {
+      markTaskCancelled(jobId, taskId);
+      return publishCancelledBeforeStart(jobId, queued, job.tasks.indexOf(queued) + 1);
+    }
+    return false;
+  }
 
   // 尝试新版 _dispose（内部调用 finish → unregisterInstance）
   if (inst._dispose) {
@@ -1418,9 +1703,15 @@ export async function killJob(jobId: string): Promise<number> {
   for (const inst of insts) {
     if (await killAgent(jobId, inst.taskId)) count++;
   }
-  // 标记 job 为 killed
   const job = state.jobs.get(jobId);
   if (job) {
+    // G02：取消尚未启动的排队任务，不创建 SDK 会话。
+    job.tasks.forEach((task, index) => {
+      if (job.terminalTaskIds?.has(task.id)) return;
+      if (getInstance(jobId, task.id)) return;
+      markTaskCancelled(jobId, task.id);
+      if (publishCancelledBeforeStart(jobId, task, index + 1)) count++;
+    });
     job.status = "killed";
     job.finishedAt = Date.now();
     emitSafely(Events.JOB_TERMINAL, { jobId, job, reason: "killed" });
@@ -1447,7 +1738,11 @@ export async function abortAgent(jobId: string, taskId: string): Promise<boolean
 export async function pauseAgent(jobId: string, taskId: string): Promise<boolean> {
   const inst = getInstance(jobId, taskId);
   if (!inst) return false;
+  // C07：重复 pause 幂等。
+  if (inst.status === "paused") return true;
 
+  // C02：先冻结活跃预算与定时器，再中断当前执行。
+  inst._pauseTimers?.();
   try {
     inst._abortExternally?.();
     await inst.session.abort();
@@ -1470,7 +1765,8 @@ export async function resumeAgent(jobId: string, taskId: string, resumeText?: st
   if (inst.status !== "paused") return false;
 
   try {
-    inst._resetTimer?.();
+    // C02：按剩余活跃预算重建计时器；旧实例回退到整段重启。
+    (inst._resumeTimers ?? inst._resetTimer)?.();
     const msg = resumeText || "继续执行之前的任务。";
     await inst.session.sendUserMessage(msg);
     inst.status = "running";
@@ -1520,10 +1816,198 @@ export function sendMessage(
   type: BusAgentMessage["type"],
   payload: string,
 ): string {
-  const msgId = randomUUID();
-  const msg: BusAgentMessage = { msgId, from, to, type, payload, timestamp: Date.now() };
+  return deliverAgentMessage(from, to, type, payload).msgId;
+}
+
+// ---- 点对点消息接收器与投递（D01/D02/D04/D05） ----
+
+export type AgentMessageDeliveryStatus =
+  | "queued"
+  | "not_found"
+  | "ambiguous_target"
+  | "queue_full"
+  | "expired"
+  | "rejected"
+  | "duplicate";
+
+export interface AgentMessageDelivery {
+  msgId: string;
+  status: AgentMessageDeliveryStatus;
+  target: string;
+  resolvedTo?: string;
+}
+
+const MESSAGE_DEDUP_TTL_MS = 60_000;
+const MESSAGE_DEDUP_MAX = 500;
+
+/** msgId 去重；超过 TTL 或容量上限的旧记录被清理（D05）。 */
+function rememberMessage(msgId: string): boolean {
+  const now = Date.now();
+  for (const [id, at] of state.messageSeen) {
+    if (now - at > MESSAGE_DEDUP_TTL_MS) state.messageSeen.delete(id);
+  }
+  if (state.messageSeen.has(msgId)) return false;
+  state.messageSeen.set(msgId, now);
+  while (state.messageSeen.size > MESSAGE_DEDUP_MAX) {
+    const oldest = state.messageSeen.keys().next().value;
+    if (oldest === undefined) break;
+    state.messageSeen.delete(oldest);
+  }
+  return true;
+}
+
+/** 为活动实例注册接收器；实例销毁时必须调用 unregisterMessageReceiver。 */
+export function registerMessageReceiver(
+  jobId: string,
+  taskId: string,
+  handler: (msg: BusAgentMessage) => boolean | Promise<boolean>,
+): void {
+  state.messageReceivers.set(instanceKey(jobId, taskId), {
+    handler,
+    enqueuedAt: Date.now(),
+  });
+}
+
+export function unregisterMessageReceiver(jobId: string, taskId: string): void {
+  state.messageReceivers.delete(instanceKey(jobId, taskId));
+}
+
+export function listMessageReceivers(): string[] {
+  return Array.from(state.messageReceivers.keys());
+}
+
+type MessageTargetResolution =
+  | { status: "ok"; keys: string[] }
+  | { status: "not_found" }
+  | { status: "ambiguous_target" };
+
+/**
+ * 解析消息目标（D02）。taskId 只有在全局唯一时才解析；跨 Job 同名 taskId
+ * 明确返回 ambiguous_target，绝不猜测或误投。传入 fromJobId 时优先在同一
+ * 任务域内解析。
+ */
+export function resolveMessageTarget(
+  to: string,
+  fromJobId?: string,
+): MessageTargetResolution {
+  if (to === "broadcast") {
+    const all = Array.from(state.messageReceivers.keys());
+    // D03：广播默认限定发送者所属任务域，跨任务域不得依赖同名 taskId。
+    const scoped = fromJobId
+      ? all.filter((key) => key.startsWith(`${fromJobId}:`))
+      : all;
+    return scoped.length > 0 ? { status: "ok", keys: scoped } : { status: "not_found" };
+  }
+  if (to === "main") return { status: "ok", keys: [] };
+
+  if (state.jobs.has(to)) {
+    const keys = Array.from(state.instances.values())
+      .filter((inst) => inst.jobId === to)
+      .map((inst) => instanceKey(inst.jobId, inst.taskId));
+    return keys.length > 0 ? { status: "ok", keys } : { status: "not_found" };
+  }
+
+  const matches = Array.from(state.instances.values()).filter(
+    (inst) => inst.taskId === to,
+  );
+  if (matches.length === 0) return { status: "not_found" };
+  if (matches.length > 1) {
+    if (fromJobId) {
+      const scoped = matches.filter((inst) => inst.jobId === fromJobId);
+      if (scoped.length === 1) {
+        return {
+          status: "ok",
+          keys: [instanceKey(scoped[0].jobId, scoped[0].taskId)],
+        };
+      }
+    }
+    return { status: "ambiguous_target" };
+  }
+  return {
+    status: "ok",
+    keys: [instanceKey(matches[0].jobId, matches[0].taskId)],
+  };
+}
+
+/**
+ * 投递一条消息并返回真实状态（D04）。queued 表示已交给接收器，不等于已被消费。
+ * 未知或歧义目标绝不返回成功。
+ */
+export function deliverAgentMessage(
+  from: string,
+  to: string,
+  type: BusAgentMessage["type"],
+  payload: string,
+  options: { jobId?: string; msgId?: string; ownerSessionId?: string } = {},
+): AgentMessageDelivery {
+  const msgId = options.msgId ?? randomUUID();
+  const msg: BusAgentMessage = {
+    msgId,
+    from,
+    to,
+    type,
+    payload,
+    timestamp: Date.now(),
+    ownerSessionId: options.ownerSessionId,
+  };
+
+  const resolution = resolveMessageTarget(to, options.jobId);
+  if (resolution.status !== "ok") {
+    return { msgId, status: resolution.status, target: to };
+  }
+  if (!rememberMessage(msgId)) {
+    return { msgId, status: "duplicate", target: to };
+  }
+
+  // main/broadcast 由总线事件承载（onMessage 消费）；实例目标同时交给接收器。
   emitSafely(Events.AGENT_MESSAGE, msg);
-  return msgId;
+
+  if (to === "main") {
+    return { msgId, status: "queued", target: to, resolvedTo: "main" };
+  }
+  if (resolution.keys.length === 0) {
+    return { msgId, status: "not_found", target: to };
+  }
+
+  let accepted = 0;
+  let rejected = 0;
+  for (const key of resolution.keys) {
+    const entry = state.messageReceivers.get(key);
+    if (!entry) {
+      rejected++;
+      continue;
+    }
+    try {
+      const result = entry.handler(msg);
+      if (result && typeof (result as PromiseLike<boolean>).then === "function") {
+        void Promise.resolve(result)
+          .then((ok) => {
+            if (!ok) console.warn(`[agent-bus] 消息 ${msgId} 被 ${key} 拒绝`);
+          })
+          .catch((error) =>
+            console.warn(`[agent-bus] 消息 ${msgId} 接收器失败:`, error),
+          );
+        accepted++;
+      } else if (result) {
+        accepted++;
+      } else {
+        rejected++;
+      }
+    } catch (error) {
+      console.warn(`[agent-bus] 消息 ${msgId} 接收器异常:`, error);
+      rejected++;
+    }
+  }
+
+  if (accepted > 0) {
+    return {
+      msgId,
+      status: "queued",
+      target: to,
+      resolvedTo: resolution.keys.join(","),
+    };
+  }
+  return { msgId, status: rejected > 0 ? "queue_full" : "not_found", target: to };
 }
 
 export function onMessage(
@@ -1650,26 +2134,54 @@ export function waitForJob(jobId: string, timeoutMs: number = 600_000, signal?: 
 
 // ---- 清理 ----
 
-export function cleanupJobs(maxAge: number = 600_000): void {
+/** G06：内存中最多保留的终态 Job 数量；超出后淘汰最旧的。 */
+export const MAX_RETAINED_JOBS = 200;
+
+/** 只清理内存记录，不默认删除磁盘存档/面板文件（磁盘清理需显式调用）。 */
+export function cleanupJobs(
+  maxAge: number = 600_000,
+  maxRetained: number = MAX_RETAINED_JOBS,
+): void {
   const now = Date.now();
+  const isTerminal = (job: AgentJob) =>
+    job.status === "complete" || job.status === "error" || job.status === "killed";
+  const evict = (id: string) => {
+    state.jobs.delete(id);
+    for (const [key, panel] of state.taskPanels) {
+      if (panel.jobId === id) state.taskPanels.delete(key);
+    }
+  };
+
   for (const [id, job] of state.jobs) {
-    if (
-      (job.status === "complete" || job.status === "error" || job.status === "killed") &&
-      job.finishedAt &&
-      now - job.finishedAt > maxAge
-    ) {
-      state.jobs.delete(id);
-      for (const [key, panel] of state.taskPanels) {
-        if (panel.jobId === id) state.taskPanels.delete(key);
-      }
+    if (isTerminal(job) && job.finishedAt && now - job.finishedAt > maxAge) {
+      evict(id);
     }
   }
-  // 清理僵尸实例（关联 job 已不存在的）
+
+  const retained = Array.from(state.jobs.entries())
+    .filter(([, job]) => isTerminal(job))
+    .sort(
+      (a, b) =>
+        (a[1].finishedAt ?? a[1].createdAt) - (b[1].finishedAt ?? b[1].createdAt),
+    );
+  const cap = Math.max(0, Math.floor(maxRetained));
+  while (retained.length > cap) {
+    const oldest = retained.shift();
+    if (oldest) evict(oldest[0]);
+  }
+
+  // 清理僵尸实例（关联 job 已不存在的），并注销其消息接收器。
   for (const [key, inst] of state.instances) {
     if (!state.jobs.has(inst.jobId)) {
       try { inst.session.dispose(); } catch (e) { console.warn("[agent-bus] cleanupJobs dispose 失败:", e); }
       state.instances.delete(key);
+      unregisterMessageReceiver(inst.jobId, inst.taskId);
     }
+  }
+
+  // 防御性清理：没有对应活动实例的消息接收器不保留。
+  for (const key of Array.from(state.messageReceivers.keys())) {
+    if (!state.instances.has(key)) state.messageReceivers.delete(key);
   }
 }
 

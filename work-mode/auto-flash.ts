@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { Model, AssistantMessage } from "@earendil-works/pi-ai";
+import type { Model, AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsSection, updateSettings } from "../lib/settings-io.js";
 import { compactAuditValue, compactReviewValue, redactAuditText } from "../lib/audit-sanitize.js";
@@ -149,7 +149,7 @@ export function getAutoCustomPrompt(): string | undefined {
   if (sessionCustomPrompt !== undefined) {
     return sessionCustomPrompt.trim() || undefined;
   }
-  const value = getSettingsSection(AUTO_CUSTOM_PROMPT_SETTINGS_KEY, undefined);
+  const value = getSettingsSection<string | undefined>(AUTO_CUSTOM_PROMPT_SETTINGS_KEY, undefined);
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
@@ -405,10 +405,14 @@ export async function reviewWithAutoFlash(
     };
   }
   if (!auth.ok) {
+    // 失败分支的 error 字段在不同版本/来源的声明里未必收窄出来，稳妥取用。
+    const authError = (auth as { error?: unknown }).error;
     return {
       allow: false,
       modelRef,
-      reason: `AUTO_FLASH 认证不可用，已拒绝：${auth.error.slice(0, 300)}`,
+      reason: `AUTO_FLASH 认证不可用，已拒绝：${
+        typeof authError === "string" ? authError.slice(0, 300) : "unknown"
+      }`,
     };
   }
 
@@ -501,10 +505,15 @@ export async function reviewWithAutoFlash(
       const response = await provider.streamSimple(
         model,
         {
-          systemPrompt,
-          messages: [{ role: "user", content: prompt, timestamp: 0 }],
-          tools: [],
-        },
+          // streamSimple 接收的是归一化后的 TranscriptContext：系统提示词必须已经
+          // 是消息列表首条的 system 消息。内置适配器只从首条 system 消息读取提示词
+          // （见 anthropic-messages 的 getInitialSystemMessage 用法），此前把
+          // systemPrompt 放在顶层字段会让内置 provider 静默丢掉整段审批指令。
+          messages: [
+            { role: "system", content: systemPrompt, timestamp: 0 },
+            { role: "user", content: prompt, timestamp: 0 },
+          ],
+        } as TranscriptContext,
         {
           reasoning: "low",
           maxTokens: getAutoFlashMaxTokens(),

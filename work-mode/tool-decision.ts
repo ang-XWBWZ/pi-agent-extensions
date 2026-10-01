@@ -99,11 +99,11 @@ const AUTO_CONFIRM_TOOLS = new Set([
   "chrome_act",
 ]);
 
-export function inputOf(event: { input?: unknown }): Record<string, unknown> {
+export function inputOf(event: { toolName?: string; input?: unknown }): Record<string, unknown> {
   return (event.input ?? {}) as Record<string, unknown>;
 }
 
-export function commandOf(event: { input?: unknown }): string {
+export function commandOf(event: { toolName?: string; input?: unknown }): string {
   const command = inputOf(event).command;
   return typeof command === "string" ? command.trim() : "";
 }
@@ -144,7 +144,7 @@ export function purposeOf(event: { toolName?: string; input?: unknown }): string
 }
 
 export function pathOf(
-  event: { input?: unknown },
+  event: { toolName?: string; input?: unknown },
   cwd: string,
 ): string | undefined {
   const path = inputOf(event).path;
@@ -987,7 +987,9 @@ function decideToolCallBase(
         );
   }
 
-  if (path && isProtectedPath(path) && effect !== "read") {
+  // effect === "read" 已在本函数前段直接放行返回，此处不必再判读；保留反而
+  // 会形成一段永真条件，掩盖真实语义。
+  if (path && isProtectedPath(path)) {
     return deny(
       "destructive",
       `Protected paths cannot be modified by ${event.toolName}: ${path}`,
@@ -1000,7 +1002,8 @@ function decideToolCallBase(
   }
 
   if (usesAiApproval(profile)) {
-    if (effect === "read" || effect === "progress" || effect === "workspace_write") {
+    // 同上：effect 已不可能是 "read"。
+    if (effect === "progress" || effect === "workspace_write") {
       if (path && !isUnder(ctx.cwd, path)) {
         return allowWithFlash(effect, path, {
           command: target,

@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * check-results.ts — check_agent_results 工具注册
  */
@@ -11,6 +12,7 @@ import {
   getAgentTaskOutputInfo,
   waitForJob,
   claimDelivery,
+  finalizeDelivery,
   type AgentJob,
   type AgentTaskPanel,
 } from "../../lib/agent-bus.js";
@@ -80,7 +82,7 @@ function formatJobResult(job: AgentJob, elapsed: string, alreadyInjected = false
     : baseText;
 
   return {
-    content: [{ type: "text", text }],
+    content: [{ type: "text" as const, text }],
     details: {
       jobId: job.jobId,
       status: job.status,
@@ -89,6 +91,12 @@ function formatJobResult(job: AgentJob, elapsed: string, alreadyInjected = false
       failCount,
       total: job.total,
       autoInjected: job._autoInjected === true,
+      deliveryState: job.delivery?.state ?? "none",
+      // C08/E08：父会话不可用与总墙钟上限可观测。
+      ownerSessionId: job.ownerSessionId,
+      ownerUnavailableAt: job.ownerUnavailableAt,
+      wallClockSeconds: job.wallClockSeconds,
+      wallClockDeadline: job.wallClockDeadline,
       taskPanels: panels.map(panelDetails),
       results: job.results.map((r) => ({
           id: r.id,
@@ -107,7 +115,7 @@ function formatJobResult(job: AgentJob, elapsed: string, alreadyInjected = false
 }
 
 export function registerCheckResults(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "check_agent_results",
     label: "Check Agent Results",
     description:
@@ -177,14 +185,12 @@ export function registerCheckResults(pi: ExtensionAPI): void {
         const elapsed = job.finishedAt
           ? ((job.finishedAt - job.createdAt) / 1000).toFixed(1)
           : "?";
-        const wasAutoInjected = job._autoInjected === true || job.delivery?.state === "delivered";
-        claimDelivery(job, "poll");
-        if (job.delivery) {
-          job.delivery.state = "delivered";
-          job.delivery.deliveredAt = Date.now();
+        // E02：只有真正把终态结果返回给调用方时才确认消费。
+        if (!claimDelivery(job, "poll")) {
+          return formatJobResult(job, elapsed, true);
         }
-        job._autoInjected = true;
-        return formatJobResult(job, elapsed, wasAutoInjected);
+        finalizeDelivery(job, "poll");
+        return formatJobResult(job, elapsed, false);
       }
 
       if (!params.wait) {
@@ -226,23 +232,45 @@ export function registerCheckResults(pi: ExtensionAPI): void {
       const waitTimeout = (params.timeout ?? 600) * 1000;
       ctx.ui.notify(`⏳ 等待 Job ${params.jobId.slice(0, 8)} 完成...`, "info");
 
-      // 先行加锁锁定，避免任务完成时 onJobComplete 竞态排队触发重复的 followUp 消息
-      claimDelivery(job, "poll");
-      job._autoInjected = true;
-      job._autoInjectRequested = false;
-
-      const completedJob = await waitForJob(params.jobId, waitTimeout, signal);
+      // E03/F06：等待本身不占用消费权。只有拿到终态并把结果返回时才结算投递，
+      // 这样等待超时/取消后自动推送仍能接管，不会丢通知。
+      const waited = await waitForJob(params.jobId, waitTimeout, signal);
       ctx.ui.setStatus("sub-agent", undefined);
-      if (completedJob.delivery) {
-        completedJob.delivery.state = "delivered";
-        completedJob.delivery.deliveredAt = Date.now();
+
+      const terminal =
+        waited.status === "complete" ||
+        waited.status === "error" ||
+        waited.status === "killed";
+      if (!terminal) {
+        const elapsed = ((Date.now() - waited.createdAt) / 1000).toFixed(1);
+        return {
+          content: [
+            {
+              type: "text",
+              text: [
+                `⏳ Job ${params.jobId.slice(0, 8)} 在等待窗口内仍未完成（wait_timeout）— ${waited.completed}/${waited.total} 完成 (${elapsed}s)`,
+                `消费权未被占用：任务完成后仍会自动推送结果，也可稍后再次查询。`,
+              ].join("\n"),
+            },
+          ],
+          details: {
+            jobId: params.jobId,
+            status: "wait_timeout",
+            completed: waited.completed,
+            total: waited.total,
+            deliveryState: waited.delivery?.state ?? "none",
+          },
+        };
       }
-      completedJob._autoInjected = true;
-      const elapsed = completedJob.finishedAt
-        ? ((completedJob.finishedAt - completedJob.createdAt) / 1000).toFixed(1)
+
+      const elapsed = waited.finishedAt
+        ? ((waited.finishedAt - waited.createdAt) / 1000).toFixed(1)
         : "?";
-      // 既然由 check_agent_results 工具主动等待并消费，直接返回结果，不再显示被注入的虚假摘要
-      return formatJobResult(completedJob, elapsed, false);
+      if (!claimDelivery(waited, "poll")) {
+        return formatJobResult(waited, elapsed, true);
+      }
+      finalizeDelivery(waited, "poll");
+      return formatJobResult(waited, elapsed, false);
     },
   });
 }

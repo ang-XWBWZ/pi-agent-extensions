@@ -8,7 +8,8 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { enqueueFrontend, registerFrontendProcessor } from "./agent-bus.js";
-import { getExecutionContext, isPreauthorizedContext } from "./execution-context.js";
+import { getExecutionContext } from "./execution-context.js";
+import { currentSessionRuntime } from "./session-runtime.js";
 
 // ---- 全局单例 ----
 
@@ -28,7 +29,10 @@ export interface ConfirmRequest {
   label: string;
   target: string;
   options: string[];
+  /** A07：真实源会话 ID。 */
   sessionId: string;
+  /** A07：归属的根/父会话 ID，用于把确认路由到对应父 UI。 */
+  ownerSessionId?: string;
 }
 
 export interface ConfirmResponse {
@@ -46,9 +50,11 @@ export function requestConfirm(
   timeoutMs: number = 60_000,
 ): Promise<string | undefined> {
   const ctx = getExecutionContext();
-  if (isPreauthorizedContext(ctx)) {
-    return Promise.resolve(options[0]);
-  }
+  // A07：移除“Auto/预授权就直接选择第一项”的隐式批准捷径。所有确认边界都
+  // 必须走真实的 UI/审查路径，由对应父会话决定。
+  const runtime = currentSessionRuntime();
+  const sessionId = ctx.sessionId;
+  const ownerSessionId = runtime?.parentSessionId ?? ctx.sessionId;
 
   const reqId = randomUUID();
   return new Promise((resolve) => {
@@ -65,7 +71,7 @@ export function requestConfirm(
 
     globalBus.on("confirm-response", handler);
     globalBus.emit("confirm-request", {
-      reqId, type, label, target, options, sessionId: "sub",
+      reqId, type, label, target, options, sessionId, ownerSessionId,
     } satisfies ConfirmRequest);
   });
 }

@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "./lib/capability-dispatch.js";
 /**
  * long-attention-ps.ts — 长程注意力 PS 注入器 (v1)
  *
@@ -189,6 +190,17 @@ function extractKeywords(message: string): string[] {
   return [...kws];
 }
 
+/**
+ * AgentMessage 是联合类型，并非每个成员都带 content（例如 BashExecutionMessage），
+ * 直接访问会被类型系统拒绝。统一走这个取值器。
+ */
+function messageContent(message: unknown): unknown {
+  return (message as { content?: unknown } | undefined)?.content;
+}
+
+/** long_attention_config_ps 的结果 details：失败分支不带 old/next，因此全部可选。 */
+type PsConfigChangeDetails = { key?: string; old?: unknown; next?: unknown };
+
 function parsePhase(raw: unknown): PsPhase {
   const s = String(raw ?? "");
   return (["hot", "warm", "cold", "archived"] as string[]).includes(s) ? s as PsPhase : "warm";
@@ -214,6 +226,26 @@ function parseExpires(raw: unknown): PsExpires {
   const s = String(raw ?? "task");
   const valid: PsExpires[] = ["turn", "task", "phase", "session", "project", "persistent"];
   return valid.includes(s as PsExpires) ? s as PsExpires : "task";
+}
+
+/**
+ * 解析 `/ps` 的子命令参数。
+ *
+ * 命令 handler 的契约是 `handler(args: string, ctx)`（内核在
+ * agent-session 的 _tryExecuteExtensionCommand 里只截取命令名之后的原始字符串），
+ * 因此这里需要自己切分位置参数与 `--key=value` 形式的选项，
+ * 不能假设 args 已经是解析好的对象。
+ */
+function parsePsArgs(raw: string): { _: string[]; flags: Record<string, string | undefined> } {
+  const positional: string[] = [];
+  const flags: Record<string, string | undefined> = {};
+  for (const token of String(raw ?? "").trim().split(/\s+/)) {
+    if (!token) continue;
+    const match = /^--([A-Za-z][\w-]*)(?:=(.*))?$/.exec(token);
+    if (match) flags[match[1]] = match[2] ?? "true";
+    else positional.push(token);
+  }
+  return { _: positional, flags };
 }
 
 function evictOne(st: PsState): void {
@@ -395,7 +427,7 @@ export default function (pi: ExtensionAPI) {
 
   const st = loadState();
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "long_attention_add_ps",
     label: "Long Attention Add PS",
     description: "添加一条长程注意力 PS。用于保存主 agent 后续需要被短提醒的约束、决策、风险或未闭环事项。",
@@ -439,14 +471,19 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "long_attention_list_ps",
     label: "Long Attention List PS",
     description: "查看长程注意力 PS 列表和当前注入配置。",
     parameters: Type.Object({}),
     async execute(_tcid, _params, signal) {
       if (signal?.aborted) throw new Error("aborted");
-      if (st.items.length === 0) return { content: [{ type: "text", text: "🧠 长程 PS 为空" }] };
+      if (st.items.length === 0) {
+        return {
+          content: [{ type: "text", text: "🧠 长程 PS 为空" }],
+          details: { items: st.items, config: st.config, sessionRounds: st.sessionRounds },
+        };
+      }
       const lines = st.items.map((it, i) => {
         const off = it.enabled ? "" : " disabled";
         const kws = it.keywords.length > 0 ? ` kw=${it.keywords.join(",")}` : "";
@@ -465,7 +502,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "long_attention_clear_ps",
     label: "Long Attention Clear PS",
     description: "清空或按 expires 清理长程注意力 PS。",
@@ -490,7 +527,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "long_attention_config_ps",
     label: "Long Attention Config PS",
     description: "查看或调整长程注意力 PS 注入配置。",
@@ -498,16 +535,28 @@ export default function (pi: ExtensionAPI) {
       key: Type.Optional(Type.String({ description: "配置项名" })),
       value: Type.Optional(Type.Any({ description: "新值" })),
     }),
-    async execute(_tcid, params, signal) {
+    // 显式标注：三个分支的 details 形状不同，靠推断会把 TDetails 固定成第一个分支的空对象类型。
+    async execute(
+      _tcid,
+      params,
+      signal,
+    ): Promise<{ content: { type: "text"; text: string }[]; details: PsConfigChangeDetails }> {
       if (signal?.aborted) throw new Error("aborted");
-      if (!params.key) return { content: [{ type: "text", text: `🧠 PS 配置\n${JSON.stringify(st.config, null, 2)}` }] };
+      if (!params.key) {
+        return {
+          content: [{ type: "text", text: `🧠 PS 配置\n${JSON.stringify(st.config, null, 2)}` }],
+          details: {},
+        };
+      }
       const key = String(params.key) as keyof PsConfig;
-      if (!(key in st.config)) return { content: [{ type: "text", text: `❌ 未知配置: ${params.key}` }] };
+      if (!(key in st.config)) {
+        return { content: [{ type: "text", text: `❌ 未知配置: ${params.key}` }], details: {} };
+      }
       const old = st.config[key];
       let next: unknown = params.value;
       if (typeof old === "number") next = Math.max(0, Number(next));
       if (typeof old === "boolean") next = next === true || next === "true";
-      (st.config as Record<string, unknown>)[key] = next;
+      (st.config as unknown as Record<string, unknown>)[key] = next;
       if (key === "maxItems") while (st.items.length > st.config.maxItems) evictOne(st);
       if (key === "maxCharsPerItem") for (const it of st.items) it.message = trimText(it.message, st.config.maxCharsPerItem);
       return { content: [{ type: "text", text: `✅ ${key}: ${old} → ${next}` }], details: { key, old, next } };
@@ -526,20 +575,21 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("ps", {
     description: "长程注意力 PS 管理: /ps add|list|clear|config ...",
     handler: async (args, ctx) => {
-      const sub = args._?.[0] ?? "list";
+      const { _, flags } = parsePsArgs(args);
+      const sub = _[0] ?? "list";
       switch (sub) {
         case "add": {
-          const message = args._?.slice(1).join(" ") || args.text || "";
+          const message = _.slice(1).join(" ");
           if (!message.trim()) { ctx.ui.notify("用法: /ps add <内容> [--type=prior_decision] [--priority=high] [--expires=project] [--phase=warm] [--mode=silent]", "warning"); return; }
-          const keywords = typeof args.keywords === "string"
-            ? String(args.keywords).split(",").map((s) => s.trim()).filter(Boolean)
+          const keywords = typeof flags.keywords === "string"
+            ? flags.keywords.split(",").map((s) => s.trim()).filter(Boolean)
             : undefined;
           const item = addPs(st, message, {
-            type: parseType(args.type),
-            priority: parsePriority(args.priority),
-            expires: parseExpires(args.expires),
-            phase: args.phase ? parsePhase(args.phase) : undefined,
-            mode: parseMode(args.mode),
+            type: parseType(flags.type),
+            priority: parsePriority(flags.priority),
+            expires: parseExpires(flags.expires),
+            phase: flags.phase ? parsePhase(flags.phase) : undefined,
+            mode: parseMode(flags.mode),
             keywords,
             source: "user",
           });
@@ -553,7 +603,7 @@ export default function (pi: ExtensionAPI) {
           break;
         }
         case "clear": {
-          const scope = String(args._?.[1] ?? "all");
+          const scope = String(_[1] ?? "all");
           const before = st.items.length;
           if (scope === "all") st.items.length = 0;
           else st.items = st.items.filter((it) => it.expires !== scope);
@@ -571,7 +621,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", (event, _ctx) => {
-    const existingIdx = event.messages.findIndex((m) => typeof m.content === "string" && m.content.startsWith(MARKER));
+    const existingIdx = event.messages.findIndex((m) => {
+      const content = messageContent(m);
+      return typeof content === "string" && content.startsWith(MARKER);
+    });
     const contextText = recentContextText(event.messages as Array<{ role?: string; content?: unknown }>);
     const selected = selectPs(st, contextText);
 
@@ -585,9 +638,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const currentText = formatPs(st, selected);
-    const existingText = existingIdx >= 0 && typeof event.messages[existingIdx]?.content === "string"
-      ? event.messages[existingIdx]?.content
-      : undefined;
+    const existingContent = existingIdx >= 0 ? messageContent(event.messages[existingIdx]) : undefined;
+    const existingText = typeof existingContent === "string" ? existingContent : undefined;
     if (existingText === currentText) return;
 
     for (const it of selected) {

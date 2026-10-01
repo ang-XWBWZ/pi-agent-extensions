@@ -471,7 +471,7 @@ export function setupRequirementsContinuity(pi: ExtensionAPI): void {
             ? asRecord(existingAnchor)?.timestamp
             : 0,
         } as any,
-      ] as typeof event.messages,
+      ],
     };
   });
 }

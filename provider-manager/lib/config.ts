@@ -30,7 +30,7 @@ export interface CustomProviderEntry {
   customStream?: boolean;
   customStreamExplicit?: boolean;
   supportsUsageInStreaming?: boolean;
-  streamCompatMode?: "builtin" | "finish-reason-fallback";
+  streamCompatMode?: "builtin" | "finish-reason-fallback" | "auto";
 }
 
 export interface TestResult {
@@ -61,8 +61,10 @@ export function readCustomProviders(): Record<string, CustomProviderEntry> {
     const v = val as Record<string, unknown>;
     if (v && typeof v.baseUrl === "string" && typeof v.apiKey === "string") {
       const streamCompatVal = v.streamCompatMode;
-      const streamCompatMode: "builtin" | "finish-reason-fallback" | undefined =
-        streamCompatVal === "builtin" || streamCompatVal === "finish-reason-fallback"
+      const streamCompatMode: "builtin" | "finish-reason-fallback" | "auto" | undefined =
+        streamCompatVal === "builtin" ||
+        streamCompatVal === "finish-reason-fallback" ||
+        streamCompatVal === "auto"
           ? streamCompatVal
           : undefined;
       const openaiApiModeVal = v.openaiApiMode;

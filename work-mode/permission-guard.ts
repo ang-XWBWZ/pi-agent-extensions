@@ -1,3 +1,4 @@
+import { approveCapabilityCall, discardCapabilityApproval, resolveCapabilityCall } from "../lib/capability-dispatch.js";
 /**
  * Runtime authorization and audit.
  *
@@ -12,7 +13,7 @@ import {
   compactAuditValue,
   redactAuditText,
 } from "../lib/audit-sanitize.js";
-import { getExecutionContext, setExecutionContext } from "../lib/execution-context.js";
+import { getExecutionContext, setExecutionContext, withSessionScope } from "../lib/execution-context.js";
 import { type ConversationPhase, type PlanStep } from "./types.js";
 import { confirmAndRemember, showAutoFlashFallbackConfirm } from "./confirm-dialog.js";
 import { formatStatelessPlanContext, reviewWithAutoFlash, type AutoFlashReviewRequest } from "./auto-flash.js";
@@ -59,7 +60,19 @@ interface PendingAudit {
   effect: ToolEffect;
   target?: string;
   startedAt: number;
+  /** A06：操作开始时的归属快照，结果阶段沿用，不读取最新全局归属。 */
+  sessionId?: string;
+  goalId?: string;
+  phase: ConversationPhase;
+  autonomy: string;
+  autoAll: boolean;
 }
+
+/**
+ * applyDecision 的解析结果，形状与内核 ToolCallEventResult 一致。
+ * 显式标注是必需的：该函数与调用它的 tool_call 处理器之间存在返回类型推断循环。
+ */
+type DecisionResolution = { block?: boolean; reason?: string; terminate?: boolean };
 
 async function applyDecision(
   decision: ToolDecision,
@@ -67,7 +80,7 @@ async function applyDecision(
   ctx: ExtensionContext,
   state: PermissionState,
   callbacks?: PermissionCallbacks,
-) {
+): Promise<DecisionResolution | undefined> {
   if (decision.warning) {
     ctx.ui.notify(decision.warning, "warning");
   }
@@ -299,7 +312,27 @@ export function setupPermissionGuard(
 ) {
   const pendingAudit = new Map<string, PendingAudit>();
 
-  pi.on("tool_call", async (event, ctx) => {
+  pi.on("tool_call", async (outerEvent, ctx) => withSessionScope(ctx.sessionManager, async () => {
+    let routed: ReturnType<typeof resolveCapabilityCall> | undefined;
+    if (outerEvent.toolName === "call_capability") {
+      try { routed = resolveCapabilityCall(outerEvent.input, ctx); }
+      catch (error) {
+        const reason = redactAuditText(error instanceof Error ? error.message : String(error));
+        const executionContext = getExecutionContext(ctx.sessionManager);
+        pi.appendEntry("work-audit", {
+          kind: "tool_blocked", timestamp: Date.now(),
+          sessionId: executionContext.sessionId, goalId: executionContext.goalId,
+          phase: state.phase, autonomy: executionContext.autonomy,
+          autoAll: executionContext.approval.autoAll,
+          toolName: outerEvent.toolName, effect: "unknown",
+          input: compactAuditValue(outerEvent.input), reason,
+        });
+        return { block: true, reason };
+      }
+    }
+    const event = routed
+      ? { ...outerEvent, toolName: routed.operation, input: routed.input }
+      : outerEvent;
     const executionContext = getExecutionContext();
     const profile = profileFromPhase({
       phase: state.phase,
@@ -309,6 +342,7 @@ export function setupPermissionGuard(
     const decision = decideToolCall(profile, event, ctx);
     const result = await applyDecision(decision, event, ctx, state, callbacks);
     const blocked = Boolean(result?.block);
+    if (routed && !blocked) approveCapabilityCall(ctx, event.toolCallId, routed);
 
     if (
       decision.effect !== "read" ||
@@ -325,8 +359,12 @@ export function setupPermissionGuard(
             ? "tool_approved"
             : "tool_started",
         timestamp: Date.now(),
+        // A06：归属在操作开始时捕获，结果阶段不再重新读取全局。
+        sessionId: executionContext.sessionId,
+        goalId: executionContext.goalId,
         phase: state.phase,
         autonomy: executionContext.autonomy,
+        autoAll: executionContext.approval.autoAll,
         toolName: event.toolName,
         effect: decision.effect,
         target: decision.target
@@ -347,20 +385,30 @@ export function setupPermissionGuard(
         effect: decision.effect,
         target: decision.target,
         startedAt: Date.now(),
+        sessionId: executionContext.sessionId,
+        goalId: executionContext.goalId,
+        phase: state.phase,
+        autonomy: executionContext.autonomy,
+        autoAll: executionContext.approval.autoAll ?? false,
       });
     }
     return result;
-  });
+  }));
 
-  pi.on("tool_result", (event, ctx) => {
+  pi.on("tool_result", (event, ctx) => withSessionScope(ctx.sessionManager, () => {
+    discardCapabilityApproval(ctx, event.toolCallId);
     const pending = pendingAudit.get(event.toolCallId);
     if (pending) {
       pendingAudit.delete(event.toolCallId);
       pi.appendEntry("work-audit", {
         kind: event.isError ? "tool_failed" : "tool_finished",
         timestamp: Date.now(),
-        phase: state.phase,
-        autonomy: getExecutionContext().autonomy,
+        // A06：沿用操作开始时的归属，即使期间另一个会话切换了模式/goal。
+        sessionId: pending.sessionId,
+        goalId: pending.goalId,
+        phase: pending.phase,
+        autonomy: pending.autonomy,
+        autoAll: pending.autoAll,
         toolName: pending.toolName,
         effect: pending.effect,
         target: pending.target
@@ -386,6 +434,6 @@ export function setupPermissionGuard(
       `工具调用失败（${shortPreview}）；步骤“${state.planSteps[currentIndex].text}”仍保持进行中，等待诊断或重试。`,
       "warning",
     );
-  });
+  }));
 
 }

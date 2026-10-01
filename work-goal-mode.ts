@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "./lib/capability-dispatch.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -14,6 +15,7 @@ import {
 import {
   getExecutionContext,
   setExecutionContext,
+  withSessionScope,
 } from "./lib/execution-context.js";
 import {
   abortWorkGoal,
@@ -78,8 +80,8 @@ function summarizeWorkGoal(goal: WorkGoalState): string {
   ].join("\n");
 }
 
-function activeWorkGoalOrMessage() {
-  const current = getExecutionContext();
+function activeWorkGoalOrMessage(sessionManager?: object) {
+  const current = getExecutionContext(sessionManager);
   const goal =
     (current.goalId ? getWorkGoal(current.goalId) : null) ??
     getActiveWorkGoal();
@@ -92,10 +94,13 @@ function activeWorkGoalOrMessage() {
   return goal;
 }
 
-function shouldRecordGenericTool(toolName: string): boolean {
+function shouldRecordGenericTool(
+  toolName: string,
+  sessionManager?: object,
+): boolean {
   if (DEDICATED_COMMAND_TOOLS.has(toolName)) return false;
   if (WORK_GOAL_TOOLS.has(toolName)) return false;
-  const ctx = getExecutionContext();
+  const ctx = getExecutionContext(sessionManager);
   return ctx.ledger === "work_goal";
 }
 
@@ -154,9 +159,9 @@ Provides structured audit logging and progress tracking for execution in WORK mo
 - Recording execution never expands or modifies current approval authority.`,
   });
 
-  pi.on("tool_call", (event, ctx) => {
-    if (!shouldRecordGenericTool(event.toolName)) return;
-    const executionContext = getExecutionContext();
+  pi.on("tool_call", (event, ctx) => withSessionScope(ctx.sessionManager, () => {
+    if (!shouldRecordGenericTool(event.toolName, ctx.sessionManager)) return;
+    const executionContext = getExecutionContext(ctx?.sessionManager);
     const goal = executionContext.goalId
       ? getWorkGoal(executionContext.goalId)
       : getActiveWorkGoal();
@@ -182,7 +187,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         ),
       },
     });
-  });
+  }));
 
   pi.on("tool_result", (event) => {
     const pending = pendingToolCalls.get(event.toolCallId);
@@ -204,7 +209,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
     });
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "work_goal_start",
     label: "work_goal_start",
     description:
@@ -226,7 +231,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
       });
     },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
-      const current = getExecutionContext();
+      const current = getExecutionContext(ctx?.sessionManager);
       if (current.phase !== "work") {
         return {
           content: [
@@ -250,12 +255,12 @@ Provides structured audit logging and progress tracking for execution in WORK mo
           details: { error: "active_goal_exists", goal: active },
         };
       }
-      const goal = createWorkGoal({
+      const goal = withSessionScope(ctx?.sessionManager, () => createWorkGoal({
         goal: redactAuditText(params.goal),
         title: params.title ? redactAuditText(params.title) : undefined,
         phase: "work",
         autonomy: current.autonomy,
-      });
+      }));
       const execCtx: ExecutionContext = {
         ...current,
         ledger: "work_goal",
@@ -265,7 +270,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
           startedAt: current.runtime.startedAt,
         },
       };
-      setExecutionContext(execCtx);
+      setExecutionContext(execCtx, ctx?.sessionManager);
       pi.appendEntry("work-goal-state", {
         goalId: goal.id,
         active: true,
@@ -300,7 +305,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "work_goal_status",
     label: "work_goal_status",
     description: "Show the current Work goal ledger status and recent logs.",
@@ -314,8 +319,8 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         isError: isToolResultError(result, context),
       });
     },
-    async execute() {
-      const goal = activeWorkGoalOrMessage();
+    async execute(_tcid, _params, _signal, _onUpdate, ctx) {
+      const goal = activeWorkGoalOrMessage(ctx?.sessionManager);
       if (!("logs" in goal)) return goal as any;
       const recent = goal.logs.slice(-10).map(formatLog);
       return {
@@ -340,7 +345,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "work_goal_log",
     label: "work_goal_log",
     description: "Show the current Work goal ledger, optionally limited to the most recent N entries.",
@@ -358,8 +363,8 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         isError: isToolResultError(result, context),
       });
     },
-    async execute(_tcid, params) {
-      const goal = activeWorkGoalOrMessage();
+    async execute(_tcid, params, _signal, _onUpdate, ctx) {
+      const goal = activeWorkGoalOrMessage(ctx?.sessionManager);
       if (!("logs" in goal)) return goal as any;
       const limit =
         params.limit != null && Number.isFinite(params.limit) && params.limit > 0
@@ -381,7 +386,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "work_goal_finish",
     label: "work_goal_finish",
     description: "Finish the active Work goal ledger and write a completion summary.",
@@ -400,7 +405,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
       });
     },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
-      const goal = activeWorkGoalOrMessage();
+      const goal = activeWorkGoalOrMessage(ctx?.sessionManager);
       if (!("logs" in goal)) return goal as any;
       const summary = redactAuditText(
         params.summary?.trim() || summarizeWorkGoal(goal),
@@ -409,13 +414,13 @@ Provides structured audit logging and progress tracking for execution in WORK mo
         type: "work_goal_finished",
         message: summary,
       });
-      const finished = finishWorkGoal(goal.id, summary);
-      const current = getExecutionContext();
+      const finished = withSessionScope(ctx?.sessionManager, () => finishWorkGoal(goal.id, summary));
+      const current = getExecutionContext(ctx?.sessionManager);
       setExecutionContext({
         ...current,
         ledger: "off",
         goalId: undefined,
-      });
+      }, ctx?.sessionManager);
       pi.appendEntry("work-goal-state", {
         goalId: goal.id,
         active: false,
@@ -433,7 +438,7 @@ Provides structured audit logging and progress tracking for execution in WORK mo
     },
   });
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "work_goal_abort",
     label: "work_goal_abort",
     description:
@@ -453,18 +458,18 @@ Provides structured audit logging and progress tracking for execution in WORK mo
       });
     },
     async execute(_tcid, params, _signal, _onUpdate, ctx) {
-      const goal = activeWorkGoalOrMessage();
+      const goal = activeWorkGoalOrMessage(ctx?.sessionManager);
       if (!("logs" in goal)) return goal as any;
       const reason = redactAuditText(
         params.reason?.trim() || "Work goal aborted",
       );
-      const aborted = abortWorkGoal(goal.id, reason);
-      const current = getExecutionContext();
+      const aborted = withSessionScope(ctx?.sessionManager, () => abortWorkGoal(goal.id, reason));
+      const current = getExecutionContext(ctx?.sessionManager);
       setExecutionContext({
         ...current,
         ledger: "off",
         goalId: undefined,
-      });
+      }, ctx?.sessionManager);
       pi.appendEntry("work-goal-state", {
         goalId: goal.id,
         active: false,

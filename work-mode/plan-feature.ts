@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../lib/capability-dispatch.js";
 /**
  * Structured execution progress for Work.
  *
@@ -111,7 +112,7 @@ export function setupPlanFeature(
       ctx.ui.notify("执行计划已清除", "info");
     }
     persistPlan(false);
-    resetAutoSteps();
+    resetAutoSteps(ctx.sessionManager);
   }
 
   function getCurrentStepIndex(): number {
@@ -137,7 +138,7 @@ export function setupPlanFeature(
     s.planFullText = fullText;
     updatePlanPanel(ctx);
     persistPlan(false);
-    resetAutoSteps();
+    resetAutoSteps(ctx.sessionManager);
   }
 
   pi.on("session_start", (_event, ctx) => {
@@ -254,7 +255,7 @@ export function setupPlanFeature(
         "错误: 已有步骤正在进行；请先用 advance 结束它。",
     })[error] ?? `错误: 无效的计划状态转换 (${error})`;
 
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "manage_plan",
     label: "Manage Plan",
     description:
@@ -378,7 +379,7 @@ export function setupPlanFeature(
           updatePlanPanel(ctx);
           persistPlan(justCompleted);
           if (justCompleted) {
-            resetAutoSteps();
+            resetAutoSteps(ctx.sessionManager);
             ctx.ui.notify(
               `执行计划已全部完成（共 ${s.planSteps.length} 步）`,
               "info",
@@ -427,7 +428,7 @@ export function setupPlanFeature(
           updatePlanPanel(ctx);
           persistPlan(justCompleted);
           if (justCompleted) {
-            resetAutoSteps();
+            resetAutoSteps(ctx.sessionManager);
             ctx.ui.notify(
               `执行计划已全部完成（共 ${s.planSteps.length} 步）`,
               "info",
@@ -512,7 +513,7 @@ export function setupPlanFeature(
             }
           }
           if (s.planSteps.length === 0) {
-            resetAutoSteps();
+            resetAutoSteps(ctx.sessionManager);
           }
           updatePlanPanel(ctx);
           persistPlan(false);
@@ -598,7 +599,7 @@ export function setupPlanFeature(
           }
           updatePlanPanel(ctx);
           persistPlan(true);
-          resetAutoSteps();
+          resetAutoSteps(ctx.sessionManager);
           ctx.ui.notify(
             `执行计划已全部完成（共 ${s.planSteps.length} 步）`,
             "info",

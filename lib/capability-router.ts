@@ -1,14 +1,11 @@
-/**
- * capability-router.ts — 渐进式能力路由器与 PCS (Progressive Capability Specification) 注册中枢
- *
- * 核心设计目标：
- * 1. 极致降低首轮初始提示词（System Prompt + Tools Schema 从 23K+ 降至 ~3K）；
- * 2. 100% 保护大模型前缀缓存（Prompt Caching）：系统提示词字节级冻结，新能力通过尾部 tool_result 与 deferred tools 挂载；
- * 3. 保证大模型激活有效性：首轮提供确定性元索引卡，支持 JIT load_capability 激活。
+/** Capability catalog and session-local loading.
+ * Native tool definitions are fixed; guides and operation schemas are returned
+ * at the transcript tail. Loading never registers or mounts native tools.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ConversationPhase } from "./workflow-types.js";
+import { currentSessionRuntime, getSessionRuntime } from "./session-runtime.js";
 
 export interface CapabilityManifest {
   /** 唯一标识符，全系统唯一，如 "parallel_agent", "work_goal" */
@@ -64,7 +61,9 @@ export const BASELINE_CORE_TOOLS = [
   "cmd",
   "powershell",
   "manage_plan",
+  "manage_requirements",
   "load_capability",
+  "call_capability",
 ];
 
 export const CHAT_CORE_TOOLS = ["read", "load_capability"];
@@ -86,6 +85,8 @@ export interface RegistryCatalog {
 export interface CapabilityActivationState {
   activated: Set<string>;
   activating: Map<string, Promise<void>>;
+  /** Fixed native tool set initialized once per session. */
+  mountedTools: Set<string>;
 }
 
 const CATALOG_KEY = "__pi_capability_catalog";
@@ -95,6 +96,7 @@ export function createCapabilityActivationState(): CapabilityActivationState {
   return {
     activated: new Set<string>(),
     activating: new Map<string, Promise<void>>(),
+    mountedTools: new Set<string>(),
   };
 }
 
@@ -109,7 +111,20 @@ function getRegistryCatalog(): RegistryCatalog {
   return globals[CATALOG_KEY] as RegistryCatalog;
 }
 
-export function getDefaultActivationState(): CapabilityActivationState {
+/**
+ * 返回当前能力激活状态。
+ *
+ * A04：优先返回当前会话自己的激活状态（通过 AsyncLocalStorage 解析）；只有
+ * 没有会话作用域时才退回全局兼容状态。因此子会话启动/销毁不会清空父会话
+ * 的已激活能力。
+ */
+export function getDefaultActivationState(
+  sessionManager?: object,
+): CapabilityActivationState {
+  const runtime = sessionManager
+    ? getSessionRuntime(sessionManager)
+    : currentSessionRuntime();
+  if (runtime) return runtime.capabilityActivation;
   const globals = globalThis as Record<string, unknown>;
   if (!globals[ACTIVATION_KEY]) {
     globals[ACTIVATION_KEY] = createCapabilityActivationState();
@@ -193,11 +208,12 @@ export function resetActivatedCapabilities(
 ): void {
   activation.activated.clear();
   activation.activating.clear();
+  activation.mountedTools.clear();
 }
 
 /**
  * 生成首轮不可变能力索引卡（XML 格式）
- * 按照 id 字典序排序，保证输出字符串绝对恒定，确保大模型 System Prompt 前缀缓存 100% 命中
+ * 按照 id 字典序排序，仅供兼容调用展示；不再进入系统提示词，也不承诺服务端缓存命中
  */
 export function formatImmutableCapabilityIndex(): string {
   const caps = getRegisteredCapabilities().sort((a, b) => a.id.localeCompare(b.id));
@@ -235,7 +251,7 @@ export function formatFullCapabilityCatalog(): string {
     "  - manage_plan: WORK 阶段多步骤任务执行计划管理 (新增/更新/完成/重排步骤)",
     "  - load_capability: 按需激活进阶能力子系统 (load_capability({ capability: '<id>' }))",
     "",
-    "【可用进阶能力清单 (通过 load_capability 按需挂载)】",
+    "【可用进阶能力清单 (通过 load_capability 加载说明)】",
   ];
 
   if (caps.length === 0) {
@@ -260,7 +276,7 @@ export function formatFullCapabilityCatalog(): string {
 
   lines.push("--------------------------------------------------------------------------------");
   lines.push("使用方式:");
-  lines.push("  - AI 调用工具: load_capability({ capability: '<id>' }) 挂载指定能力及工具");
+  lines.push("  - AI 调用工具: load_capability({ capability: '<id>' }) 加载指定能力说明，然后通过 call_capability 调用操作");
   lines.push("  - AI 查询清单: load_capability({ action: 'list' }) 查看最新全量能力清单");
   lines.push("  - 用户终端命令: /capabilities 或 /caps 随时查看此功能卡片");
   lines.push("================================================================================");
@@ -268,7 +284,7 @@ export function formatFullCapabilityCatalog(): string {
 }
 
 /**
- * 激活指定能力（纯追加式，完全不碰 System Prompt，前缀缓存安全）
+ * 激活执行层能力；不修改模型请求的工具定义或系统提示词
  */
 export async function activateCapability(
   id: string,
@@ -276,6 +292,7 @@ export async function activateCapability(
   ctx: ExtensionContext,
   currentPhase: ConversationPhase = "work",
   activation: CapabilityActivationState = getDefaultActivationState(),
+  sessionManager?: object,
 ): Promise<ActivationResult> {
   const catalog = getRegistryCatalog();
   const manifest = catalog.manifests.get(id);
@@ -320,12 +337,11 @@ export async function activateCapability(
 
   activation.activated.add(id);
 
-  // 阶段感知投影：按当前 phase 重新计算并挂载活跃工具集合
-  syncActiveToolsForPhase(currentPhase, pi, activation);
+  // Loading changes execution availability only. Never change request-level tools.
 
   return {
     success: true,
-    message: `能力 [${manifest.name}] 激活成功，已挂载工具: [${manifest.tools.join(", ")}]`,
+    message: `能力 [${manifest.name}] 激活成功，可通过 call_capability 调用操作: [${manifest.tools.join(", ")}]`,
     doc: manifest.usageDoc,
     activatedTools: manifest.tools,
   };
@@ -337,6 +353,7 @@ export async function activateCapability(
 export function computeActiveTools(
   phase: ConversationPhase,
   activation: CapabilityActivationState = getDefaultActivationState(),
+  allowedTools?: ReadonlySet<string>,
 ): string[] {
   const coreList =
     phase === "chat"
@@ -359,17 +376,35 @@ export function computeActiveTools(
     }
   }
 
+  // A08：阶段允许集 ∩ 已激活能力 ∩ 子任务工具上限。上限之外的工具（包括
+  // 派发与生命周期管理安全网）在激活能力后也不得被重新打开。
+  if (allowedTools) {
+    for (const tool of Array.from(activeTools)) {
+      if (!allowedTools.has(tool)) activeTools.delete(tool);
+    }
+  }
+
   return Array.from(activeTools);
 }
 
-/**
- * 阶段流转时的活跃工具白名单同步
+/** Initialize a phase-independent native loadout once. Permissions are checked
+ * at execution; capability loads never change this list or its order.
  */
 export function syncActiveToolsForPhase(
   phase: ConversationPhase,
   pi: ExtensionAPI,
   activation: CapabilityActivationState = getDefaultActivationState(),
+  sessionManager?: object,
 ): void {
   if (typeof pi.setActiveTools !== "function") return;
-  pi.setActiveTools(computeActiveTools(phase, activation));
+  const runtime = sessionManager
+    ? getSessionRuntime(sessionManager)
+    : currentSessionRuntime();
+  // Fixed for the entire session, irrespective of phase and loaded capabilities.
+  // Execution-time checks enforce phase and the logical child tool ceiling.
+  const fixed = BASELINE_CORE_TOOLS.filter((tool) =>
+    !runtime?.allowedTools || runtime.allowedTools.has(tool));
+  if (activation.mountedTools.size > 0) return;
+  for (const tool of fixed) activation.mountedTools.add(tool);
+  pi.setActiveTools(fixed);
 }

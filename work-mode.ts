@@ -15,7 +15,7 @@ import {
 } from "./work-mode/requirements-feature.js";
 import { setupRequirementsContinuity } from "./work-mode/requirements-continuity.js";
 import { ensureAutoFlashSystemContext, registerAutoFlashCommand } from "./work-mode/auto-flash.js";
-import { getExecutionContext, setExecutionContext } from "./lib/execution-context.js";
+import { getExecutionContext, setExecutionContext, withSessionScope } from "./lib/execution-context.js";
 
 // ============================================================
 // Entry
@@ -54,6 +54,7 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Shared callbacks ----
   function persist(ctx: ExtensionContext) {
+    withSessionScope(ctx.sessionManager, () => {
     const executionContext = getExecutionContext();
     pi.appendEntry("work-phase-state", {
       phase: s.phase,
@@ -64,9 +65,11 @@ export default function (pi: ExtensionAPI) {
       "work-mode",
       `${s.phase.toUpperCase()} · ${executionContext.approval.autoAll ? "AUTO_ALL" : executionContext.autonomy.toUpperCase()}`,
     );
+    });
   }
 
   function setPhase(phase: ConversationPhase, ctx: ExtensionContext) {
+    return withSessionScope(ctx.sessionManager, () => {
     s.phase = phase;
     const current = getExecutionContext();
     const autonomy = phase === "work" ? current.autonomy : "guarded";
@@ -83,6 +86,7 @@ export default function (pi: ExtensionAPI) {
       },
     });
     persist(ctx);
+    });
   }
 
   // ---- Wire modules (plan-feature first, then dependents) ----
@@ -110,6 +114,7 @@ export default function (pi: ExtensionAPI) {
   setupPermissionGuard(pi, s, {
     getCurrentStepIndex: planCb.getCurrentStepIndex,
     onCircuitBreak: (_reason, ctx) => {
+      withSessionScope(ctx.sessionManager, () => {
       s.phase = "work";
       const current = getExecutionContext();
       setExecutionContext({
@@ -125,6 +130,7 @@ export default function (pi: ExtensionAPI) {
         },
       });
       persist(ctx);
+      });
     },
   });
 }

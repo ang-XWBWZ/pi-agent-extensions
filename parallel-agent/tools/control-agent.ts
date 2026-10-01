@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "../../lib/capability-dispatch.js";
 /**
  * control-agent.ts — control_agent 工具注册
  */
@@ -73,7 +74,7 @@ function compactTaskPanel(panel: AgentTaskPanel | undefined) {
 }
 
 export function registerControlAgent(pi: ExtensionAPI): void {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "control_agent",
     label: "Control Agent",
     description:
@@ -309,7 +310,7 @@ export function registerControlAgent(pi: ExtensionAPI): void {
             return { content: [{ type: "text", text: "kill_job 需要 jobId" }], details: { error: "missing_args" } };
           }
           const count = await killJob(jobId);
-          ctx.ui.notify(`💀 已杀死 ${count} 个子 Agent`, "warn");
+          ctx.ui.notify(`💀 已杀死 ${count} 个子 Agent`, "warning");
           return {
             content: [{ type: "text", text: `💀 Job ${jobId.slice(0, 8)}: 已杀死 ${count} 个子 Agent` }],
             details: { action: "kill_job", jobId, killed: count },
@@ -318,7 +319,7 @@ export function registerControlAgent(pi: ExtensionAPI): void {
 
         case "kill": {
           const ok = await killAgent(jobId!, taskId!);
-          ctx.ui.notify(ok ? `💀 已杀死 ${taskId}` : `❌ 杀死失败: ${taskId}`, ok ? "warn" : "error");
+          ctx.ui.notify(ok ? `💀 已杀死 ${taskId}` : `❌ 杀死失败: ${taskId}`, ok ? "warning" : "error");
           return {
             content: [{ type: "text", text: ok ? `💀 已杀死子 Agent: ${taskId}` : `❌ 无法杀死: ${taskId}` }],
             details: { action: "kill", jobId, taskId, ok },

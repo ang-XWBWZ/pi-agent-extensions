@@ -230,9 +230,12 @@ export function createAnthropicStream() {
 
         // 思考等级 → adaptive effort
         const reasoning = options?.reasoning;
-        if (reasoning && reasoning !== "off" && (model as any).reasoning) {
+        // 项目级 ThinkingLevel 含 "off"，内核类型不含，因此直接比较会被判定为无重叠。
+        // 该分支是活的：model-switch 允许把 thinking level 设为 "off"，用于显式关闭思考。
+        const reasoningDisabled = reasoning !== undefined && (reasoning as string) === "off";
+        if (reasoning && !reasoningDisabled && (model as any).reasoning) {
           applyAnthropicThinking(reqBody, model, reasoning);
-        } else if ((model as any).reasoning && (!reasoning || reasoning === "off")) {
+        } else if ((model as any).reasoning && (!reasoning || reasoningDisabled)) {
           reqBody.thinking = { type: "disabled" };
         }
 
@@ -391,13 +394,13 @@ export function createAnthropicStream() {
               const index = data.index ?? blockIndices.length;
 
               if (block.type === "text") {
-                const b = { type: "text", text: "" };
+                const b = { type: "text" as const, text: "" };
                 output.content.push(b);
                 blocksById.set(String(index), b);
                 blockIndices[index] = b;
                 outer.push({ type: "text_start", contentIndex: getIdx(b), partial: output });
               } else if (block.type === "thinking") {
-                const b = { type: "thinking", thinking: "", thinkingSignature: block.thinking || "" };
+                const b = { type: "thinking" as const, thinking: "", thinkingSignature: block.thinking || "" };
                 output.content.push(b);
                 blocksById.set(String(index), b);
                 blockIndices[index] = b;
@@ -408,7 +411,7 @@ export function createAnthropicStream() {
                 });
               } else if (block.type === "tool_use") {
                 const b = {
-                  type: "toolCall",
+                  type: "toolCall" as const,
                   id: block.id || `toolu_${Date.now()}`,
                   name: block.name || "",
                   arguments: {},

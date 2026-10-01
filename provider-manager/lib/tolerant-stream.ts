@@ -137,7 +137,10 @@ export function createOpenAITolerantStream() {
         }
 
         const reasoning = options?.reasoning;
-        if (reasoning && reasoning !== "off" && model.reasoning) {
+        // 项目级 ThinkingLevel 含 "off"，内核类型不含，因此直接比较会被判定为无重叠。
+        // 该分支是活的：model-switch 允许把 thinking level 设为 "off"。
+        const reasoningDisabled = reasoning !== undefined && (reasoning as string) === "off";
+        if (reasoning && !reasoningDisabled && model.reasoning) {
           reqBody.reasoning_effort = PI_TO_OPENAI_REASONING_EFFORT[reasoning] ?? reasoning;
         }
 

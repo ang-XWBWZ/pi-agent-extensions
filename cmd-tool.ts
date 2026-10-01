@@ -1,3 +1,4 @@
+import { capabilityToolRegistry } from "./lib/capability-dispatch.js";
 /**
  * cmd-tool extension - provides a `cmd` tool that executes shell commands
  * via cmd.exe (Windows) with real-time streaming output.
@@ -85,7 +86,7 @@ function codepageToEncoding(codepage: number): string {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerTool({
+  capabilityToolRegistry(pi).registerTool({
     name: "cmd",
     label: "cmd",
     description:
@@ -187,8 +188,8 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const command = String(params.command ?? "");
       const cwd = ctx?.cwd ?? process.cwd();
-      const execCtx = getExecutionContext();
-      const started = await beforeCommand({ command, cwd });
+      const execCtx = getExecutionContext(ctx?.sessionManager);
+      const started = await beforeCommand({ command, cwd, sessionManager: ctx?.sessionManager });
 
       return new Promise((resolve) => {
         // 默认 30s 超时；AI 可传正数覆盖，无硬上限。非法值（0/负数/非数字）兜底到 30s
@@ -238,6 +239,7 @@ export default function (pi: ExtensionAPI) {
             exitCode: resultExitCode(result),
             stdout: resultText(result),
             error: resultError(result),
+            sessionManager: ctx?.sessionManager,
           }).finally(() => resolve(result));
         };
 

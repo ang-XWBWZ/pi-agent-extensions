@@ -64,7 +64,9 @@ export function advancePlanWithEvidence(
   if (!proof) return { ok: false, error: "missing_evidence" };
 
   const result = advancePlanSteps(steps, status);
-  if (!result.ok) return result;
+  // 显式重建失败分支：AdvancePlanResult 与 PlanStatusResult 的成功分支形状不同
+  // （current 对 target），直接 return 整个判联体会被判定为不可赋值。
+  if (!result.ok) return { ok: false, error: result.error };
   result.current.evidence = proof;
   result.current.updatedAt = now;
   if (result.next) result.next.updatedAt = now;
