@@ -5,7 +5,7 @@
  * 不发送任何消息，不污染对话上下文。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { estimateTokens as estimatePiTokens } from "@earendil-works/pi-agent-core";
+import { estimateTokens as estimatePiTokens } from "@earendil-works/pi-coding-agent";
 import { Box, Text, matchesKey, Key, type Component } from "@earendil-works/pi-tui";
 import { getSpeedTracker } from "./lib/speed-tracker.js";
 

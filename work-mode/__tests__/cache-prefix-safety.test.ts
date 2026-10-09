@@ -7,6 +7,8 @@ import {
   setExecutionContext,
 } from "../../lib/execution-context.js";
 import { registerCapability } from "../../lib/capability-router.js";
+import { createOpenAITolerantStream } from "../../stream-compat/lib/tolerant-stream.js";
+import { convertToLlm } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js";
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -160,4 +162,42 @@ test("the runtime directive is injected at the tail and tracks runtime state", a
   const autoText = directiveOf(auto.messages);
   assert.ok(autoText.includes('approval="never_ask"'));
   assert.notEqual(autoText, guardedText, "the directive must reflect the current runtime state");
+  assert.equal(auto.messages[1].content, guardedText, "the old directive must remain in its original position");
+});
+
+test("actual HTTP payloads preserve the whole preceding request across tool loops and authorization changes", async () => {
+  const { first, mockCtx, setRuntime } = harness();
+  const context = first("context");
+  const payloads: any[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    payloads.push(JSON.parse(String(init?.body)));
+    return new Response('data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}\n\ndata: [DONE]\n\n');
+  };
+  const model: any = { id: "probe", provider: "probe", api: "probe", baseUrl: "https://example.invalid/v1", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  const history: any[] = [{ role: "user", content: "Initial task", timestamp: 0 }];
+  const send = async () => {
+    const result = await context({ messages: history }, mockCtx);
+    return createOpenAITolerantStream()(model, { systemPrompt: "Fixed system", messages: convertToLlm(result?.messages ?? history) }, { apiKey: "offline", sessionId: "stable" }).result();
+  };
+  try {
+    await send();
+    history.push({ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "README.md" } }], stopReason: "toolUse", timestamp: 1 });
+    history.push({ role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "Synthetic result" }], timestamp: 2 });
+    await send();
+    setRuntime({ autonomy: "auto", approval: { interactive: false, preauthorized: true, inheritToChildren: true, autoAll: false } });
+    history.push({ role: "assistant", content: [{ type: "text", text: "Reviewed" }], stopReason: "stop", timestamp: 3 });
+    history.push({ role: "user", content: "Continue", timestamp: 4 });
+    await send();
+    for (let index = 1; index < payloads.length; index++) {
+      const previous = payloads[index - 1];
+      assert.equal(JSON.stringify(payloads[index].messages.slice(0, previous.messages.length)), JSON.stringify(previous.messages));
+      assert.equal(payloads[index].prompt_cache_key, previous.prompt_cache_key);
+    }
+    assert.equal(payloads[1].messages.filter((m: any) => m.content?.startsWith("<pi_runtime_directive>")).length, 1, "unchanged state must not append another directive");
+    assert.equal(payloads[2].messages.filter((m: any) => m.content?.startsWith("<pi_runtime_directive>")).length, 2, "state changes append a new directive after preserving the old one");
+    const count = payloads.length;
+    await send();
+    assert.equal(JSON.stringify(payloads[count]), JSON.stringify(payloads[count - 1]), "an unchanged repeated request must be byte-identical");
+  } finally { globalThis.fetch = originalFetch; }
 });

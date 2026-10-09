@@ -25,6 +25,7 @@ import {
   registerFrontendProcessor,
 } from "./lib/agent-bus.js";
 import { getSessionRuntime } from "./lib/session-runtime.js";
+import { projectStableContext } from "./lib/stable-context.js";
 import { setupWidget } from "./parallel-agent/lib/widget.js";
 import { registerSpawnAgent } from "./parallel-agent/tools/spawn-agent.js";
 import { registerCheckResults } from "./parallel-agent/tools/check-results.js";
@@ -140,7 +141,10 @@ export default function (pi: ExtensionAPI) {
     const legacyMsgs = ownerKey === "default" ? [] : pendingByOwner.get("default") ?? [];
     const pendingMsgs = [...ownedMsgs, ...legacyMsgs];
     const hasMsgs = pendingMsgs.length > 0;
-    if (!hasSteer && !hasMsgs) return;
+    if (!hasSteer && !hasMsgs) {
+      const messages = projectStableContext(pi, ctx, event.messages, "agent-message");
+      return messages === event.messages ? undefined : { messages };
+    }
     const parts: string[] = [];
     if (hasSteer) {
       const batch = steerQ.splice(0);
@@ -163,15 +167,8 @@ export default function (pi: ExtensionAPI) {
         parts.push(`[agent-message]\n${uniqueLines.join("\n")}`);
       }
     }
-    return {
-      messages: [
-        ...event.messages,
-        {
-          role: "user",
-          content: parts.join("\n"),
-        } as any,
-      ],
-    };
+    return { messages: projectStableContext(pi, ctx, event.messages, "agent-message",
+      parts.length > 0 ? parts.join("\n") : undefined, { repeat: true }) };
   });
 
   // ---- 子 Agent 状态面板 Widget ----

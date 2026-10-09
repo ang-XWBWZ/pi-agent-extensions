@@ -1,6 +1,7 @@
 /** Manual live acceptance probe. Uses the configured provider without changing
  * settings or exposing credentials. Sends only synthetic data, up to four short
- * responses, and reports cache usage plus hashes of the actual request prefix.
+ * responses, and compares the complete preceding HTTP message prefix on every
+ * request, including extension context projections and growing tool history.
  * Run: ./node_modules/.bin/tsx scripts/verify-capability-cache.ts
  */
 import assert from "node:assert/strict";
@@ -9,7 +10,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
-  ModelRuntime, ModelRegistry,
+  ModelRuntime, ModelRegistry, SessionManager,
   createReadToolDefinition, createEditToolDefinition, createWriteToolDefinition, createBashToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -21,6 +22,7 @@ import { setupPlanFeature } from "../work-mode/plan-feature.js";
 import { setupRequirementsFeature } from "../work-mode/requirements-feature.js";
 import cmdExtension from "../cmd-tool.js";
 import powershellExtension from "../powershell-tool.js";
+import { convertToLlm } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js";
 
 async function main() {
   const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -29,7 +31,14 @@ async function main() {
   const runtime = await ModelRuntime.create({ modelsPath: null, authPath: join(temporary, "auth.json"), refreshOnCreate: false });
   const registry = new ModelRegistry(runtime);
   restoreCustomProviders({ registerProvider: (name: string, config: any) => registry.registerProvider(name, config) } as any);
-  const model = registry.find(settings.defaultProvider, settings.defaultModel);
+  const option = (flag: string, fallback: string) => {
+    const index = process.argv.indexOf(flag);
+    if (index < 0) return fallback;
+    const value = process.argv[index + 1];
+    assert.ok(value && !value.startsWith("--"), `${flag} requires a value`);
+    return value;
+  };
+  const model = registry.find(option("--provider", settings.defaultProvider), option("--model", settings.defaultModel));
   if (!model) throw new Error("Configured model unavailable");
 
   const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
@@ -37,10 +46,10 @@ async function main() {
   const native = new Map<string, any>();
   let active: string[] = [];
   let nativeWrites = 0;
-  const ctx: any = { cwd: temporary, sessionManager: { getEntries: () => [] }, ui: { setStatus: () => {}, notify: () => {} } };
+  const ctx: any = { cwd: temporary, sessionManager: SessionManager.inMemory(temporary), ui: { setStatus: () => {}, notify: () => {} } };
   const pi: any = {
     on: (name: string, fn: any) => { const list = handlers.get(name) ?? []; list.push(fn); handlers.set(name, list); },
-    registerTool: (definition: any) => native.set(definition.name, definition), registerCommand: (name: string, definition: any) => commands.set(name, definition), appendEntry: () => {},
+    registerTool: (definition: any) => native.set(definition.name, definition), registerCommand: (name: string, definition: any) => commands.set(name, definition), appendEntry: (name: string, data: unknown) => ctx.sessionManager.appendCustomEntry(name, data),
     setActiveTools: (names: string[]) => { active = [...names]; nativeWrites++; }, getActiveTools: () => active,
   };
   for (const definition of [createReadToolDefinition(temporary), createEditToolDefinition(temporary), createWriteToolDefinition(temporary), createBashToolDefinition(temporary)]) native.set(definition.name, definition);
@@ -89,7 +98,12 @@ async function main() {
   const samples: any[] = [];
   async function request(label: string, messages: any[]) {
     const before = requests.length;
-    const response = await registry.streamSimple(model!, { systemPrompt, tools: tools(), messages }, {
+    let projected = [...messages];
+    for (const handler of handlers.get("context") ?? []) {
+      const result = await handler({ messages: projected }, ctx);
+      if (result?.messages) projected = result.messages;
+    }
+    const response = await registry.streamSimple(model!, { systemPrompt, tools: tools(), messages: convertToLlm(projected) }, {
       sessionId: "pi-fixed-capability-cache-acceptance", cacheRetention: "long", maxTokens: 256,
       reasoning: "low", timeoutMs: 45_000, maxRetries: 0,
     }).result();
@@ -97,6 +111,14 @@ async function main() {
     assert.equal(requests.length, before + 1, "probe expects one HTTP model request per sample");
     const payload = requests.at(-1);
     const messagesField = payload.messages ?? payload.input;
+    const previous = requests.at(-2);
+    if (previous) {
+      assert.equal(JSON.stringify(payload.tools), JSON.stringify(previous.tools), "HTTP tool definitions changed");
+      assert.equal(payload.instructions, previous.instructions, "HTTP instructions changed");
+      const previousMessages = previous.messages ?? previous.input;
+      assert.equal(JSON.stringify(messagesField.slice(0, previousMessages.length)), JSON.stringify(previousMessages),
+        `${label}: the complete previous HTTP message prefix changed`);
+    }
     const prefix = { tools: payload.tools, instructions: payload.instructions, messages: messagesField.slice(0, (requests[0].messages ?? requests[0].input).length) };
     const hash = createHash("sha256").update(JSON.stringify(prefix)).digest("hex");
     const sample = { label, input: response.usage.input, cacheRead: response.usage.cacheRead, cacheWrite: response.usage.cacheWrite, output: response.usage.output, prefixSha256: hash, rawUsage: await rawUsage.at(-1) };
@@ -110,21 +132,21 @@ async function main() {
     const loaded = await native.get("load_capability").execute("probe-load", { capability: "cache_acceptance_probe" }, undefined, undefined, ctx);
     assert.equal(loaded.details.success, true);
     const call: any = { ...first, content: [{ type: "toolCall", id: "probe-load", name: "load_capability", arguments: { capability: "cache_acceptance_probe" } }], stopReason: "toolUse" };
-    const expanded: any[] = [...initial, call, { role: "toolResult", toolCallId: "probe-load", toolName: "load_capability", content: loaded.content, isError: false, timestamp: 1 }, { role: "user", content: "Reply OK without tools.", timestamp: 2 }];
+    const syntheticHistory = Array.from({ length: 160 }, (_, i) => `Synthetic tool record ${i}: existing messages must keep the same content and position in later requests.`).join("\n");
+    const expanded: any[] = [...initial, call, { role: "toolResult", toolCallId: "probe-load", toolName: "load_capability", content: [...loaded.content, { type: "text", text: syntheticHistory }], isError: false, timestamp: 1 }, { role: "user", content: "Reply OK without tools.", timestamp: 2 }];
     const third = await request("after_load", expanded);
     const repeated = await native.get("load_capability").execute("probe-repeat", { capability: "cache_acceptance_probe" }, undefined, undefined, ctx);
     await commands.get("plan").handler("", ctx);
-    let finalMessages = [...expanded, third, { role: "user", content: repeated.content[0].text + "\nReply OK without tools.", timestamp: 3 }];
-    for (const handler of handlers.get("context") ?? []) {
-      const transformed = await handler({ messages: finalMessages }, ctx);
-      if (transformed?.messages) finalMessages = transformed.messages;
-    }
+    const finalMessages = [...expanded, third, { role: "user", content: repeated.content[0].text + "\nReply OK without tools.", timestamp: 3 }];
     await request("repeat_load_and_plan", finalMessages);
     assert.equal(nativeWrites, 1);
     assert.equal(new Set(samples.map((s) => s.prefixSha256)).size, 1, "actual HTTP request prefix changed");
     const initialInput = samples[0].input + samples[0].cacheRead + samples[0].cacheWrite;
     assert.ok(initialInput > 1024, "probe prefix is too short to test cache reuse");
     for (const sample of samples.slice(1)) assert.ok(sample.cacheRead >= initialInput * 0.8, `${sample.label}: provider did not report reuse of the substantial original prefix`);
+    const expandedInput = samples[2].input + samples[2].cacheRead + samples[2].cacheWrite;
+    assert.ok(samples[3].cacheRead >= expandedInput * 0.8, "growing tool history was not reused");
+    assert.ok(samples[3].cacheRead > initialInput + 1024, "cache reuse stalled at the initial prompt prefix");
     console.log(JSON.stringify({ status: "verified", provider: model.provider, model: model.id, nativeTools: active, samples }));
   } finally { globalThis.fetch = realFetch; }
 }

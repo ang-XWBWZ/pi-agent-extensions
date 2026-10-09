@@ -1,4 +1,5 @@
 import { getSessionRuntime } from "../lib/session-runtime.js";
+import { projectStableContext } from "../lib/stable-context.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerBusInput, registerBusUI, type BusUI } from "../lib/confirm-bus.js";
 import { getWorkGoal } from "../lib/work-goal-store.js";
@@ -197,11 +198,8 @@ export function setupCore(
 
   }));
 
-  // ---- 运行态指令：尾部注入（前缀缓存安全） ----
-  // 相位规则与授权档位随运行态变化（/auto、/auto_all、/yolo、work_goal_start 等）。
-  // 把它们拼进系统提示词头部时，任何一次变化都会让 tools + system + 全部历史的
-  // 缓存前缀一起失效。改为在每次请求尾部追加一条投影消息：内核的 transformContext
-  // 输出只服务本次请求、不写入会话记录，所以不会累积，运行态变化也只影响尾部区域。
+  // Keep already-sent directives at their original history boundaries. A phase
+  // or authorization change appends a new directive; unchanged state adds none.
   pi.on("context", (event, ctx) => {
     const sessionManager = (ctx as unknown as { sessionManager?: object } | undefined)
       ?.sessionManager;
@@ -220,9 +218,8 @@ export function setupCore(
       ].join("\n");
     });
 
-    const cleaned = [...event.messages];
-    cleaned.push({ role: "user", content: directive } as any);
-    return { messages: cleaned };
+    const messages = projectStableContext(pi, ctx, event.messages, "runtime", directive);
+    return messages === event.messages ? undefined : { messages };
   });
 
   pi.registerCommand("chat", {

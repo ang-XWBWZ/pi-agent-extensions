@@ -3,13 +3,14 @@
  *
  * Pi remains the sole owner of compaction timing and of the ordinary LLM
  * summary. This module records a small, structured delivery checkpoint at
- * each successful compaction, then injects it as ephemeral context on later
+ * each successful compaction, then replays its context at stable boundaries on later
  * turns. The contract and acceptance criteria therefore survive compaction
  * without replacing Pi's general-purpose summary.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { redactAuditText } from "../lib/audit-sanitize.js";
+import { projectStableContext } from "../lib/stable-context.js";
 
 export const REQUIREMENTS_CONTINUITY_MARKER = "[requirements-continuity]";
 export const REQUIREMENTS_CHECKPOINT_ENTRY = "requirements-continuity-checkpoint";
@@ -390,17 +391,6 @@ export function buildContinuityAnchor(checkpoint: RequirementsCheckpoint): strin
   return clipAnchor(lines.join("\n"));
 }
 
-function removeExistingAnchor(messages: readonly unknown[]): unknown[] {
-  return messages.filter((message) => {
-    const record = asRecord(message);
-    return !(
-      record?.role === "user" &&
-      typeof record.content === "string" &&
-      record.content.startsWith(REQUIREMENTS_CONTINUITY_MARKER)
-    );
-  });
-}
-
 function currentCheckpoint(entries: readonly unknown[], previous?: RequirementsCheckpoint): RequirementsCheckpoint | undefined {
   const contract = currentContract(entries, previous);
   const plan = currentPlan(entries, previous);
@@ -443,35 +433,10 @@ export function setupRequirementsContinuity(pi: ExtensionAPI): void {
 
   pi.on("context", (event, ctx) => {
     const checkpoint = currentCheckpoint(ctx.sessionManager.getBranch(), latest);
-    const existingAnchor = event.messages.find((message) => {
-      const record = asRecord(message);
-      return record?.role === "user" &&
-        typeof record.content === "string" &&
-        record.content.startsWith(REQUIREMENTS_CONTINUITY_MARKER);
-    });
-    const messages = removeExistingAnchor(event.messages);
-    if (!checkpoint) {
-      return messages.length === event.messages.length ? undefined : { messages };
-    }
-    const content = buildContinuityAnchor(checkpoint);
-    if (
-      existingAnchor &&
-      asRecord(existingAnchor)?.content === content &&
-      messages.length === event.messages.length - 1
-    ) {
-      return;
-    }
-    return {
-      messages: [
-        ...messages,
-        {
-          role: "user",
-          content,
-          timestamp: typeof asRecord(existingAnchor)?.timestamp === "number"
-            ? asRecord(existingAnchor)?.timestamp
-            : 0,
-        } as any,
-      ],
-    };
+    const messages = projectStableContext(pi, ctx, event.messages, "requirements",
+      checkpoint ? buildContinuityAnchor(checkpoint) : undefined, {
+        inactiveContent: `${REQUIREMENTS_CONTINUITY_MARKER}\nNo active requirement contract or plan. Earlier continuity anchors are historical.`,
+      });
+    return messages === event.messages ? undefined : { messages };
   });
 }

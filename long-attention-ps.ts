@@ -1,4 +1,5 @@
 import { capabilityToolRegistry } from "./lib/capability-dispatch.js";
+import { projectStableContext } from "./lib/stable-context.js";
 /**
  * long-attention-ps.ts — 长程注意力 PS 注入器 (v1)
  *
@@ -620,38 +621,18 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("context", (event, _ctx) => {
-    const existingIdx = event.messages.findIndex((m) => {
-      const content = messageContent(m);
-      return typeof content === "string" && content.startsWith(MARKER);
-    });
+  pi.on("context", (event, ctx) => {
     const contextText = recentContextText(event.messages as Array<{ role?: string; content?: unknown }>);
     const selected = selectPs(st, contextText);
 
-    if (selected.length === 0) {
-      if (existingIdx >= 0) {
-        const cleaned = [...event.messages];
-        cleaned.splice(existingIdx, 1);
-        return { messages: cleaned };
-      }
-      return;
-    }
-
-    const currentText = formatPs(st, selected);
-    const existingContent = existingIdx >= 0 ? messageContent(event.messages[existingIdx]) : undefined;
-    const existingText = typeof existingContent === "string" ? existingContent : undefined;
-    if (existingText === currentText) return;
-
-    for (const it of selected) {
-      coolDownAfterInject(st, it);
-    }
-
-    const cleaned = existingIdx >= 0
-      ? [...event.messages.slice(0, existingIdx), ...event.messages.slice(existingIdx + 1)]
-      : [...event.messages];
-
-    cleaned.push({ role: "user", content: currentText } as any);
-    return { messages: cleaned };
+    const messages = projectStableContext(pi, ctx, event.messages, "ps",
+      selected.length > 0 ? formatPs(st, selected) : undefined, {
+        inactiveContent: `${MARKER}\nNo PS reminder is active for this request. Earlier PS injections are historical.`,
+        repeat: selected.length > 0,
+        onAppend: () => { for (const it of selected) coolDownAfterInject(st, it); },
+      });
+    if (messages === event.messages) return;
+    return { messages };
   });
 
   pi.on("message_end", (_event, ctx) => {

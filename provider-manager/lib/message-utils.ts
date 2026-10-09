@@ -3,7 +3,7 @@
  */
 
 import { type Api, type AssistantMessage, calculateCost } from "@earendil-works/pi-ai";
-import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-agent-core";
+import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 
 /** Retained as a compatibility export; Pi's native estimate has no fixed reserve. */

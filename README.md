@@ -6,7 +6,7 @@
 ![Pi Coding Agent](https://img.shields.io/badge/Pi%20Coding%20Agent-Pi%20Package-blueviolet)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Status](https://img.shields.io/badge/Dashboard-2--Line%20Minimal%20HUD-orange)
-![Tests](https://img.shields.io/badge/Tests-135%20Passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-221%20Passing-brightgreen)
 
 **给 Pi Coding Agent 装上工业级工程引擎、双轨浏览器中枢与极简 HUD 仪表盘。**  
 不改内核一行代码，通过官方 Pi Package 扩展规范与 PCS 渐进能力路由器，赋予其一键安装、子 Agent 并行调度、前台 Chrome CDP 真实接管、静默无头抓取、极简两行状态底栏、生成速率追踪、受控工作流、上下文深度监控、模型热切换与 MCP 接入等企业级能力。
@@ -190,7 +190,7 @@ Line 2: ↑67k ↓22k R50k W2.0k CH42.0% $0.085 3.2%/1.0M (auto) · 48.2 t/s    
 ## 📂 目录结构
 
 ```text
-pi-agent-extensions/
+pi-agent-
 ├── package.json               # ⭐ 标准 Pi Package 根清单 (npm Workspaces)
 ├── README.md                  # 本文件 — 特性说明与使用指南
 ├── AGENTS.md                  # 行为与交互风格契约
@@ -251,7 +251,7 @@ pi-agent-extensions/
 
 ```bash
 npm test
-# 213 tests passed, including strict typechecking and stream-compat regressions
+# ℹ tests 135 | pass 135 | fail 0
 ```
 
 ---

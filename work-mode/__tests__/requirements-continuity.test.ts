@@ -154,6 +154,7 @@ test("the hook records a checkpoint only after a successful Pi compaction and ne
   assert.equal(appended.length, 1);
   assert.equal(appended[0]?.type, REQUIREMENTS_CHECKPOINT_ENTRY);
 
+  const sameSession = { getBranch: () => fixtureEntries() };
   const injected = context(
     {
       messages: [
@@ -161,18 +162,19 @@ test("the hook records a checkpoint only after a successful Pi compaction and ne
         { role: "user", content: `${REQUIREMENTS_CONTINUITY_MARKER}\nold anchor` },
       ],
     },
-    { sessionManager: { getBranch: () => fixtureEntries() } },
+    { sessionManager: sameSession },
   ) as { messages?: Array<{ role: string; content: unknown }> } | undefined;
   assert.ok(injected?.messages);
   const anchors = injected.messages.filter(
     (message) => typeof message.content === "string" && message.content.startsWith(REQUIREMENTS_CONTINUITY_MARKER),
   );
-  assert.equal(anchors.length, 1);
-  assert.match(String(anchors[0]?.content), /已接受的需求契约/);
+  assert.equal(anchors.length, 2, "already-sent anchors must remain in place");
+  assert.match(String(anchors[0]?.content), /old anchor/);
+  assert.match(String(anchors[1]?.content), /已接受的需求契约/);
 
   const secondPass = context(
     { messages: injected.messages },
-    { sessionManager: { getBranch: () => fixtureEntries() } },
+    { sessionManager: sameSession },
   );
   assert.equal(secondPass, undefined, "unchanged continuity anchors should be cache-stable");
 });

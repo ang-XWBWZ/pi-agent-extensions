@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-extensions",
-  "version": "7.1.1",
+  "version": "7.1.2",
   "description": "Comprehensive engineering extensions suite for Pi Coding Agent",
   "type": "module",
   "keywords": [
