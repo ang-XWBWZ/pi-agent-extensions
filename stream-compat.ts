@@ -30,20 +30,25 @@ export function patchModelFinishReasonCompat(model: any): boolean {
 
   const baseUrl: string | undefined = model.baseUrl;
   const isOfficialOpenAI = !baseUrl || baseUrl.includes("api.openai.com");
-  if (!isOfficialOpenAI) {
+  if (isOfficialOpenAI) return false;
+  if (model.compat?.supportsFinishReason !== undefined) return false;
+  // pi 1.5 起 runtime 深冻结 models.json / 内置模型，扩展无法注入 compat；
+  // 这类模型需要在 models.json 里声明 compat.supportsFinishReason。
+  if (Object.isFrozen(model)) return false;
+  try {
     if (!model.compat) {
       model.compat = { supportsFinishReason: false };
       return true;
-    } else if (model.compat.supportsFinishReason === undefined) {
-      if (Object.isFrozen(model.compat)) {
-        model.compat = { ...model.compat, supportsFinishReason: false };
-      } else {
-        model.compat.supportsFinishReason = false;
-      }
-      return true;
     }
+    if (Object.isFrozen(model.compat)) {
+      model.compat = { ...model.compat, supportsFinishReason: false };
+    } else {
+      model.compat.supportsFinishReason = false;
+    }
+    return true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 export default function (pi: ExtensionAPI) {

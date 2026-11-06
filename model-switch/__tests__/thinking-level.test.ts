@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+// 必须先于其它模块求值：把 settings 读写重定向到临时目录（settings-io 首次调用即缓存路径）
+import "./isolated-settings-env.js";
 import { buildModelConfigs } from "../../provider-manager/lib/register.js";
 import {
   VALID_THINKING_LEVELS,
@@ -88,6 +90,55 @@ test("forceThinkingSupportAll patches an array of models", () => {
   assert.equal(models[1].reasoning, true);
   assert.deepEqual(nativeGetSupportedThinkingLevels(models[0]), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   assert.deepEqual(nativeGetSupportedThinkingLevels(models[1]), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+});
+
+test("forceThinkingSupport skips runtime-frozen models instead of throwing (pi >= 1.5)", () => {
+  // pi 1.5 的 ModelConfig 会 deepFreeze models.json 模型；改写会抛
+  // "Cannot assign to read only property 'minimal' of object" 并中断 session_start
+  const frozen = Object.freeze({
+    id: "workbuddy/deepseek-v4.1-flash",
+    provider: "magpie",
+    reasoning: true,
+    thinkingLevelMap: Object.freeze({
+      off: "none",
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    }),
+  });
+
+  assert.equal(forceThinkingSupport(frozen), false, "frozen model must report no patch");
+  assert.equal(frozen.thinkingLevelMap.minimal, null, "frozen model must stay untouched");
+  // runtime 自带的钳制逻辑接管：声明为 null 的等级不生效
+  assert.deepEqual(nativeGetSupportedThinkingLevels(frozen), ["off", "low", "high", "max"]);
+});
+
+test("forceThinkingSupport rebuilds a frozen thinkingLevelMap when the model itself is writable", () => {
+  const model: any = {
+    id: "relay-model",
+    provider: "third-party-relay",
+    reasoning: true,
+    thinkingLevelMap: Object.freeze({ off: "none", minimal: null, xhigh: null }),
+  };
+
+  assert.equal(forceThinkingSupport(model), true);
+  assert.notEqual(Object.isFrozen(model.thinkingLevelMap), true, "map is replaced, not mutated in place");
+  assert.equal(model.thinkingLevelMap.off, "none", "declared off mapping is preserved");
+  assert.deepEqual(nativeGetSupportedThinkingLevels(model), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+});
+
+test("forceThinkingSupportAll patches writable models and counts only those", () => {
+  const writable = { id: "m1", reasoning: false };
+  const frozen = Object.freeze({ id: "m2", reasoning: false });
+
+  const patched = forceThinkingSupportAll([writable, frozen, null]);
+
+  assert.equal(patched, 1);
+  assert.equal(writable.reasoning, true);
+  assert.equal(frozen.reasoning, false);
 });
 
 test("thinking commands (/thinking-level, /thinklev, /thinklive) register and handle direct parameters with persistence", async () => {
@@ -407,6 +458,12 @@ test("interactive secondary menu: Choice 3 (Tier config) saves tier thinkingLeve
       },
     },
   };
+
+  // handler 通过 readAllTiers() 读盘，而非 state：先把分层配置写进隔离后的临时 settings
+  updateSettings((s) => {
+    (s as any).modelTiers = { ...state.tierConfig };
+    return s;
+  });
 
   await thinkCmd.handler("", mockCtx);
 

@@ -78,8 +78,9 @@ export default function (pi: ExtensionAPI) {
     if (lvl) {
       forceThinkingSupport(model);
       pi.setThinkingLevel(lvl as any);
-      currentThinking = lvl;
-      return lvl;
+      // runtime 会按模型声明的 thinkingLevelMap 钳制等级，这里回读实际生效值
+      currentThinking = pi.getThinkingLevel?.() ?? lvl;
+      return currentThinking as ThinkingLevel;
     }
     return undefined;
   }
@@ -88,7 +89,7 @@ export default function (pi: ExtensionAPI) {
     if (isValidThinkingLevel(level)) {
       forceThinkingSupport(model);
       pi.setThinkingLevel(level as any);
-      currentThinking = level;
+      currentThinking = pi.getThinkingLevel?.() ?? level;
     }
   }
 
@@ -101,14 +102,14 @@ export default function (pi: ExtensionAPI) {
     const modelSpecific = modelKey ? (s.modelThinkingLevels as Record<string, string>)?.[modelKey] : undefined;
     if (modelSpecific && isValidThinkingLevel(modelSpecific)) {
       setThinking(modelSpecific, model);
-      return modelSpecific as ThinkingLevel;
+      return (currentThinking || modelSpecific) as ThinkingLevel;
     }
     if (tier && tierConfig[tier]?.thinkingLevel) {
       return applyThinking(tier, model);
     }
     if (s.defaultThinkingLevel && isValidThinkingLevel(s.defaultThinkingLevel)) {
       setThinking(s.defaultThinkingLevel as string, model);
-      return s.defaultThinkingLevel as ThinkingLevel;
+      return (currentThinking || s.defaultThinkingLevel) as ThinkingLevel;
     }
     return undefined;
   }

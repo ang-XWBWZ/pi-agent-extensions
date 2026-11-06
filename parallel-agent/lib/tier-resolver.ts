@@ -24,14 +24,17 @@ export const VALID_THINKING_LEVELS = [
 
 // ---- 强制思考支持（与 model-switch/lib/types.ts 保持一致） ----
 
-export function forceThinkingSupport(model: unknown): void {
-  if (!model || typeof model !== "object") return;
+export function forceThinkingSupport(model: unknown): boolean {
+  if (!model || typeof model !== "object") return false;
   const m = model as {
     reasoning?: boolean;
     thinkingLevelMap?: Record<string, string | null | undefined>;
   };
+  // pi 1.5 起 runtime 深冻结 models.json / 内置模型，改写会抛 TypeError；
+  // 这类模型的思考支持由声明式配置决定，交由 runtime 自带钳制处理。
+  if (Object.isFrozen(m)) return false;
   const hasReasoning = m.reasoning === true;
-  m.thinkingLevelMap = {
+  const map: Record<string, string | null | undefined> = {
     off: undefined,
     minimal: hasReasoning ? (m.thinkingLevelMap?.minimal ?? "minimal") : undefined,
     low: hasReasoning ? (m.thinkingLevelMap?.low ?? "low") : undefined,
@@ -40,6 +43,12 @@ export function forceThinkingSupport(model: unknown): void {
     xhigh: hasReasoning ? (m.thinkingLevelMap?.xhigh ?? "xhigh") : undefined,
     max: hasReasoning ? (m.thinkingLevelMap?.max ?? "max") : undefined,
   };
+  try {
+    m.thinkingLevelMap = map;
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 // ---- Skill 配置（通过共享缓存，不读磁盘） ----

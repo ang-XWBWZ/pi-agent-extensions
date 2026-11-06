@@ -201,6 +201,20 @@ test("patchModelFinishReasonCompat protects third-party models without touching 
   assert.equal((anthropicModel as any).compat, undefined);
 });
 
+test("patchModelFinishReasonCompat skips runtime-frozen models without throwing (pi >= 1.5)", () => {
+  // pi 1.5 会深冻结 models.json / 内置模型，此处改写会抛
+  // "Cannot assign to read only property"，必须安静降级
+  const frozen = Object.freeze({
+    id: "relay-model",
+    provider: "third-party-relay",
+    api: "openai-completions",
+    baseUrl: "https://my-relay.com/v1",
+  });
+
+  assert.equal(patchModelFinishReasonCompat(frozen), false);
+  assert.equal((frozen as any).compat, undefined);
+});
+
 test("registerCustomProvider in auto mode automatically protects models with supportsFinishReason: false", () => {
   let registeredProvider: any = null;
   const fakePi = {

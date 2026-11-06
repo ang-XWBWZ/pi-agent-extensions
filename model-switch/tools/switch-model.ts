@@ -27,7 +27,8 @@ export function registerSwitchModel(
     if (isValidThinkingLevel(level)) {
       forceThinkingSupport(model);
       pi.setThinkingLevel(level as any);
-      setState({ currentThinking: level });
+      // runtime 会按模型声明的 thinkingLevelMap 钳制等级，这里回读实际生效值
+      setState({ currentThinking: pi.getThinkingLevel?.() ?? level });
     }
   }
 

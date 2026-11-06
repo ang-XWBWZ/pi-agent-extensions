@@ -53,38 +53,49 @@ export function thinkingLabel(level: string): string {
 
 // ---- 强制思考支持 ----
 
-export function forceThinkingSupport(model: unknown): void {
-  if (!model || typeof model !== "object") return;
+/**
+ * 补齐模型的思考等级支持。
+ *
+ * pi 1.5 起 runtime 会深冻结模型定义（models.json 经 ModelConfig 载入后 Object.freeze），
+ * 冻结对象上的赋值会抛 TypeError 并中断 session_start。这类 runtime 托管模型的
+ * reasoning / thinkingLevelMap 只能由声明式配置决定（models.json 的 reasoning 与
+ * thinkingLevelMap，或 registerProvider 注册时的模型定义），扩展不应也无法在运行时改写。
+ *
+ * @returns true = 模型可写且已补齐；false = 模型由 runtime 托管，未做任何修改。
+ */
+export function forceThinkingSupport(model: unknown): boolean {
+  if (!model || typeof model !== "object") return false;
   const m = model as {
     reasoning?: boolean;
     thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
   };
-  m.reasoning = true;
-  if (!m.thinkingLevelMap) {
-    m.thinkingLevelMap = {
-      off: undefined,
-      minimal: "minimal",
-      low: "low",
-      medium: "medium",
-      high: "high",
-      xhigh: "xhigh",
-      max: "max",
-    };
-  } else {
-    // 补齐所有思考等级映射，解除 null 与 undefined 阻断，全面兼容原生 7 级
-    if (!m.thinkingLevelMap.minimal) m.thinkingLevelMap.minimal = "minimal";
-    if (!m.thinkingLevelMap.low) m.thinkingLevelMap.low = "low";
-    if (!m.thinkingLevelMap.medium) m.thinkingLevelMap.medium = "medium";
-    if (!m.thinkingLevelMap.high) m.thinkingLevelMap.high = "high";
-    if (!m.thinkingLevelMap.xhigh) m.thinkingLevelMap.xhigh = "xhigh";
-    if (!m.thinkingLevelMap.max) m.thinkingLevelMap.max = "max";
+  if (Object.isFrozen(m)) return false;
+  // 复制一份再整体赋值：原 map 也可能被冻结，且不污染 runtime 正在使用的对象。
+  const map: Partial<Record<ThinkingLevel, string | null>> =
+    m.thinkingLevelMap && typeof m.thinkingLevelMap === "object"
+      ? { ...m.thinkingLevelMap }
+      : { off: undefined };
+  // 补齐 minimal..max：已有映射（含 provider 自定义值）保持不变，null / undefined 解除阻断
+  for (const level of VALID_THINKING_LEVELS) {
+    if (level === "off") continue;
+    if (!map[level]) map[level] = level;
   }
+  try {
+    m.reasoning = true;
+    m.thinkingLevelMap = map;
+  } catch {
+    return false; // 属性只读：同样交给 runtime 的声明式配置
+  }
+  return true;
 }
 
-export function forceThinkingSupportAll(models: unknown[]): void {
-  if (!Array.isArray(models)) return;
+/** @returns 实际被改写的模型数量（runtime 托管的冻结模型会被跳过）。 */
+export function forceThinkingSupportAll(models: unknown[]): number {
+  if (!Array.isArray(models)) return 0;
+  let patched = 0;
   for (const m of models) {
-    forceThinkingSupport(m);
+    if (forceThinkingSupport(m)) patched += 1;
   }
+  return patched;
 }
 
